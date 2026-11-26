@@ -55,7 +55,6 @@ import Time.Duration (Duration)
 import System.Task as Task
 import Target (OS(..))
 import Target as Target
-import Turkey.Errors (IOError)
 import Turkey.Errors as Errors
 import Turkey.FD as FD
 import Turkey.IO as IO
@@ -108,21 +107,23 @@ fun withEnvironment(cmd : Command, name : String, value : String) -> Command =
 	}
 
 --- Run `cmd` and wait for it to end, or for `timeout` to pass if there is one.
-fun run(cmd : Command, timeout : Option Duration) -> Either IOError Output =
+--- A failure to start the program or to wait for it holds an `IOError`; how
+--- the program itself ended is in the `Output`.
+fun run(cmd : Command, timeout : Option Duration) -> Either SomeError Output =
 	runUntil(cmd, Option.map(timeout, Deadline.after))
 
 --- `run` with a deadline made earlier, so that one limit can cover this and
 --- other steps.
-fun runUntil(cmd : Command, deadline : Option Deadline) -> Either IOError Output {
+fun runUntil(cmd : Command, deadline : Option Deadline) -> Either SomeError Output {
 	-- WASI preview 1 has no processes to start.
-	if let Wasi = Target.os { return Runtime.unsupported(Left(Errors.failure("spawn", None, 0))) }
+	if let Wasi = Target.os { return Runtime.unsupported(throw(Errors.failure("spawn", None, 0))) }
 	let limit = match deadline {
 		Some(d) -> Clock.nanos(Deadline.reading(d))
 		None    -> -1
 	}
 	let name = if len(cmd.argv) == 0 { "" } else { cmd.argv[0] }
 	let started = match Spawn.start(cmd.argv, cmd.directory, laterWins(cmd.environment)) {
-		Left(e)  -> return Left(Errors.failure("spawn", Some(name), e))
+		Left(e)  -> return throw(Errors.failure("spawn", Some(name), e))
 		Right(s) -> s
 	}
 	let out = FD.fd(started.stdout)
@@ -162,7 +163,7 @@ fun runUntil(cmd : Command, deadline : Option Deadline) -> Either IOError Output
 	let _ = FD.close(out)
 	let _ = FD.close(err)
 	let (failed, output) = finished
-	if failed != 0 { Left(Errors.failure("wait", Some(name), failed)) } else { Right(output) }
+	if failed != 0 { throw(Errors.failure("wait", Some(name), failed)) } else { Right(output) }
 }
 
 -- -- underneath -----------------------------------------------------------------------

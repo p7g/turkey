@@ -20,7 +20,7 @@ import Time.Zone as Zone
 
 fun say(r) = match r {
     Right(z) -> show(z)
-    Left(e) -> message(e)
+    Left(e) -> show(e)
 }
 
 fun main() {
@@ -50,7 +50,7 @@ fun main() {
                                       Option.expect(TimeOfDay.new(12, 0, 0), "time"))
             print(DateTime.offset(DateTime.of(p, z)))
         }
-        Left(e) -> print(message(e))
+        Left(e) -> print(e)
     }
 }
 """

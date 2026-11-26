@@ -298,7 +298,12 @@ whose values are objects ([`Object` and
   printing](builtins.md#show-and-printing).
 
 Only `eq`, `lt`, `hashInto` and `debug` are written; the other methods are the
-class's defaults, so `<=` is `lt(x, y) || eq(x, y)`.
+class's defaults, so `<=` is `lt(x, y) || eq(x, y)`. Those defaults are right
+only when the order agrees with the type's equality: for any two values,
+exactly one of `lt(a, b)`, `lt(b, a)` and `a == b` holds. A derived `Ord`
+always agrees with a derived `Eq`. An `Ord` written by hand beside a derived
+`Eq` is reported by the `ord-inconsistent-with-eq` check
+([Warnings](README.md#warnings)).
 
 A tuple of any length gets the same instances, and `Ord` and `Show` too,
 without asking, wherever its elements have them. It behaves like a type with
@@ -435,11 +440,11 @@ derived `Hash` either, and writes its own if it needs one:
 type Angle = Angle(Int)
 
 instance Eq Angle {
-    fun eq(Angle(a), Angle(b)) = Int.mod(a, 360) == Int.mod(b, 360)
+    fun eq(Angle(a), Angle(b)) = a % 360 == b % 360
 }
 
 instance Hash Angle {
-    fun hashInto(Angle(a), h) = hashInto(Int.mod(a, 360), h)
+    fun hashInto(Angle(a), h) = hashInto(a % 360, h)
 }
 
 fun main() {

@@ -142,6 +142,25 @@ def needs_wasmtime() -> str:
     pytest.skip("wasmtime is not installed")
 
 
+def needs_node() -> str:
+    """Returns the path of `node`, which runs the playground's host
+    (`playground/host.js`). Skips the calling test where node is not
+    installed or is older than 18, which first has `DecompressionStream`, or
+    fails it where `$TURKEY_REQUIRE_NODE` is set, as CI sets it, so that a
+    runner without it cannot pass by skipping."""
+    path = shutil.which("node")
+    message = "node is not installed"
+    if path is not None:
+        version = subprocess.run([path, "--version"], capture_output=True, text=True).stdout
+        major = version.strip().lstrip("v").split(".")[0]
+        if major.isdigit() and int(major) >= 18:
+            return path
+        message = f"node {version.strip()} is older than 18"
+    if os.environ.get("TURKEY_REQUIRE_NODE"):
+        pytest.fail(message)
+    pytest.skip(message)
+
+
 def identity() -> bytes:
     """The compiler, as part of a cache key. How a binary is run is not: it
     does not change what was built."""

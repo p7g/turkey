@@ -1,16 +1,26 @@
-export (Error(..), SomeError(..), fail, throw, promote, context, causeOf, messageOf, describe, cast)
+export (
+	Error(..),
+	SomeError(..),
+	fail,
+	throw,
+	promote,
+	context,
+	causeOf,
+	messageOf,
+	describe,
+	cast,
+	find,
+)
 
 import Prelude ()
 import Data.String (String)
-import Data.Eq (Eq(..), (==), (!=))
-import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
+import Data.Eq ((==))
+import Data.Num ((+))
 import Text.Show (Show(..))
 import Data.Typed (Typed(..))
-import Data.Index (Index(..), SetIndex(..), Length(..))
 import Data.Either (Either(..), mapLeft)
 import Data.Option (Option(..))
-import Data.Typed (TypeRep(..), Proxy(..))
-import Data.String ()
+import Data.Typed (Proxy(..))
 
 --- What every payload in the shared error channel can do.
 --- `Typed` is a superclass so that a packed payload can be asked what it is:
@@ -32,6 +42,23 @@ class Error e : Typed e { fun message(e) -> String }
 --- dropped it (Well-Typed, 2026) -- and a field that is only ever written by
 --- `context` cannot lose anything that way.
 type SomeError = SomeError[Error e] { payload : e, cause : Option SomeError }
+
+-- The rule for the library's public functions that can fail: return
+-- `Either SomeError a`, and pack the module's own error type once, where it
+-- is made. A caller outside the module needs nothing of that type beyond
+-- `cast` and `find`, and one error type at every boundary is what lets `?`
+-- mix calls into several modules without `promote`.
+--
+-- Keep an error typed where the code that made it decides on it, and convert
+-- at the edge: the HTTP layers refuse a message or retry a stale connection
+-- on theirs, and `Time.Zone` tells an unknown zone from an unreadable one.
+-- For the same reason `Read` and `Write` keep their associated error types,
+-- and so do the functions generic over them. A parser whose failure callers
+-- routinely act on, such as `Int.parse` or `URL.parse`, returns `Option` or
+-- an error type of its own.
+--
+-- Two public functions break the rule and return `Either IOError a`:
+-- `Signal.listen` and `Net.Memory.connect`.
 
 --- Packs `value` into the channel, with no cause. `throw` packs it and
 --- returns it as a failed result in one step.
@@ -110,5 +137,16 @@ fun cast[Typed a](err : SomeError) -> Option a {
 			} else {
 				None
 			}
+	}
+}
+
+--- Returns the payload of the first error along `err`'s cause chain,
+--- outermost first, that has type `a`, or `None` when no error in the chain
+--- has. `err` itself is the first one looked at.
+fun find[Typed a](err : SomeError) -> Option a = match cast(err) {
+	Some(found) -> Some(found)
+	None -> match causeOf(err) {
+		Some(inner) -> find(inner)
+		None        -> None
 	}
 }

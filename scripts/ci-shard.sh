@@ -15,7 +15,8 @@
 #              which test_emit, test_bootstrap, test_debug_info and
 #              test_unwind share; also the compiler built for wasm32-wasi
 #              compiling itself under wasmtime, which writes the compiler for
-#              each target the way the fixed point does
+#              each target the way the fixed point does, and the playground's
+#              host running that same compiler under node
 #   native     the corpus built by the arm64 backend, run under GC stress
 #              with every collection full
 #   generational
@@ -40,7 +41,7 @@
 
 set -eu
 
-BOOTSTRAP="test_bootstrap test_emit test_debug_info test_unwind"
+BOOTSTRAP="test_bootstrap test_emit test_debug_info test_unwind test_playground_host"
 NATIVE="test_arm64_native"
 ASSEMBLER="test_encode test_executable"
 PASSES="test_select test_machine_check test_ssa_lower test_ssa test_sccp

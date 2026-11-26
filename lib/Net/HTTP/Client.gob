@@ -132,13 +132,12 @@ export (
 --- a byte.
 
 import Data.Error as Error
-import Data.Error (promote)
 import Data.Ord (min)
 import Net
 import Net (ConnectPolicy)
 import Net.TCP as TCP
 import Net.TLS as TLS
-import Net.TLS (TLSError, Roots(..))
+import Net.TLS (Roots(..))
 import Net.HTTP.Payload as Payload (Payload)
 import Net.HTTP.Error (
 	HTTPError(..),
@@ -146,7 +145,6 @@ import Net.HTTP.Error (
 	RedirectRefused(..),
 	Refusal(..),
 	FromHTTP(..),
-	transport,
 	flattenError,
 )
 import Net.HTTP.H1.Body as Framed
@@ -191,7 +189,6 @@ import Time.Deadline as Deadline
 import Time.Deadline (Deadline)
 import Time.Duration as Duration
 import Time.Duration (Duration)
-import Turkey.Buffer (Buffer)
 import Turkey.Errors (IOError(..), ErrorKind(..))
 import Turkey.ReadWrite (Read(..), Write(..))
 import URL as URL
@@ -403,7 +400,7 @@ let keptBuffers = 64
 --- Returns a client with `c`'s settings, and the defaults for those it does
 --- not set, or why its TLS configuration cannot be made: a roots file that
 --- does not load.
-fun client(c : Config) -> Either TLSError Client {
+fun client(c : Config) -> Either SomeError Client {
 	let s = settings(c)
 	let tls = TLS.clientConfig(s.roots, ["http/1.1"])?
 	Right(Client {
@@ -1019,10 +1016,13 @@ fun dial(c : Client, u : HTTPURL, total : Option Deadline) -> Either HTTPError (
 		None    -> limit
 	}
 	let dnsTimer = Stopwatch.start()
-	let d = transport(Net.resolve(HTTPURL.host(u), HTTPURL.port(u), c.settings.policy, within))?
+	let d = Either.mapLeft(
+		Net.resolve(HTTPURL.host(u), HTTPURL.port(u), c.settings.policy, within),
+		Transport,
+	)?
 	let dns = Some(Stopwatch.elapsed(dnsTimer))
 	let connectTimer = Stopwatch.start()
-	let s = transport(TCP.connect(d, within))?
+	let s = Either.mapLeft(TCP.connect(d, within), Transport)?
 	let connect = Some(Stopwatch.elapsed(connectTimer))
 	if !HTTPURL.isHTTPS(u) {
 		return Right((
@@ -1046,7 +1046,7 @@ fun dial(c : Client, u : HTTPURL, total : Option Deadline) -> Either HTTPError (
 		))
 		Left(e) -> {
 			let _ = TCP.close(s)
-			Left(Transport(fail(e)))
+			Left(Transport(e))
 		}
 	}
 }

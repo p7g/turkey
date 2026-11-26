@@ -1,0 +1,815 @@
+export (unusedVariable, unusedImport, unusedPrivateFunction)
+
+--- Checks about whether what a module binds is used: local bindings,
+--- imports and private top-level bindings (`Turkey.Lint`).
+
+import Data.Set as Set
+import Turkey.Ast (..)
+import Turkey.Binders as Binders
+import Turkey.Lint (File, Finding(..), Fix(..), Edit(..))
+import Turkey.Lint as Lint
+import Turkey.Modules (ImportUse(..), ImportPart(..))
+import Turkey.Runtime as Rt
+import Turkey.Source (Span(..))
+import Turkey.Source as Source
+
+-- -- unused-variable ----------------------------------------------------------------
+--
+-- A local binding that nothing reads: a `let`, `var` or `let ... else`, a
+-- `for ... in` pattern, a `match` arm or guard pattern, a condition's
+-- pattern, or a local `fun`. Parameters are left alone, since a parameter
+-- nothing reads is most often there to match a signature. A name that starts
+-- with `_` says it is unused on purpose.
+--
+-- What reads a binder is a reference to it, found through the binder table,
+-- other than the binder's own: the target of an assignment to it, a
+-- reference in the value assigned to it (`x = x + 1`), and a reference in a
+-- local function's own body. A binder whose only references are its own is
+-- unused.
+--
+-- The check runs before desugaring, where every reference means the binder
+-- the author wrote. Desugaring turns a `var` condition into a `match` that
+-- binds an immutable copy and a `var` in the arm's body, and points the later
+-- conditions' references at the copy; before that, they point at the binder
+-- of the `var` condition itself.
+
+-- A binder this check may report, with every binding occurrence of it, and
+-- the references that are its own.
+type Candidate = Candidate {
+	name : String
+	-- The variables of a pattern that bind it, or for a local `fun`, none.
+	occurrences : Vec Occurrence
+	-- The local `fun` that binds it, if one does.
+	function : Option FunDecl
+	-- Whether the whole pattern of a `let`, `var` or `let ... else` binds
+	-- it, or a local `fun` does, where the name tells a reader what the
+	-- value is.
+	named     : Bool
+	own       : Vec Expr
+	var reads : Int
+	-- Whether renaming it leaves the program as it is.
+	var fixable : Bool
+}
+
+-- A variable of a pattern, and the field of a record pattern it is the
+-- whole of, which punning may have written for it.
+type Occurrence = Occurrence { pat : Pat, field : Option String }
+
+type Walk = Walk {
+	f          : File
+	candidates : Map Int Candidate
+	-- The binders in order of their first binding occurrence, so findings
+	-- come in a stable order.
+	order : Vec Int
+}
+
+fun unusedVariable(f : File) -> Vec Finding {
+	let w = Walk { f = f, candidates = Map.new(), order = [] }
+	for d in Lint.programOf(f).decls {
+		match d {
+			DStmt(s) -> match s.kind {
+				SFun(fd) -> walk(w, ChFun(fd), [])
+				_        -> for c in children(ChStmt(s)) { walk(w, c, []) }
+			}
+			DClass(c)                          -> for m in c.methods { walk(w, ChFun(m), []) }
+			DInstance(i)                       -> for m in i.methods { walk(w, ChFun(m), []) }
+			DType(_) | DForeign(_) | DInfix(_) -> {}
+		}
+	}
+	let out = []
+	for id in w.order {
+		let c = found(w, id)
+		if c.reads == 0 { unused(f, c, out) }
+	}
+	out
+}
+
+-- Walks `c`, inside the definitions of the binders `own`: the variables
+-- whose assignments and the local functions whose bodies it is in.
+fun walk(w : Walk, c : Child, own : Vec Int) -> Unit {
+	match c {
+		ChStmt(s) -> match s.kind {
+			SLet(pat, _) | SVar(pat, _) | SLetElse(_, pat, _, _) -> bindPattern(w, pat, True)
+			SFun(d) -> {
+				if let Some(id) = Map.get(Lint.bindersOf(w.f).refs, d.id) {
+					candidate(w, id, d.name, None, Some(d), True)
+					for child in children(ChStmt(s)) { walk(w, child, Vec.append(own, [id])) }
+					return
+				}
+			}
+			SAssign(target, value) -> {
+				let assigned = unparen(target)
+				if let EVar(_, _) = assigned.kind {
+					if let Some(id) = Map.get(Lint.bindersOf(w.f).refs, assigned.id) {
+						reference(w, assigned, id, [id])
+						walk(w, ChExpr(value), Vec.append(own, [id]))
+						return
+					}
+				}
+			}
+			SExpr(_) -> {}
+		}
+		ChExpr(e) -> match e.kind {
+			EVar(_, _) -> if let Some(id) = Map.get(Lint.bindersOf(w.f).refs, e.id) {
+				reference(w, e, id, own)
+			}
+			EForIn(pat, _, _, _, _)                             -> bindPattern(w, pat, False)
+			EIfLet(conditions, _, _) | EWhileLet(conditions, _) -> bindConditions(w, conditions)
+			_                                                   -> {}
+		}
+		ChArm(a) -> {
+			for p in a.patterns { bindPattern(w, p, False) }
+			for g in a.guards {
+				if let GLet(alts, _) = g {
+					for p in alts { bindPattern(w, p, False) }
+				}
+			}
+		}
+		ChFun(_) -> {}
+	}
+	for child in children(c) { walk(w, child, own) }
+}
+
+-- Records a reference to `id`, which is its own if `own` holds it.
+fun reference(w : Walk, e : Expr, id : Int, own : Vec Int) -> Unit {
+	let c = match Map.get(w.candidates, id) {
+		Some(c) -> c
+		None    -> return
+	}
+	if Vec.contains(own, id) { Vec.push(c.own, e) } else { c.reads = c.reads + 1 }
+}
+
+-- Makes a candidate of each variable the conditions bind. A later condition
+-- that binds the name of a `var` condition's variable is assignable in the
+-- body because of it, so that variable cannot be renamed.
+fun bindConditions(w : Walk, conditions : Vec Condition) -> Unit {
+	for var k = 0; k < len(conditions); k = k + 1 {
+		let CondLet(_, isVar, alts, _) = conditions[k] else { continue }
+		let later = Set.new()
+		if isVar {
+			for var j = k + 1; j < len(conditions); j = j + 1 {
+				if let CondLet(_, _, others, _) = conditions[j] {
+					for p in others {
+						for name in patternVars(p) { Set.add(later, name) }
+					}
+				}
+			}
+		}
+		for alt in alts { bindVariables(w, alt, False, later) }
+	}
+}
+
+-- Makes a candidate of each variable `p` binds. `whole` is whether `p` is the
+-- whole pattern of a `let`, `var` or `let ... else`.
+fun bindPattern(w : Walk, p : Pat, whole : Bool) -> Unit = bindVariables(w, p, whole, Set.new())
+
+-- `bindPattern`, where the variables named in `fixed` cannot be renamed.
+fun bindVariables(w : Walk, p : Pat, whole : Bool, fixed : Set.Set String) -> Unit {
+	let found = []
+	variables(p, None, found)
+	for o in found {
+		let PVar(name) = o.pat.kind else { continue }
+		if let Some(id) = Map.get(Lint.bindersOf(w.f).refs, o.pat.id) {
+			candidate(w, id, name, Some(o), None, whole && isVariable(p))
+			if Set.contains(fixed, name) {
+				if let Some(c) = Map.get(w.candidates, id) { c.fixable = False }
+			}
+		}
+	}
+}
+
+fun isVariable(p : Pat) -> Bool = match p.kind {
+	PVar(_)          -> True
+	PAnnot(inner, _) -> isVariable(inner)
+	PParen(inner)    -> isVariable(inner)
+	_                -> False
+}
+
+-- Adds every variable of `p` to `out`, the later alternatives' of a `POr`
+-- included, each with the record field `p` is the whole of, if it is one.
+fun variables(p : Pat, field : Option String, out : Vec Occurrence) -> Unit = match p.kind {
+	PVar(_)               -> Vec.push(out, Occurrence { pat = p, field = field })
+	PWild                 -> {}
+	PLit(_, _)            -> {}
+	PCon(_, args)         -> for a in args { variables(a, None, out) }
+	PRecord(_, fields, _) -> for (name, sub) in fields { variables(sub, Some(name), out) }
+	PTuple(elems)         -> for e in elems { variables(e, None, out) }
+	PAnnot(inner, _)      -> variables(inner, field, out)
+	POr(alts)             -> for a in alts { variables(a, None, out) }
+	PParen(inner)         -> variables(inner, field, out)
+}
+
+fun candidate(
+	w : Walk,
+	id : Int,
+	name : String,
+	at : Option Occurrence,
+	function : Option FunDecl,
+	named : Bool,
+) -> Unit {
+	if String.startsWith(name, "_") { return }
+	let c = match Map.get(w.candidates, id) {
+		Some(c) -> c
+		None -> {
+			let c = Candidate {
+				name        = name
+				occurrences = []
+				function    = function
+				named       = named
+				own         = []
+				reads       = 0
+				fixable     = True
+			}
+			Map.put(w.candidates, id, c)
+			Vec.push(w.order, id)
+			c
+		}
+	}
+	if let Some(o) = at { Vec.push(c.occurrences, o) }
+}
+
+fun found(w : Walk, id : Int) -> Candidate = match Map.get(w.candidates, id) {
+	Some(c) -> c
+	None    -> error("Usage.found: no candidate for a binder in the order")
+}
+
+-- Reports `c`, which nothing reads, with the fix that renames it `_name`, or
+-- for a variable inside a pattern, writes `_` in its place.
+fun unused(f : File, c : Candidate, out : Vec Finding) -> Unit {
+	let at = match c.function {
+		Some(d) -> nameIn(f, d)
+		None    -> if len(c.occurrences) > 0 { c.occurrences[0].pat.span } else { return }
+	}
+	if Source.isGenerated(at) || Source.isEmpty(at) { return }
+	let renamed = "_" + c.name
+	let rename = c.named || len(c.own) > 0
+	let edits = []
+	var mechanical = c.fixable && (!rename || !String.contains(Lint.sourceOf(f), renamed))
+	for o in c.occurrences {
+		let s = o.pat.span
+		if Source.isGenerated(s) || Source.isEmpty(s) { mechanical = False }
+		let text = if rename { renamed } else { "_" }
+		Vec.push(edits, Edit {
+			span = s
+			text = if punned(f, o, c.name) { c.name + " = " + text } else { text }
+		})
+	}
+	if Option.isSome(c.function) { Vec.push(edits, Edit { span = at, text = renamed }) }
+	for e in c.own {
+		if Source.isGenerated(e.span) || Source.isEmpty(e.span) { mechanical = False }
+		Vec.push(edits, Edit { span = e.span, text = renamed })
+	}
+	let what = match c.function {
+		Some(_) -> "the function '" + c.name + "' is never called"
+		None -> if len(c.own) > 0 {
+			"'" + c.name + "' is assigned but never read"
+		} else {
+			"'" + c.name + "' is never used"
+		}
+	}
+	let advice = if !c.fixable {
+		""
+	} else if rename {
+		"; rename it '" + renamed + "' if that is meant"
+	} else {
+		"; write '_' in its place if that is meant"
+	}
+	Vec.push(out, Finding {
+		span    = at
+		message = what + advice
+		fix     = Some(Fix { edits = edits, mechanical = mechanical })
+	})
+}
+
+-- Whether the variable `o` is a record field written by punning, `R { x }`,
+-- where the field's name is all the text there is.
+fun punned(f : File, o : Occurrence, name : String) -> Bool {
+	if o.field != Some(name) { return False }
+	let s = o.pat.span
+	var at = Lint.offsetOf(f, s.line, s.col) - 1
+	while at >= 0 {
+		let c = Lint.charAt(f, Lint.spanOf(f, at, at, s))
+		match c {
+			Some(' ') | Some('\t') | Some('\n') -> { at = at - 1 }
+			Some('=')                           -> return False
+			_                                   -> return True
+		}
+	}
+	True
+}
+
+-- The span of a function's name, which its declaration's span begins just
+-- before: `fun name`. A top-level function's name is internal by now.
+fun nameIn(f : File, d : FunDecl) -> Span {
+	let start = Lint.offsetOf(f, d.span.line, d.span.col)
+	let name = bare(d.name)
+	-- Only the start of the declaration, which holds its name: the whole of
+	-- a long body would be copied for nothing.
+	let head = Source.endingAt(d.span, d.span.line, d.span.col + 16 + String.codePointCount(name))
+	let text = Lint.textOf(f, head)
+	let Some(after) = String.stripPrefix(text, "fun") else { return Source.emptyAt(d.span) }
+	let gap = String.codePointCount(text) - String.codePointCount(after)
+	let trimmed = String.trimStart(after)
+	let from = start + gap + (String.codePointCount(after) - String.codePointCount(trimmed))
+	if !String.startsWith(trimmed, name) { return Source.emptyAt(d.span) }
+	Lint.spanOf(f, from, from + String.codePointCount(name), d.span)
+}
+
+-- -- unused-import ------------------------------------------------------------------
+--
+-- An import, or an entry of its list, that brings names no reference reads.
+-- What a reference read is recorded as resolution looks names up
+-- (`Turkey.Modules.importUses`), so a name means the import only if the
+-- module did not shadow it: a top-level declaration with the name of an
+-- imported one hides the import from every reference, and the finding says
+-- which declaration does.
+--
+-- A name or qualifier the module's export list passes on is used by the
+-- export. `x as _` brings nothing and is not reported. `import M ()` is
+-- written for what loading `M` does, and is reported only where that is
+-- nothing.
+--
+-- The fix deletes the entry with the comma that separates it from the next,
+-- or the previous for the last. When nothing an import brings is used, it
+-- deletes the whole import, or keeps it as `import M ()` (`Whole`), and every
+-- finding of that import has the same fix.
+
+fun unusedImport(f : File) -> Vec Finding {
+	let exported = exportedNames(Lint.programOf(f))
+	let imports = Lint.importsOf(f)
+	-- Each import's parts, which are consecutive, and those of them unused.
+	let groups = []
+	var i = 0
+	while i < len(imports) {
+		let decl = imports[i].decl
+		var j = i
+		while j < len(imports) && sameSpan(imports[j].decl.span, decl.span) { j = j + 1 }
+		let parts = Vec.slice(imports, i, j)
+		Vec.push(groups, (
+			decl,
+			parts,
+			Vec.filter(parts, fun(u) = !u.used && !reexported(u, exported)),
+		))
+		i = j
+	}
+	-- The modules some import of which stays, so that deleting another
+	-- import of one leaves it loaded.
+	let kept = Set.new()
+	for (decl, parts, unusedParts) in groups {
+		if len(unusedParts) < len(parts) || Iter.any(parts, _.inert) { Set.add(kept, decl.name) }
+	}
+	let rewritten = Set.new()
+	let out = []
+	for (decl, parts, unusedParts) in groups {
+		let whole = if len(unusedParts) < len(parts) {
+			None
+		} else if Set.contains(kept, decl.name) || Set.contains(rewritten, decl.name) {
+			Some(Delete)
+		} else {
+			Set.add(rewritten, decl.name)
+			Some(LoadOnly)
+		}
+		let unusedEntries = []
+		for u in unusedParts {
+			if let Entry(entry) = u.part { Vec.push(unusedEntries, entry.item.span) }
+		}
+		for u in unusedParts { importFinding(f, u, whole, unusedEntries, out) }
+	}
+	out
+}
+
+-- What the fix does with an import none of which is used. Deleting the last
+-- import of a module stops the module being loaded, and with it its
+-- instances and the initializers of its top-level bindings, so that import is
+-- written `import M ()` instead, which brings no names and keeps the module.
+-- The imports of a module whose loading changes nothing a program runs
+-- (`ImportUse`'s `inert`) are deleted.
+type Whole = Delete | LoadOnly
+
+fun sameSpan(a : Span, b : Span) -> Bool =
+	a.line == b.line && a.col == b.col && a.endLine == b.endLine && a.endCol == b.endCol
+
+-- The names and qualifiers the module's export list names.
+fun exportedNames(p : Program) -> Set.Set String {
+	let out = Set.new()
+	if let Some(d) = p.exportDecl {
+		for item in d.items {
+			Set.add(out, if item.qualifier { "module " + item.name } else { item.name })
+		}
+	}
+	out
+}
+
+fun reexported(u : ImportUse, exported : Set.Set String) -> Bool = match u.part {
+	Qualifier -> Set.contains(exported, "module " + Option.unwrapOr(u.decl.alias, u.decl.name))
+	Entry(entry) -> {
+		let under = Option.unwrapOr(entry.rename, entry.item.name)
+		Set.contains(exported, if entry.item.qualifier { "module " + under } else { under })
+	}
+	Rest | Empty -> False
+}
+
+fun importFinding(
+	f : File,
+	u : ImportUse,
+	whole : Option Whole,
+	unusedEntries : Vec Span,
+	out : Vec Finding,
+) -> Unit {
+	let decl = u.decl
+	let (span, what) = match u.part {
+		Qualifier -> (
+			decl.span,
+			"the qualifier '" + Option.unwrapOr(decl.alias, decl.name) + "' is never used",
+		)
+		Entry(entry) -> {
+			let under = Option.unwrapOr(entry.rename, entry.item.name)
+			let shown = if entry.item.qualifier { "module " + under } else { under }
+			let hidden = if u.shadowed {
+				match declarationOf(Lint.programOf(f), under) {
+					Some(s) -> ", since the declaration of '"
+						+ under
+						+ "' on line "
+						+ Int.toString(s.line)
+						+ " hides it"
+					None -> ", since a declaration of this module hides it"
+				}
+			} else {
+				""
+			}
+			(entry.item.span, "'" + shown + "' is imported and never used" + hidden)
+		}
+		Rest  -> (decl.span, "nothing that '..' imports from '" + decl.name + "' is used")
+		Empty -> (decl.span, "loading '" + decl.name + "' changes nothing the program does")
+	}
+	if Source.isGenerated(span) || Source.isEmpty(span) { return }
+	let (fix, remove) = match whole {
+		Some(Delete) -> (Some(wholeLine(f, decl)), "remove the import")
+		Some(LoadOnly) -> (
+			Some(loadOnly(f, decl)),
+			"remove the import, or write 'import "
+				+ decl.name
+				+ " ()' if the module is needed only for its instances or its initialization",
+		)
+		None -> match u.part {
+			Qualifier -> (aliasFix(f, decl), "remove 'as " + Option.unwrapOr(decl.alias, "") + "'")
+			Entry(entry) -> (Some(entryFix(f, decl, entry, unusedEntries)), "remove it")
+			Rest         -> (None, "remove '..'")
+			Empty        -> (None, "remove the import")
+		}
+	}
+	Vec.push(out, Finding { span = span, message = what + "; " + remove, fix = fix })
+}
+
+-- Where the module declares `name` at the top level, if it does.
+fun declarationOf(p : Program, name : String) -> Option Span {
+	for d in p.decls {
+		match d {
+			DStmt(s) -> match s.kind {
+				SFun(fd) -> if bare(fd.name) == name { return Some(fd.span) }
+				SLet(pat, _) | SVar(pat, _) | SLetElse(_, pat, _, _) ->
+					for v in patternVars(pat) {
+						if bare(v) == name { return Some(s.span) }
+					}
+				_ -> {}
+			}
+			DType(t) -> {
+				if t.name == name { return Some(t.span) }
+				for c in Option.unwrapOr(t.variants, []) {
+					if c.name == name { return Some(c.span) }
+				}
+			}
+			DClass(c) -> {
+				if c.name == name { return Some(c.span) }
+				for m in c.methods {
+					if m.name == name { return Some(m.span) }
+				}
+			}
+			DForeign(x)  -> if bare(x.name) == name { return Some(x.span) }
+			DInfix(op)   -> if op.op == name { return Some(op.span) }
+			DInstance(_) -> {}
+		}
+	}
+	None
+}
+
+-- A top-level name without the module part resolution gave it, `M#name`.
+fun bare(internal : String) -> String = match String.splitOnce(internal, "#") {
+	Some((_, short)) -> short
+	None             -> internal
+}
+
+-- Deletes `decl` and the line break after it.
+fun wholeLine(f : File, decl : ImportDecl) -> Fix {
+	let s = decl.span
+	let from = Lint.offsetOf(f, s.line, s.col)
+	var to = Lint.offsetOf(f, s.endLine, s.endCol)
+	var kept = True
+	loop {
+		match Lint.charAt(f, Lint.spanOf(f, to, to, s)) {
+			Some(' ') | Some('\t') -> { to = to + 1 }
+			Some('\n') -> {
+				to = to + 1
+				break
+			}
+			None -> break
+			_ -> {
+				-- Something follows on the line: a comment, or another
+				-- statement. Delete the import alone, and not mechanically,
+				-- since a comment left behind is about the import.
+				kept = False
+				break
+			}
+		}
+	}
+	let end = if kept { to } else { Lint.offsetOf(f, s.endLine, s.endCol) }
+	Fix {
+		edits      = [Edit { span = Lint.spanOf(f, from, end, s), text = "" }]
+		mechanical = kept && !String.contains(Lint.textOf(f, s), "--")
+	}
+}
+
+-- Writes `decl` as `import M ()`. Mechanical only for a module whose name has
+-- a dot, for the reason `aliasFix` gives, and where no comment would go.
+fun loadOnly(f : File, decl : ImportDecl) -> Fix = Fix {
+	edits = [Edit { span = decl.span, text = "import " + decl.name + " ()" }]
+	mechanical = String.contains(decl.name, ".")
+		&& !String.contains(Lint.textOf(f, decl.span), "--")
+}
+
+-- Deletes ` as Q` from `import M as Q (...)`. Mechanical only for a module
+-- whose name has a dot: an undotted name is also a qualifier the Prelude may
+-- give, which an import's own replaces.
+fun aliasFix(f : File, decl : ImportDecl) -> Option Fix {
+	let alias = match decl.alias {
+		Some(a) -> a
+		None    -> return None
+	}
+	let s = decl.span
+	let start = Lint.offsetOf(f, s.line, s.col)
+	let text = Lint.textOf(f, s)
+	let written = " as " + alias
+	let at = match String.splitOnce(text, written) {
+		Some((before, _)) -> String.codePointCount(before)
+		None              -> return None
+	}
+	let from = start + at
+	Some(Fix {
+		edits = [
+			Edit {
+				span = Lint.spanOf(f, from, from + String.codePointCount(written), s)
+				text = ""
+			},
+		]
+		mechanical = String.contains(decl.name, ".")
+	})
+}
+
+-- Deletes `entry` from the list of `decl`, with the other entries of the
+-- run of unused ones it is in, given by their spans in `unusedEntries`. Every
+-- entry of one run has the same fix, and no two runs' fixes overlap: a run
+-- is deleted with the comma after it, up to the next entry, or for the run
+-- at the end of the list, with the comma before it, from the entry before.
+-- Not mechanical where a comment would go with it.
+fun entryFix(f : File, decl : ImportDecl, entry : ImportItem, unusedEntries : Vec Span) -> Fix {
+	if withheld(decl, entry) { return unrename(f, entry) }
+	let items = Option.unwrapOr(decl.items, [])
+	let isUnused = fun(k : Int) = !withheld(decl, items[k])
+		&& Iter.any(unusedEntries, sameSpan(_, items[k].item.span))
+	var first = 0
+	while first < len(items) && !sameSpan(items[first].item.span, entry.item.span) {
+		first = first + 1
+	}
+	var last = first
+	while first > 0 && isUnused(first - 1) { first = first - 1 }
+	while last + 1 < len(items) && isUnused(last + 1) { last = last + 1 }
+	let like = entry.item.span
+	let (from, _) = extent(f, items[first])
+	let (_, to) = extent(f, items[last])
+	let next = skipForward(f, to, like)
+	let previous = skipBack(f, from, like)
+	let (start, end) = if at(f, next, like) == Some(',') {
+		(from, skipForward(f, next + 1, like))
+	} else if at(f, previous - 1, like) == Some(',') {
+		(previous - 1, to)
+	} else {
+		-- The whole list: delete it with its parentheses and the space
+		-- before them.
+		(skipBack(f, previous - 1, like), next + 1)
+	}
+	let span = Lint.spanOf(f, start, end, like)
+	Fix {
+		edits      = [Edit { span = span, text = "" }]
+		mechanical = !String.contains(Lint.textOf(f, span), "--")
+	}
+}
+
+-- Whether `entry` renames a name that the `..` of `decl` would otherwise
+-- bring under its own: `x as y` beside `..` also keeps `x` out, so deleting
+-- it would bring `x`.
+fun withheld(decl : ImportDecl, entry : ImportItem) -> Bool =
+	decl.rest && Option.isSome(entry.rename)
+
+-- Writes `x as y` as `x as _`, which brings nothing and still keeps `x` out
+-- of the `..` beside it.
+fun unrename(f : File, entry : ImportItem) -> Fix {
+	let (_, to) = extent(f, entry)
+	let under = Option.unwrapOr(entry.rename, "")
+	let from = to - String.codePointCount(under)
+	Fix {
+		edits      = [Edit { span = Lint.spanOf(f, from, to, entry.item.span), text = "_" }]
+		mechanical = True
+	}
+}
+
+-- Where an entry's text begins and ends: an operator's parentheses and a
+-- rename's `as y` included.
+fun extent(f : File, entry : ImportItem) -> (Int, Int) {
+	let s = entry.item.span
+	var from = Lint.offsetOf(f, s.line, s.col)
+	var to = Lint.offsetOf(f, s.endLine, s.endCol)
+	-- An operator's entry spans the operator, inside its parentheses.
+	if isOperator(entry.item.name) {
+		from = skipBack(f, from, s)
+		if at(f, from - 1, s) == Some('(') { from = from - 1 }
+		to = skipForward(f, to, s)
+		if at(f, to, s) == Some(')') { to = to + 1 }
+	}
+	if let Some(under) = entry.rename {
+		let after = skipForward(f, to, s)
+		if Lint.textOf(f, Lint.spanOf(f, after, after + 2, s)) == "as" {
+			to = skipForward(f, after + 2, s) + String.codePointCount(under)
+		}
+	}
+	(from, to)
+}
+
+fun isOperator(name : String) -> Bool = match String.decode(name, String.start(name)) {
+	Some(c) -> !Char.isAsciiAlpha(c) && c != '_'
+	None    -> False
+}
+
+-- The character at the offset `offset`.
+fun at(f : File, offset : Int, like : Span) -> Option Char =
+	if offset < 0 { None } else { Lint.charAt(f, Lint.spanOf(f, offset, offset, like)) }
+
+-- The first offset from `offset` on that is not white space.
+fun skipForward(f : File, offset : Int, like : Span) -> Int {
+	var to = offset
+	while isSpace(at(f, to, like)) { to = to + 1 }
+	to
+}
+
+-- The offset just after the last character before `offset` that is not white
+-- space.
+fun skipBack(f : File, offset : Int, like : Span) -> Int {
+	var from = offset
+	while isSpace(at(f, from - 1, like)) { from = from - 1 }
+	from
+}
+
+fun isSpace(c : Option Char) -> Bool = match c {
+	Some(' ') | Some('\t') | Some('\n') | Some('\r') -> True
+	_                                                -> False
+}
+
+-- -- unused-private-function --------------------------------------------------------
+--
+-- A top-level `fun`, `let` or `var` of a module with an export list that the
+-- list does not name, and that nothing reaches. What reaches a binding is a
+-- reference from a root, or from a binding a root reaches: the roots are the
+-- declarations the module exports, `main`, what an `infix` declaration means,
+-- the functions the runtime enters by name (`Turkey.Runtime.entryPoints`),
+-- every class and instance method, and every `let` or `var` whose initializer
+-- may run code. A `foreign` definition is called from outside and is never
+-- reported, and a name that starts with `_` says it is unused on purpose. A
+-- module whose export list has a `..` exports everything it declares, and
+-- the entry has no list, so neither has anything to report.
+--
+-- Private bindings that refer only to each other, a function's own
+-- recursion included, are all unreached. There is no mechanical fix: the
+-- binding may have been meant for the export list.
+
+-- A top-level declaration: the private bindings it makes, none for a root,
+-- and the top-level binders its body refers to.
+-- A binding's place is its pattern variable's span, or for a function, the
+-- function, whose name is found in the text only if it is reported: finding
+-- it reads the text, which nothing else here needs.
+type TopLevel = TopLevel { bound : Vec (Int, String, Either FunDecl Span), refers : Vec Int }
+
+fun unusedPrivateFunction(f : File) -> Vec Finding {
+	let program = Lint.programOf(f)
+	let exported = match program.exportDecl {
+		Some(d) -> if d.rest { return [] } else { exportedNames(program) }
+		None    -> return []
+	}
+	let refs = Lint.bindersOf(f).refs
+	-- What an `infix` declaration means is reached through the operator, by
+	-- uses here and in its importers alike.
+	let operands = Set.new()
+	for d in program.decls {
+		if let DInfix(op) = d { Set.add(operands, bare(op.target)) }
+	}
+	let isPrivate = fun(internal : String) {
+		let name = bare(internal)
+		!String.startsWith(name, "_")
+			&& !Set.contains(exported, name)
+			&& !Set.contains(operands, name)
+			&& name != "main"
+			&& !Array.contains(Rt.entryPoints, internal)
+	}
+	let tops = []
+	for d in program.decls {
+		let bound = []
+		if let DStmt(s) = d {
+			match s.kind {
+				-- A `foreign` definition with a body is called from outside.
+				SFun(fd) -> if isPrivate(fd.name) && Option.isNone(fd.symbol) {
+					if let Some(id) = Binders.named(Lint.bindersOf(f), fd.name) {
+						Vec.push(bound, (id, "the function '" + bare(fd.name) + "'", Left(fd)))
+					}
+				}
+				-- A binding whose initializer may run code may be there for
+				-- what the code does, as `let workers = Scheduler.start()`
+				-- is, so it is a root.
+				SLet(pat, value) | SVar(pat, value) | SLetElse(_, pat, value, _) ->
+					if isInert(value) {
+						for v in varPatterns(pat) {
+							if let (PVar(name), Some(id)) = (v.kind, Map.get(refs, v.id)) {
+								if isPrivate(name) {
+									Vec.push(bound, (id, "'" + bare(name) + "'", Right(v.span)))
+								}
+							}
+						}
+					}
+				SAssign(_, _) | SExpr(_) -> {}
+			}
+		}
+		Vec.push(tops, TopLevel { bound = bound, refers = [] })
+	}
+	-- What a root reaches, and then what that reaches.
+	let reached = Set.new()
+	let pending = []
+	let owner : Map Int Int = Map.new()
+	for k in Int.range(0, len(tops)) {
+		for (id, _, _) in tops[k].bound { Map.put(owner, id, k) }
+	}
+	if len(owner) == 0 { return [] }
+	-- Only references to candidates matter, which keeps the walk below to
+	-- them.
+	for k in Int.range(0, len(tops)) {
+		for c in declChildren(program.decls[k]) { referencesIn(refs, owner, c, tops[k].refers) }
+	}
+	for t in tops {
+		if len(t.bound) == 0 {
+			for id in t.refers { Vec.push(pending, id) }
+		}
+	}
+	while let Some(id) = Vec.pop(pending) {
+		if Set.contains(reached, id) { continue }
+		Set.add(reached, id)
+		if let Some(k) = Map.get(owner, id) {
+			for next in tops[k].refers { Vec.push(pending, next) }
+		}
+	}
+	let out = []
+	for t in tops {
+		for (id, what, place) in t.bound {
+			if Set.contains(reached, id) { continue }
+			let at = match place {
+				Left(fd) -> nameIn(f, fd)
+				Right(s) -> s
+			}
+			if Source.isGenerated(at) || Source.isEmpty(at) {
+				continue
+			}
+			Vec.push(
+				out,
+				Lint.finding(at, what + " is neither exported nor used; export it, or remove it"),
+			)
+		}
+	}
+	out
+}
+
+-- The nodes a top-level declaration holds.
+fun declChildren(d : Decl) -> Vec Child = match d {
+	DStmt(s)                           -> [ChStmt(s)]
+	DClass(c)                          -> Vec.map(c.methods, ChFun)
+	DInstance(i)                       -> Vec.map(i.methods, ChFun)
+	DType(_) | DForeign(_) | DInfix(_) -> []
+}
+
+-- Adds to `out` the binder of every reference in `c` that is one of
+-- `wanted`'s keys. A method reference the compiler wrote means a class
+-- method, which is never one, so those are not walked.
+fun referencesIn(refs : Map Int Int, wanted : Map Int Int, c : Child, out : Vec Int) -> Unit {
+	if let ChExpr(e) = c {
+		if let EVar(_, _) = e.kind {
+			if let Some(id) = Map.get(refs, e.id) {
+				if Map.contains(wanted, id) { Vec.push(out, id) }
+			}
+		}
+	}
+	for child in children(c) { referencesIn(refs, wanted, child, out) }
+}

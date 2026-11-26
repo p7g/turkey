@@ -1,0 +1,878 @@
+export (varNeverReassigned, loopVariableCaptured, unreadAssignment)
+
+--- Checks about local `var`s (`Turkey.Lint`): one never assigned, one a
+--- closure captures from a C-style `for` and keeps past the iteration, and a
+--- value assigned to one that nothing reads.
+
+import Data.BitSet as BitSet
+import Data.Set as Set
+import Turkey.Ast (..)
+import Turkey.Binders as Binders
+import Turkey.Lint (File, Finding(..), Fix(..), Edit(..), finding)
+import Turkey.Lint as Lint
+import Turkey.Source (Span(..))
+import Turkey.Source as Source
+import Turkey.Ssa as Ssa
+import Turkey.Ssa (BlockId(..), Term(..), Slot(..))
+import Turkey.Typed (TypeTable)
+import Turkey.Typed as Typed
+
+-- -- var-never-reassigned -----------------------------------------------------------
+--
+-- A local `var`, `var` condition or `var ... else` none of whose variables
+-- any assignment targets, anywhere in the variables' scope, a lambda's body
+-- included: a lambda shares the variable's cell. The fix writes `let` for
+-- `var`. Once nothing assigns the variable, that changes nothing a program
+-- can do but the variable's type: a `let` generalizes a syntactic value, and
+-- a `var` does not. A generalized `1` is an `Int` at one use and a `Float` at
+-- another where the `var`'s was a `Float` at both, which changes what
+-- `print` writes. So the fix is mechanical only where the initializer is not
+-- a value a `let` could generalize to a type with a class in it
+-- (`mayGeneralize`). Where only some of a pattern's variables are assigned,
+-- the `var` has to stay, and the others are reported with no fix.
+--
+-- The check runs before desugaring. A later condition that binds the name of
+-- a `var` condition's variable is assignable in the body only because of the
+-- `var` condition, so an assignment to it counts as one to the `var`'s, which
+-- could not otherwise be made a `let`.
+--
+-- An initializer that every path overwrites is `unread-assignment`'s to
+-- leave alone; this check is about a `var` with no assignment at all, which
+-- that one never reports, so the two never find the same `var`.
+
+-- A `var` as written: where its keyword is, each variable it binds, with the
+-- binders an assignment to which makes it assigned, whether it is a C-style
+-- `for`'s initializer, and whether writing `let` for it may change its type.
+type Declared = Declared {
+	at          : Span
+	names       : Vec (Pat, Vec Int)
+	initializer : Bool
+	generalizes : Bool
+}
+
+fun varNeverReassigned(f : File) -> Vec Finding {
+	let declared = []
+	let assigned = Set.new()
+	let initializers = Set.new()
+	let binders = Lint.bindersOf(f)
+	let binderOf = fun(p : Pat) = Map.get(binders.refs, p.id)
+	-- The variables of `p`, each with its own binder.
+	let variablesOf = fun(p : Pat) {
+		let out = []
+		for v in varPatterns(p) {
+			if let Some(id) = binderOf(v) { Vec.push(out, (v, [id])) }
+		}
+		out
+	}
+	eachLocal(f, fun(c) {
+		match c {
+			ChStmt(s) -> match s.kind {
+				SVar(pat, value) | SLetElse(True, pat, value, _) -> Vec.push(declared, Declared {
+					at          = s.span
+					names       = variablesOf(pat)
+					initializer = Set.contains(initializers, s.id)
+					generalizes = mayGeneralize(value)
+				})
+				SAssign(target, _) -> {
+					let assignedTo = unparen(target)
+					if let EVar(_, _) = assignedTo.kind {
+						if let Some(id) = Map.get(binders.refs, assignedTo.id) {
+							Set.add(assigned, id)
+						}
+					}
+				}
+				_ -> {}
+			}
+			ChExpr(e) -> match e.kind {
+				EForC(Some(init), _, _, _) -> Set.add(initializers, init.id)
+				EIfLet(conditions, _, _) | EWhileLet(conditions, _) ->
+					for var k = 0; k < len(conditions); k = k + 1 {
+						let CondLet(at, True, alts, _) = conditions[k] else { continue }
+						let names = variablesOf(alts[0])
+						for var j = k + 1; j < len(conditions); j = j + 1 {
+							let CondLet(_, _, others, _) = conditions[j] else { continue }
+							for other in others {
+								for v in varPatterns(other) {
+									for (p, ids) in names {
+										if let (PVar(a), PVar(b), Some(id)) = (
+											p.kind,
+											v.kind,
+											binderOf(v),
+										) {
+											if a == b { Vec.push(ids, id) }
+										}
+									}
+								}
+							}
+						}
+						-- A condition's variables are not generalized.
+						Vec.push(declared, Declared {
+							at          = at
+							names       = names
+							initializer = False
+							generalizes = False
+						})
+					}
+				_ -> {}
+			}
+			_ -> {}
+		}
+		True
+	})
+	let out = []
+	for d in declared {
+		let never = Vec.filter(d.names, fun((_, ids)) = !Iter.any(ids, Set.contains(assigned, _)))
+		if len(never) == 0 { continue }
+		if len(never) == len(d.names) {
+			let keyword = Source.endingAt(d.at, d.at.line, d.at.col + 3)
+			if Source.isGenerated(d.at) || Lint.textOf(f, keyword) != "var" { continue }
+			let shown = String.join(Vec.map(never, fun((p, _)) = quoted(nameOf(p))), " and ")
+			let verb = if len(never) == 1 { " is" } else { " are" }
+			-- A `for`'s initializer gets no fix: a `let` there whose value is
+			-- generalized does not compile.
+			if d.initializer {
+				Vec.push(
+					out,
+					finding(
+						keyword,
+						shown + verb + " never assigned; declare it with 'let' before the loop",
+					),
+				)
+			} else {
+				Vec.push(out, Finding {
+					span    = keyword
+					message = shown + verb + " never assigned; write 'let' in place of 'var'"
+					fix = Some(Fix {
+						edits      = [Edit { span = keyword, text = "let" }]
+						mechanical = !d.generalizes
+					})
+				})
+			}
+		} else {
+			for (p, _) in never {
+				if Source.isGenerated(p.span) { continue }
+				Vec.push(
+					out,
+					finding(
+						p.span,
+						quoted(nameOf(p))
+							+ " is never assigned, but another variable of this 'var' is, so the "
+							+ "'var' must stay",
+					),
+				)
+			}
+		}
+	}
+	out
+}
+
+-- Whether a `let` could generalize `e` to a type with a class in it: whether
+-- `e` is a syntactic value other than a literal or `()` whose type its
+-- spelling fixes. This answers `True` for values a `let` gives a type with
+-- no class in it, such as `True`, which costs only a fix that is not
+-- mechanical.
+fun mayGeneralize(e : Expr) -> Bool = match e.kind {
+	ELit(LString(_), _) | ELit(LChar(_), _) | ELit(LFloat(_), _) | EUnit -> False
+	EParen(x)                                                            -> mayGeneralize(x)
+	_                                                                    -> isValue(e)
+}
+
+-- Whether `e` is a syntactic value, which the value restriction lets a `let`
+-- generalize. A constructor may be mutable, which the value restriction also
+-- asks, so this answers `True` for more than a `let` generalizes.
+fun isValue(e : Expr) -> Bool = match e.kind {
+	ELit(_, _) | EUnit | EVar(_, _) | ECon(_) | ELambda(_, _, _, _) -> True
+	ETuple(xs)                                                      -> Iter.all(xs, isValue)
+	ECall(callee, args) -> match callee.kind {
+		ECon(_) -> Iter.all(args, isValue)
+		_       -> False
+	}
+	ERecord(_, fields)       -> Iter.all(fields, fun((_, x)) = isValue(x))
+	EAnnot(x, _) | EParen(x) -> isValue(x)
+	_                        -> False
+}
+
+fun nameOf(p : Pat) -> String = match p.kind {
+	PVar(name) -> name
+	_          -> "_"
+}
+
+fun quoted(name : String) -> String = "'" + name + "'"
+
+-- Calls `visit` on every node inside a declaration, the bodies of class and
+-- instance methods included, as `Lint.nodes` does, but not on a top-level
+-- statement itself: a top-level `var` is any function's to assign.
+fun eachLocal(f : File, visit : fun(Child) -> Bool) -> Unit {
+	for d in Lint.programOf(f).decls {
+		match d {
+			DStmt(s)                           -> for c in children(ChStmt(s)) { walkIf(c, visit) }
+			DClass(c)                          -> for m in c.methods { walkIf(ChFun(m), visit) }
+			DInstance(i)                       -> for m in i.methods { walkIf(ChFun(m), visit) }
+			DType(_) | DForeign(_) | DInfix(_) -> {}
+		}
+	}
+}
+
+-- Calls `visit` on `c`, and goes into it if `visit` returns `True`.
+fun walkIf(c : Child, visit : fun(Child) -> Bool) -> Unit {
+	if visit(c) {
+		for child in children(c) { walkIf(child, visit) }
+	}
+}
+
+-- -- loop-variable-captured ---------------------------------------------------------
+--
+-- A C-style `for` has one variable for the whole loop: `init` declares it once
+-- and `step` assigns it. A function made in the body that captures it, and
+-- outlives the iteration, sees the value the variable has when the function
+-- runs, which is usually its last.
+--
+-- A function outlives the iteration when it is stored: an argument of
+-- `Vec.push`, `Map.put` or `Task.spawn`, the value of an index or field
+-- assignment, an element of an array or record literal, or the value of a
+-- `return` or `break`; directly, or through a `let` or local `fun` the
+-- position then names. Passed to any other call, it is taken to run during
+-- the iteration, as a callback does.
+--
+-- The fix makes a copy for each iteration, with `let i = i` first in the
+-- body, which is offered only when the body never assigns `i`. It changes
+-- what the function sees, so it is never mechanical.
+
+-- The functions an argument of which outlives the call.
+let storing = ["Data.Vec#push", "Data.Map#put", "System.Task#spawn"]
+
+fun loopVariableCaptured(f : File) -> Vec Finding {
+	let out = []
+	let binders = Lint.bindersOf(f)
+	Lint.nodes(f, fun(c) {
+		if let ChExpr(e) = c {
+			if let EForC(Some(init), _, _, body) = e.kind {
+				if let SVar(pat, _) = init.kind {
+					let ids = []
+					let names = []
+					for v in varPatterns(pat) {
+						if let (PVar(name), Some(id)) = (v.kind, Map.get(binders.refs, v.id)) {
+							Vec.push(ids, id)
+							Vec.push(names, name)
+						}
+					}
+					if len(ids) > 0 { capturedIn(f, ids, names, body, out) }
+				}
+			}
+		}
+		True
+	})
+	out
+}
+
+-- Reports each function made in `body` that captures one of `ids`, bound
+-- by `names`, and outlives the iteration.
+fun capturedIn(
+	f : File,
+	ids : Vec Int,
+	names : Vec String,
+	body : Expr,
+	out : Vec Finding,
+) -> Unit {
+	let binders = Lint.bindersOf(f)
+	-- The functions bound by a `let` or local `fun` in the body, by binder,
+	-- with the variables they capture.
+	let named : Map Int (Span, Vec Int) = Map.new()
+	let reported = Set.new()
+	let report = fun(at : Span, captured : Vec Int) {
+		if Source.isGenerated(at) || Set.contains(reported, (at.line, at.col)) { return }
+		Set.add(reported, (at.line, at.col))
+		Vec.push(out, escaping(f, at, captured, ids, names, body))
+	}
+	-- Reports the functions the expression at a storing position is, or holds
+	-- in a constructor's arguments or a tuple, which are stored with it.
+	fun stored(e : Expr) -> Unit {
+		let x = unwrap(e)
+		match x.kind {
+			ELambda(_, _, inner, _) -> {
+				let captured = capturedBy(binders, inner, ids)
+				if len(captured) > 0 { report(x.span, captured) }
+			}
+			EVar(_, _) -> if let Some(id) = Map.get(binders.refs, x.id) {
+				if let Some((at, captured)) = Map.get(named, id) { report(at, captured) }
+			}
+			ECall(callee, args) -> if let ECon(_) = unwrap(callee).kind {
+				for a in args { stored(a) }
+			}
+			ETuple(xs) -> for x in xs { stored(x) }
+			_          -> {}
+		}
+	}
+	walk(ChExpr(body), fun(c) {
+		match c {
+			ChStmt(s) -> match s.kind {
+				SLet(pat, value) -> if let PVar(_) = unwrapPattern(pat).kind {
+					let x = unwrap(value)
+					if let ELambda(_, _, inner, _) = x.kind {
+						let captured = capturedBy(binders, inner, ids)
+						if let Some(id) = Map.get(binders.refs, unwrapPattern(pat).id) {
+							if len(captured) > 0 { Map.put(named, id, (x.span, captured)) }
+						}
+					}
+				}
+				SFun(d) -> if let Some(inner) = d.body {
+					let captured = capturedBy(binders, inner, ids)
+					if let Some(id) = Map.get(binders.refs, d.id) {
+						if len(captured) > 0 { Map.put(named, id, (d.span, captured)) }
+					}
+				}
+				SAssign(target, value) -> match unparen(target).kind {
+					EIndex(_, _, _, _) | EField(_, _) -> stored(value)
+					_                                 -> {}
+				}
+				_ -> {}
+			}
+			ChExpr(e) -> match e.kind {
+				ECall(fn, args) -> if let EVar(name, _) = unwrap(fn).kind {
+					if Array.contains(storing, name) {
+						for a in args { stored(a) }
+					}
+				}
+				EArray(xs)                         -> for x in xs { stored(x) }
+				ERecord(_, fields)                 -> for (_, x) in fields { stored(x) }
+				EReturn(Some(x)) | EBreak(Some(x)) -> stored(x)
+				_                                  -> {}
+			}
+			_ -> {}
+		}
+	})
+}
+
+-- The finding for a function at `at` that captures `captured`, of the loop
+-- variables `ids` bound by `names`, in the loop body `body`.
+fun escaping(
+	f : File,
+	at : Span,
+	captured : Vec Int,
+	ids : Vec Int,
+	names : Vec String,
+	body : Expr,
+) -> Finding {
+	let shown = []
+	for var k = 0; k < len(ids); k = k + 1 {
+		if Vec.contains(captured, ids[k]) { Vec.push(shown, names[k]) }
+	}
+	let quotedNames = String.join(Vec.map(shown, quoted), " and ")
+	let copies = String.join(Vec.map(shown, fun(n) = "let " + n + " = " + n), "; ")
+	let message = "this function captures "
+		+ quotedNames
+		+ ", one variable for the whole loop, and outlives the iteration; begin the loop's "
+		+ "body with '"
+		+ copies
+		+ "'"
+	Finding {
+		span    = at
+		message = message
+		fix     = if assignsAny(f, body, captured) { None } else { copyFix(f, body, shown) }
+	}
+}
+
+-- The edit that writes `let n = n` for each of `names` first in `body`, a
+-- block. It is never mechanical: a function that sees each iteration's value
+-- in place of the last is the point of the fix, and `check --fix` makes only
+-- changes a program cannot notice.
+fun copyFix(f : File, body : Expr, names : Vec String) -> Option Fix {
+	let EBlock(stmts) = body.kind else { return None }
+	let open = body.span
+	if Source.isGenerated(open) || Lint.charAt(f, open) != Some('{') { return None }
+	let copies = Vec.map(names, fun(n) = "let " + n + " = " + n)
+	let (at, text) = if len(stmts) > 0 && stmts[0].span.line > open.line {
+		-- The body's statements are on lines of their own: so is the copy, at
+		-- their indentation, on the line before the first. A comment after
+		-- the `{` stays on its line.
+		let first = stmts[0].span
+		let lineStart = Lint.offsetOf(f, first.line, 1)
+		let indent = Lint.textOf(
+			f,
+			Lint.spanOf(f, lineStart, Lint.offsetOf(f, first.line, first.col), first),
+		)
+		(
+			Lint.spanOf(f, lineStart, lineStart, first),
+			String.join(Vec.map(copies, fun(c) = indent + c + "\n"), ""),
+		)
+	} else {
+		let after = Span {
+			line    = open.line
+			col     = open.col + 1
+			endLine = open.line
+			endCol  = open.col + 1
+			file    = open.file
+			inlined = None
+		}
+		(after, " " + String.join(copies, "; ") + ";")
+	}
+	Some(Fix { edits = [Edit { span = at, text = text }], mechanical = False })
+}
+
+-- Whether anything in `body` assigns one of `ids`.
+fun assignsAny(f : File, body : Expr, ids : Vec Int) -> Bool {
+	let binders = Lint.bindersOf(f)
+	var found = False
+	walk(ChExpr(body), fun(c) {
+		if let ChStmt(s) = c {
+			if let SAssign(target, _) = s.kind {
+				let t = unparen(target)
+				if let EVar(_, _) = t.kind {
+					if let Some(id) = Map.get(binders.refs, t.id) {
+						if Vec.contains(ids, id) { found = True }
+					}
+				}
+			}
+		}
+	})
+	found
+}
+
+-- Which of `ids` a reference in `e` means.
+fun capturedBy(binders : Binders.Table, e : Expr, ids : Vec Int) -> Vec Int {
+	let out = []
+	walk(ChExpr(e), fun(c) {
+		if let ChExpr(x) = c {
+			if let EVar(_, _) = x.kind {
+				if let Some(id) = Map.get(binders.refs, x.id) {
+					if Vec.contains(ids, id) && !Vec.contains(out, id) { Vec.push(out, id) }
+				}
+			}
+		}
+	})
+	out
+}
+
+fun unwrap(e : Expr) -> Expr = match e.kind {
+	EParen(inner)    -> unwrap(inner)
+	EAnnot(inner, _) -> unwrap(inner)
+	_                -> e
+}
+
+fun unwrapPattern(p : Pat) -> Pat = match p.kind {
+	PParen(inner)    -> unwrapPattern(inner)
+	PAnnot(inner, _) -> unwrapPattern(inner)
+	_                -> p
+}
+
+-- Calls `visit` on `c` and every node below it, a node before what it
+-- contains.
+fun walk(c : Child, visit : fun(Child) -> Unit) -> Unit {
+	visit(c)
+	for child in children(c) { walk(child, visit) }
+}
+
+-- -- unread-assignment --------------------------------------------------------------
+--
+-- An assignment to a local `var` whose value no path reads: every path from
+-- it reaches another assignment to the `var`, or the end of its scope, before
+-- a read. The answer is backward liveness over the function's control flow,
+-- solved by the backend's own slot liveness (`Ssa.slotLiveness`) over a graph
+-- of this check's own instructions, a load or a store of one `var` each.
+-- `Turkey.Ssa`'s value liveness is the wrong one here: a `var` is assigned
+-- any number of times, so it is a slot and not an SSA value.
+--
+-- It runs on the desugared tree, where condition lists and `let ... else` are
+-- already a `match`, and on the program as written, before anything is
+-- inlined, specialized or dropped as unreachable from `main`: each of those
+-- would add or remove stores the author did not write.
+--
+-- Left alone:
+--
+-- * a `var` a function nested in it refers to, which shares the variable's
+--   cell and may read it whenever it runs;
+-- * a `var` nothing reads but its own assignments, which is
+--   `unused-variable`'s, and which every assignment here would report again;
+-- * the initializer of a `var`, which is often written to be overwritten on
+--   every path;
+-- * a store in code nothing reaches, which is `unreachable-code`'s;
+-- * `x = x`, which is `self-assignment`'s.
+--
+-- A call that cannot return ends its path, so a store before it is read only
+-- if a read comes first.
+
+-- One load or store of the `var` numbered `slot`. A store carries the index of
+-- its assignment in `Graph.stores`, or -1 for an initializer.
+type Access = Access { slot : Int, store : Option Int }
+
+instance Show Access {
+	fun show(a) = match a.store {
+		Some(k) -> "store " + Int.toString(a.slot) + " #" + Int.toString(k)
+		None    -> "load " + Int.toString(a.slot)
+	}
+}
+
+-- An access uses and defines no value: what it touches is its slot.
+instance Ssa.Inst Access {
+	fun anyUse(_, _) = False
+	fun anyDef(_, _) = False
+	fun effects(_) = Ssa.reads_()
+	fun renameUses(a, _) = a
+	fun copyOf(_) = None
+	fun slotOf(a) = match a.store {
+		Some(_) -> Stores(a.slot)
+		None    -> Loads(a.slot)
+	}
+}
+
+-- The graph of one function's accesses as it is built.
+type Graph = Graph {
+	f     : Ssa.Func Access
+	types : TypeTable
+	-- The slot of each `var` the function declares and nothing nested in it
+	-- refers to, by binder.
+	slots : Map Int Int
+	-- Where each assignment is, by the index its store carries.
+	stores : Vec Span
+	-- The block accesses are added to.
+	var at : Int
+	-- The block a `return` goes to.
+	var exit : Int
+	-- The innermost loop's `continue` and `break` targets, innermost last.
+	var loops : Vec (Int, Int)
+	-- The value a branch is on. Only slots are analyzed, so one does for all.
+	test : Ssa.Value
+}
+
+fun unreadAssignment(f : File, types : TypeTable) -> Vec Finding {
+	let out = []
+	eachFunction(f, fun(body) = analyze(f, types, body, out))
+	out
+}
+
+-- Calls `visit` on the body of every function the module defines: each
+-- top-level `fun`, method, local `fun` and lambda.
+fun eachFunction(f : File, visit : fun(Expr) -> Unit) -> Unit {
+	Lint.nodes(f, fun(c) {
+		match c {
+			ChFun(d)  -> if let Some(body) = d.body { visit(body) }
+			ChExpr(e) -> if let ELambda(_, _, body, _) = e.kind { visit(body) }
+			_         -> {}
+		}
+		True
+	})
+}
+
+-- Reports the unread assignments of the function whose body is `body`.
+fun analyze(f : File, types : TypeTable, body : Expr, out : Vec Finding) -> Unit {
+	let binders = Lint.bindersOf(f)
+	let slots = varsOf(binders, body)
+	if len(slots) == 0 { return }
+	let fn : Ssa.Func Access = Ssa.newFunc("", [])
+	let g = Graph {
+		f      = fn
+		types  = types
+		slots  = slots
+		stores = []
+		at     = 0
+		exit   = 0
+		loops  = []
+		test   = Ssa.freshValue(fn, Ssa.untraced(Ssa.I1))
+	}
+	g.at = block(g)
+	g.exit = block(g)
+	let graph = g
+	expr(graph, binders, body)
+	jump(graph, g.exit)
+	fn.blocks[g.exit].term = Ret([])
+	let reachable = Ssa.pruneUnreachable(fn)
+	let count = len(slots)
+	let live = Ssa.slotLiveness(reachable, count)
+	let liveSets = Vec.map(live, fun(entering) {
+		let set = BitSet.new(count)
+		for s in entering { BitSet.add(set, s) }
+		set
+	})
+	for b in reachable.blocks {
+		let after = BitSet.new(count)
+		for target in Ssa.successors(b.term) {
+			let _ = BitSet.unionInto(after, liveSets[Ssa.blockId(target)])
+		}
+		for var k = len(b.insts) - 1; k >= 0; k = k - 1 {
+			let a = b.insts[k]
+			match a.store {
+				Some(index) -> {
+					if index >= 0 && !BitSet.contains(after, a.slot) {
+						let at = graph.stores[index]
+						if !Source.isGenerated(at) {
+							Vec.push(out, finding(at, unreadMessage(binders, slots, a.slot)))
+						}
+					}
+					let _ = BitSet.remove(after, a.slot)
+				}
+				None -> BitSet.add(after, a.slot)
+			}
+		}
+	}
+}
+
+fun unreadMessage(binders : Binders.Table, slots : Map Int Int, slot : Int) -> String {
+	var name = "?"
+	for (id, s) in Map.entries(slots) {
+		if s == slot { name = Binders.binderAt(binders, id).name }
+	}
+	"the value assigned to '" + name + "' here is never read"
+}
+
+-- The `var`s `body` declares, outside functions nested in it, that something
+-- reads besides their own assignments and that no function nested in `body`
+-- refers to, each numbered by a slot.
+fun varsOf(binders : Binders.Table, body : Expr) -> Map Int Int {
+	let declared = []
+	let captured = Set.new()
+	let read = Set.new()
+	-- Walks `c`, `depth` functions deep in `body`, inside the assignments to
+	-- the binders `own`.
+	fun scan(c : Child, depth : Int, own : Vec Int) -> Unit {
+		match c {
+			ChStmt(s) -> match s.kind {
+				SVar(pat, _) -> if depth == 0 {
+					for v in varPatterns(pat) {
+						if let Some(id) = Map.get(binders.refs, v.id) { Vec.push(declared, id) }
+					}
+				}
+				SAssign(target, value) -> {
+					let t = unparen(target)
+					if let EVar(_, _) = t.kind {
+						if let Some(id) = Map.get(binders.refs, t.id) {
+							if depth > 0 { Set.add(captured, id) }
+							scan(ChExpr(value), depth, Vec.append(own, [id]))
+							return
+						}
+					}
+				}
+				SFun(d) -> {
+					if let Some(inner) = d.body { scan(ChExpr(inner), depth + 1, own) }
+					return
+				}
+				_ -> {}
+			}
+			ChExpr(e) -> match e.kind {
+				EVar(_, _) -> if let Some(id) = Map.get(binders.refs, e.id) {
+					if depth > 0 { Set.add(captured, id) }
+					if !Vec.contains(own, id) { Set.add(read, id) }
+				}
+				ELambda(_, _, inner, _) -> {
+					scan(ChExpr(inner), depth + 1, own)
+					return
+				}
+				_ -> {}
+			}
+			_ -> {}
+		}
+		for child in children(c) { scan(child, depth, own) }
+	}
+	scan(ChExpr(body), 0, [])
+	let slots = Map.new()
+	for id in declared {
+		if !Set.contains(captured, id) && Set.contains(read, id) && !Map.contains(slots, id) {
+			Map.put(slots, id, len(slots))
+		}
+	}
+	slots
+}
+
+-- -- building the graph -------------------------------------------------------------
+
+fun block(g : Graph) -> Int {
+	Vec.push(g.f.blocks, Ssa.newBlock())
+	len(g.f.blocks) - 1
+}
+
+fun emit(g : Graph, a : Access) -> Unit = Vec.push(g.f.blocks[g.at].insts, a)
+
+-- Ends the current block with `term`, and goes on in a new one nothing
+-- reaches yet.
+fun finish(g : Graph, term : Term) -> Unit {
+	g.f.blocks[g.at].term = term
+	g.at = block(g)
+}
+
+fun jump(g : Graph, target : Int) -> Unit = finish(g, Jump(BlockId(target), []))
+
+-- Ends the current block with a branch to each of `targets`.
+fun branch(g : Graph, targets : Vec Int) -> Unit {
+	let cases = []
+	for var k = 0; k < len(targets); k = k + 1 { Vec.push(cases, (k, BlockId(targets[k]))) }
+	finish(g, Switch(g.test, cases, None))
+}
+
+-- Goes on in `target`, which the current block falls into.
+fun enter(g : Graph, target : Int) -> Unit {
+	jump(g, target)
+	g.at = target
+}
+
+fun load(g : Graph, binders : Binders.Table, e : Expr) -> Unit {
+	if let Some(id) = Map.get(binders.refs, e.id) {
+		if let Some(slot) = Map.get(g.slots, id) { emit(g, Access { slot = slot, store = None }) }
+	}
+}
+
+fun stmt(g : Graph, binders : Binders.Table, s : Stmt) -> Unit = match s.kind {
+	SLet(_, value) -> expr(g, binders, value)
+	SVar(pat, value) -> {
+		expr(g, binders, value)
+		for v in varPatterns(pat) {
+			if let Some(id) = Map.get(binders.refs, v.id) {
+				if let Some(slot) = Map.get(g.slots, id) {
+					emit(g, Access { slot = slot, store = Some(-1) })
+				}
+			}
+		}
+	}
+	SFun(_) -> {}
+	SAssign(target, value) -> {
+		let t = unparen(target)
+		match t.kind {
+			EVar(_, _) -> {
+				expr(g, binders, value)
+				if let Some(id) = Map.get(binders.refs, t.id) {
+					if let Some(slot) = Map.get(g.slots, id) {
+						-- `x = x` is `self-assignment`'s to report. It still
+						-- overwrites what came before.
+						let index = if sameBinder(binders, value, id) {
+							-1
+						} else {
+							Vec.push(g.stores, s.span)
+							len(g.stores) - 1
+						}
+						emit(g, Access { slot = slot, store = Some(index) })
+					}
+				}
+			}
+			_ -> {
+				expr(g, binders, target)
+				expr(g, binders, value)
+			}
+		}
+	}
+	SExpr(e) -> expr(g, binders, e)
+	SLetElse(_, _, value, otherwise) -> {
+		expr(g, binders, value)
+		let rest = block(g)
+		let other = block(g)
+		branch(g, [rest, other])
+		g.at = other
+		expr(g, binders, otherwise)
+		jump(g, rest)
+		g.at = rest
+	}
+}
+
+-- Whether `value` is a reference to the binder `id` and nothing else.
+fun sameBinder(binders : Binders.Table, value : Expr, id : Int) -> Bool {
+	let v = unparen(value)
+	match v.kind {
+		EVar(_, _) -> Map.get(binders.refs, v.id) == Some(id)
+		_          -> False
+	}
+}
+
+fun expr(g : Graph, binders : Binders.Table, e : Expr) -> Unit = match e.kind {
+	EVar(_, _)          -> load(g, binders, e)
+	ELambda(_, _, _, _) -> {}
+	EIf(cond, then, otherwise) -> {
+		expr(g, binders, cond)
+		let yes = block(g)
+		let no = block(g)
+		let join = block(g)
+		branch(g, [yes, no])
+		g.at = yes
+		expr(g, binders, then)
+		jump(g, join)
+		g.at = no
+		if let Some(x) = otherwise { expr(g, binders, x) }
+		enter(g, join)
+	}
+	EBinary(op, left, right, _) -> if op == "&&" || op == "||" {
+		expr(g, binders, left)
+		let evaluated = block(g)
+		let join = block(g)
+		branch(g, [evaluated, join])
+		g.at = evaluated
+		expr(g, binders, right)
+		enter(g, join)
+	} else {
+		expr(g, binders, left)
+		expr(g, binders, right)
+	}
+	EMatch(scrutinee, arms) -> {
+		expr(g, binders, scrutinee)
+		let join = block(g)
+		let entries = Vec.map(arms, fun(_) = block(g))
+		-- Every arm may be tried first, and a guard that fails goes on to any
+		-- arm after it. A `match` that compiles is exhaustive, so no path
+		-- leaves it without taking an arm.
+		branch(g, entries)
+		for var k = 0; k < len(arms); k = k + 1 {
+			g.at = entries[k]
+			for guard in arms[k].guards {
+				expr(g, binders, guardExpr(guard))
+				let holds = block(g)
+				branch(g, Vec.append([holds], Vec.slice(entries, k + 1, len(entries))))
+				g.at = holds
+			}
+			expr(g, binders, arms[k].body)
+			jump(g, join)
+		}
+		g.at = join
+	}
+	ELoop(body)        -> loopOf(g, binders, False, None, body, None)
+	EWhile(cond, body) -> loopOf(g, binders, True, Some(cond), body, None)
+	EForIn(_, iterable, body, _, _) -> {
+		expr(g, binders, iterable)
+		loopOf(g, binders, True, None, body, None)
+	}
+	EForC(init, cond, step, body) -> {
+		if let Some(s) = init { stmt(g, binders, s) }
+		loopOf(g, binders, True, Some(cond), body, step)
+	}
+	EReturn(value) -> {
+		if let Some(x) = value { expr(g, binders, x) }
+		jump(g, g.exit)
+	}
+	EBreak(value) -> {
+		if let Some(x) = value { expr(g, binders, x) }
+		if len(g.loops) > 0 { jump(g, g.loops[len(g.loops) - 1].1) }
+	}
+	EContinue     -> if len(g.loops) > 0 { jump(g, g.loops[len(g.loops) - 1].0) }
+	EBlock(stmts) -> for s in stmts { stmt(g, binders, s) }
+	ECall(_, _) -> {
+		for c in children(ChExpr(e)) {
+			if let ChExpr(x) = c { expr(g, binders, x) }
+		}
+		if !Typed.canReturn(g.types, e) { finish(g, Unreachable) }
+	}
+	_ -> for c in children(ChExpr(e)) {
+		if let ChExpr(x) = c { expr(g, binders, x) }
+	}
+}
+
+-- A loop: `test` before each round, then `body`, then `step` before the
+-- next. A loop that `tests` may leave before any round, after its `test`
+-- if it has one, and every loop leaves by `break`.
+fun loopOf(
+	g : Graph,
+	binders : Binders.Table,
+	tests : Bool,
+	test : Option Expr,
+	body : Expr,
+	step : Option Stmt,
+) -> Unit {
+	let header = block(g)
+	let entered = block(g)
+	let next = block(g)
+	let after = block(g)
+	enter(g, header)
+	if let Some(t) = test { expr(g, binders, t) }
+	if tests { branch(g, [entered, after]) } else { jump(g, entered) }
+	g.at = entered
+	g.loops = Vec.append(g.loops, [(next, after)])
+	expr(g, binders, body)
+	g.loops = Vec.slice(g.loops, 0, len(g.loops) - 1)
+	enter(g, next)
+	if let Some(s) = step { stmt(g, binders, s) }
+	jump(g, header)
+	g.at = after
+}

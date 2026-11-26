@@ -7,74 +7,38 @@ export (run)
 import Turkey.Diag as Diag
 import Data.Map as Map
 import Data.BitSet as BitSet
-import Data.BitSet (BitSet)
 import Turkey.LowIr as L
 import Turkey.LowIr (Op(..), Low(..))
 import Turkey.Position as Position
 import Turkey.Ssa as Ssa
-import Turkey.Ssa (Value(..), BlockId(..), Term(..), Rep(..))
+import Turkey.Ssa (Value(..), BlockId(..), Term(..))
 
 fun run(input : Ssa.Func Low) -> Ssa.Func Low {
 	let f = Ssa.pruneUnreachable(input)
-	-- Slots are numbered densely per function, so the sets below are bitsets
-	-- of the highest one. Most functions have none, and pay only this scan.
+	-- Slots are numbered densely per function, so the liveness sets are
+	-- bitsets of the highest one. Most functions have none, and pay only
+	-- this scan.
 	var slotCount = 0
-	for block in f.blocks {
-		for inst in block.insts {
-			match inst.op {
-				SlotLoad(slot) | SlotStore(slot, _) ->
-					if slot >= slotCount { slotCount = slot + 1 }
-				_ -> {}
-			}
-		}
-	}
-	if slotCount == 0 { return f }
 	let reps = Map.new()
-	-- Each block's needed slots twice: as a list, whose order is the order of
-	-- the parameters the block gains and of the arguments every edge into it
-	-- passes, and as a bitset, to ask whether one is there already.
-	let needed : Vec (Vec Int) = []
-	let neededSet : Vec BitSet = []
-	let written : Vec BitSet = []
 	for block in f.blocks {
-		let use = []
-		let useSet = BitSet.new(slotCount)
-		let defs = BitSet.new(slotCount)
 		for inst in block.insts {
 			match inst.op {
 				SlotLoad(slot) -> {
-					if !BitSet.contains(defs, slot) && !BitSet.contains(useSet, slot) {
-						BitSet.add(useSet, slot)
-						Vec.push(use, slot)
-					}
+					if slot >= slotCount { slotCount = slot + 1 }
 					Map.put(reps, slot, Ssa.repOf(f, inst.result))
 				}
 				SlotStore(slot, v) -> {
-					BitSet.add(defs, slot)
+					if slot >= slotCount { slotCount = slot + 1 }
 					Map.put(reps, slot, Ssa.repOf(f, v))
 				}
 				_ -> {}
 			}
 		}
-		Vec.push(needed, use)
-		Vec.push(neededSet, useSet)
-		Vec.push(written, defs)
 	}
-	var changed = True
-	while changed {
-		changed = False
-		for var b = len(f.blocks) - 1; b >= 0; b = b - 1 {
-			for target in Ssa.successors(f.blocks[b].term) {
-				for slot in needed[Ssa.blockId(target)] {
-					if !BitSet.contains(written[b], slot) && !BitSet.contains(neededSet[b], slot) {
-						BitSet.add(neededSet[b], slot)
-						Vec.push(needed[b], slot)
-						changed = True
-					}
-				}
-			}
-		}
-	}
+	if slotCount == 0 { return f }
+	-- Each block's live slots, in the order of the parameters the block
+	-- gains and of the arguments every edge into it passes.
+	let needed = Ssa.slotLiveness(f, slotCount)
 	if len(needed[Ssa.blockId(f.entry)]) > 0 {
 		panic("slot promotion: uninitialized local in " + f.name)
 	}
@@ -173,7 +137,7 @@ fun run(input : Ssa.Func Low) -> Ssa.Func Low {
 	-- edge. Remove those, including loop parameters whose only other input
 	-- is themselves, so native selection need not pay for redundant copies.
 	let preds = Ssa.predecessors(f)
-	changed = True
+	var changed = True
 	while changed {
 		changed = False
 		for var b = 0; b < count; b = b + 1 {

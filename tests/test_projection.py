@@ -81,7 +81,7 @@ def test_exhaustiveness_deeply_resolves_an_index_family_payload():
 fun head(xs) = Some(xs[0])
 fun main() {
     match head([(1, "x")]) {
-        Some((a, b)) -> print(a)
+        Some((a, _)) -> print(a)
         None -> print(0)
     }
 }

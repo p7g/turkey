@@ -4,11 +4,13 @@
 //
 // Messages in:  { type: "compile", id, source }
 // Messages out: { type: "status", text }            progress while loading
-//               { type: "ready" }                   the compiler is loaded
+//               { type: "ready", baseline }         the compiler is loaded;
+//                 baseline is the refused-function count of a program that prints
 //               { type: "failed", text }            loading failed for good
 //               { type: "compiled", id, bytes, status, diagnostics, ms }
 
 import { loadCompiler, compile } from "./host.js";
+import { refusedCount } from "./diagnostics.js";
 
 // Both files are fetched with the default cache mode, so the browser's HTTP
 // cache decides whether the network is touched: the server's validators
@@ -31,12 +33,19 @@ async function load() {
     WebAssembly.compileStreaming(fetchOk("turkey.wasm")),
     fetchOk("lib.tar.gz").then((response) => response.arrayBuffer()),
   ]);
-  return await loadCompiler(module, new Uint8Array(lib));
+  const compiler = await loadCompiler(module, new Uint8Array(lib));
+  // Compile a program that only prints, once. The compiler's warning about
+  // functions the backend refuses counts the user's functions too, and any
+  // program that writes output reaches two of the compiler runtime's own
+  // refused functions (the coroutine switch). So the count for printing alone
+  // is what the page treats as normal; a larger one is the user's.
+  const empty = await compile(compiler, 'fun main() {\n\tprint("")\n}\n');
+  return { compiler, baseline: refusedCount(empty.diagnostics) };
 }
 
 const loading = load().then(
-  (compiler) => {
-    postMessage({ type: "ready" });
+  ({ compiler, baseline }) => {
+    postMessage({ type: "ready", baseline });
     return compiler;
   },
   (error) => {

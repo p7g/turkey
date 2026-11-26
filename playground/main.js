@@ -1,6 +1,8 @@
 // The page: a source box, Run and Stop, and an output pane. Compiling happens
 // in one Worker and running in another, so the page itself never waits.
 
+import { withoutBaseline } from "./diagnostics.js";
+
 const $ = (id) => document.getElementById(id);
 const source = $("source");
 const runButton = $("run");
@@ -8,18 +10,6 @@ const stopButton = $("stop");
 const output = $("output");
 const state = $("state");
 const timeoutInput = $("timeout");
-
-// The compiler warns about two of its own functions on every compile. The
-// warning says nothing about the user's program, so we drop its line.
-const NOISE = "functions use operations the wasm32 backend does not compile yet";
-
-function withoutNoise(diagnostics) {
-  return diagnostics
-    .split("\n")
-    .filter((line) => !line.includes(NOISE))
-    .join("\n")
-    .trim();
-}
 
 const HELLO = `fun main() {
   print("Hello, Turkey!")
@@ -39,6 +29,7 @@ source.addEventListener("input", () => {
 
 let compiler = null; // the compile Worker
 let runner = null; // the run Worker, idle or running
+let baseline = 0; // the refused-function count of a program that prints
 let phase = "loading"; // loading | idle | compiling | running
 let nextId = 0;
 let currentId = 0;
@@ -49,6 +40,13 @@ function setPhase(next, text) {
   state.textContent = text;
   runButton.disabled = phase !== "idle";
   stopButton.disabled = phase !== "compiling" && phase !== "running";
+  // A button that disables itself drops keyboard focus; hand it to the other.
+  const active = document.activeElement;
+  if (active === runButton && runButton.disabled && !stopButton.disabled) {
+    stopButton.focus();
+  } else if (active === stopButton && stopButton.disabled && !runButton.disabled) {
+    runButton.focus();
+  }
 }
 
 // Each part of the output is its own element, so stdout, stderr and the
@@ -66,35 +64,97 @@ function show(parts) {
   );
 }
 
-function loadFailed(text) {
-  setPhase("loading", "The compiler failed to load.");
-  show([["error", text]]);
-}
-
 function startCompiler() {
-  compiler = new Worker("compile-worker.js", { type: "module" });
-  compiler.onmessage = ({ data }) => {
+  const worker = new Worker("compile-worker.js", { type: "module" });
+  compiler = worker;
+  worker.onmessage = ({ data }) => {
+    if (worker !== compiler) {
+      return;
+    }
     if (data.type === "status") {
       state.textContent = data.text;
     } else if (data.type === "ready") {
+      baseline = data.baseline;
       if (phase === "loading") {
         setPhase("idle", "Ready.");
       }
     } else if (data.type === "failed") {
-      loadFailed(data.text);
-    } else if (data.type === "compiled" && data.id === currentId) {
+      setPhase("loading", "The compiler failed to load.");
+      show([["error", data.text]]);
+    } else if (data.type === "compiled" && data.id === currentId && phase === "compiling") {
       compiled(data);
     }
   };
-  compiler.onerror = (event) => loadFailed(event.message || "the compile Worker failed");
+  worker.onerror = (event) => {
+    if (worker !== compiler) {
+      return;
+    }
+    const text = event.message || "the compile Worker failed";
+    worker.terminate();
+    if (phase === "compiling") {
+      // A crash in the middle of a compile: start over with a fresh compiler.
+      startCompiler();
+      setPhase("loading", "The compiler crashed. Reloading it...");
+      show([["error", `The compiler crashed: ${text}`]]);
+    } else {
+      setPhase("loading", "The compiler failed to load.");
+      show([["error", text]]);
+    }
+  };
 }
 
+// Handlers check that their Worker is still the current one, so a message
+// from a Worker we have stopped or replaced changes nothing.
 function startRunner() {
-  runner = new Worker("run-worker.js", { type: "module" });
+  const worker = new Worker("run-worker.js", { type: "module" });
+  runner = worker;
+  worker.onmessage = ({ data }) => {
+    if (worker !== runner || phase !== "running") {
+      return;
+    }
+    const trapped = data.trap !== null;
+    finishRun(
+      [
+        // Warnings about the user's own program, if the compiler gave any.
+        ["warning", pendingWarnings],
+        ["stdout", data.stdout],
+        ["stderr", data.stderr],
+        ["error", trapped ? `trap: ${data.trap}` : ""],
+        ["status", trapped ? "no exit status (trapped)" : `exit status ${data.status}`],
+      ],
+      "Done.",
+    );
+  };
+  worker.onerror = (event) => {
+    if (worker !== runner) {
+      return;
+    }
+    const text = event.message || "the run Worker failed";
+    if (phase === "running") {
+      finishRun([["error", text]], "Run failed.");
+    } else {
+      // Failed to load while idle: replace it, and say why.
+      worker.terminate();
+      startRunner();
+      show([["error", text]]);
+    }
+  };
+}
+
+let pendingWarnings = "";
+
+// Ends the run in progress. A finished Worker is dropped for a fresh one, so
+// no run sees another's leftovers.
+function finishRun(parts, text) {
+  clearTimeout(timer);
+  runner.terminate();
+  startRunner();
+  show(parts);
+  setPhase("idle", text);
 }
 
 function compiled(data) {
-  const diagnostics = withoutNoise(data.diagnostics);
+  const diagnostics = withoutBaseline(data.diagnostics, baseline);
   if (data.bytes === null) {
     const status = data.status === null ? "the compiler trapped" : `compiler exit status ${data.status}`;
     show([
@@ -104,38 +164,14 @@ function compiled(data) {
     setPhase("idle", "Compile failed.");
     return;
   }
-  const seconds = Math.max(1, Number(timeoutInput.value) || 10);
+  const limit = Math.min(600, Math.max(1, Math.floor(Number(timeoutInput.value)) || 10));
+  pendingWarnings = diagnostics;
   setPhase("running", "Running...");
-  const worker = runner;
-  const finish = (parts, text) => {
-    clearTimeout(timer);
-    // A finished Worker is dropped for a fresh one, so no run sees another's
-    // leftovers.
-    worker.terminate();
-    startRunner();
-    show(parts);
-    setPhase("idle", text);
-  };
-  worker.onmessage = ({ data: result }) => {
-    const trapped = result.trap !== null;
-    finish(
-      [
-        // Warnings about the user's own program, if the compiler gave any.
-        ["warning", diagnostics],
-        ["stdout", result.stdout],
-        ["stderr", result.stderr],
-        ["error", trapped ? `trap: ${result.trap}` : ""],
-        ["status", trapped ? "no exit status (trapped)" : `exit status ${result.status}`],
-      ],
-      "Done.",
-    );
-  };
-  worker.onerror = (event) => finish([["error", event.message || "the run Worker failed"]], "Run failed.");
   timer = setTimeout(
-    () => finish([["error", `Timed out after ${seconds} s; the program was stopped.`]], "Timed out."),
-    seconds * 1000,
+    () => finishRun([["error", `Timed out after ${limit} s; the program was stopped.`]], "Timed out."),
+    limit * 1000,
   );
-  worker.postMessage({ type: "run", bytes: data.bytes });
+  runner.postMessage({ type: "run", bytes: data.bytes });
 }
 
 // Stops what is in flight. A running program is stopped by terminating its
@@ -144,6 +180,8 @@ function compiled(data) {
 // compile reloads it from the HTTP cache.
 function stop() {
   clearTimeout(timer);
+  // Whatever the stopped Worker still sends is for an id nobody waits on.
+  currentId = ++nextId;
   if (phase === "running") {
     runner.terminate();
     startRunner();

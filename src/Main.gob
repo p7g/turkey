@@ -675,7 +675,7 @@ fun formatFile(path : String, checking : Bool, unparsed : Int) -> Int {
 			if text == source.text { return 0 }
 			if !checking {
 				if let Left(e) = File.writeText(path, text) {
-					toStderr("turkey: cannot write '" + path + "': " + message(e) + "\n")
+					toStderr("turkey: cannot write '" + path + "': " + Error.describe(e) + "\n")
 					return 13
 				}
 			}
@@ -759,7 +759,7 @@ fun doc(p : Args.Parser) -> Unit {
 	var directory = None
 	let names = []
 	for path in paths {
-		if let Left(e) = File.metadata(path) { die(message(e)) }
+		if let Left(e) = File.metadata(path) { die(Error.describe(e)) }
 		let (root, name) = moduleNamed(path, library)
 		if root != library {
 			match directory {
@@ -844,9 +844,9 @@ fun doc(p : Args.Parser) -> Unit {
 -- Writes each of `files`, a path relative to `dir` and its contents, under
 -- `dir`, creating `dir` first if it is not there.
 fun writeSite(dir : String, files : Vec (String, String)) -> Unit {
-	if let Left(e) = File.createDirAll(dir) { die(message(e)) }
+	if let Left(e) = File.createDirAll(dir) { die(Error.describe(e)) }
 	for (path, text) in files {
-		if let Left(e) = File.writeText(dir + "/" + path, text) { die(message(e)) }
+		if let Left(e) = File.writeText(dir + "/" + path, text) { die(Error.describe(e)) }
 	}
 }
 
@@ -944,8 +944,8 @@ fun writeExecutable(path : String, bytes : IO.Buffer) -> Unit {
 		let _ = File.close(out)
 		die(message(e))
 	}
-	if let Left(e) = File.close(out) { die(message(e)) }
-	if let Left(e) = File.rename(partial, path) { die(message(e)) }
+	if let Left(e) = File.close(out) { die(Error.describe(e)) }
+	if let Left(e) = File.rename(partial, path) { die(Error.describe(e)) }
 	Diag.keepOnExit(partial)
 }
 
@@ -963,9 +963,13 @@ fun createPartial(stem : String, n : Int, executable : Bool) -> (String, File.Fi
 	}
 	match made {
 		Right(out) -> (candidate, out)
-		Left(e) -> match e.kind {
-			IO.AlreadyExists -> createPartial(stem, n + 1, executable)
-			_                -> die(message(e))
+		Left(e) -> match Error.find(e) : Option IO.IOError {
+			Some(IO.IOError { kind = IO.AlreadyExists, .. }) -> createPartial(
+				stem,
+				n + 1,
+				executable,
+			)
+			_ -> die(Error.describe(e))
 		}
 	}
 }
@@ -1000,12 +1004,12 @@ fun finishAssembly(pending : Pending) -> Unit {
 	}
 	-- `die` removes the partial file, once: removing it here as well could
 	-- remove another build's, made under the same name in between.
-	if let Left(e) = File.close(out) { die(message(e)) }
+	if let Left(e) = File.close(out) { die(Error.describe(e)) }
 	-- A rename, so the file at `path` is replaced, not written through: a
 	-- symbolic link there becomes a regular file, and the file's mode is the
 	-- partial's, whatever the replaced file's was. An executable written over
 	-- another is replaced the same way.
-	if let Left(e) = File.rename(partial, pending.path) { die(message(e)) }
+	if let Left(e) = File.rename(partial, pending.path) { die(Error.describe(e)) }
 	Diag.keepOnExit(partial)
 }
 
@@ -3256,9 +3260,11 @@ fun directoryOf(path : String) -> String {
 }
 
 fun readOrDie(path : String) -> Source = match File.readText(path) {
-	Right(text)    -> Source { name = path, text = text }
-	Left(Left(_))  -> die("'" + path + "' is not valid UTF-8")
-	Left(Right(e)) -> die(message(e))
+	Right(text) -> Source { name = path, text = text }
+	Left(e) -> match Error.cast(e) : Option IO.InvalidUTF8 {
+		Some(_) -> die("'" + path + "' is not valid UTF-8")
+		None    -> die(Error.describe(e))
+	}
 }
 
 fun usage() -> a =

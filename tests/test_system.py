@@ -140,8 +140,10 @@ import System.IO as IO
 fun main() {
     match File.readText("bytes.bin") {
         Right(_) -> print("read ill-formed bytes as a String")
-        Left(Left(IO.InvalidUTF8)) -> print("not UTF-8")
-        Left(Right(e)) -> print(e)
+        Left(e) -> match Error.cast(e) : Option IO.InvalidUTF8 {
+            Some(_) -> print("not UTF-8")
+            None -> print(e)
+        }
     }
 }
 """

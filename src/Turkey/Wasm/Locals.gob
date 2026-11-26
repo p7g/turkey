@@ -1,0 +1,207 @@
+export (Locals(..), allocate)
+
+--- The wasm locals a function's values are held in.
+---
+--- This pass is the whole of the wasm backend's local allocation. Wasm has
+--- as many locals as a function declares, so nothing is spilled; but an
+--- engine's baseline compiler gives each declared local a slot in the frame,
+--- so a function that declares one local per value has frames as large as it
+--- has values. Values that are never live at once share a local instead.
+---
+--- **Greedy is enough.** Every definition dominates its uses (`Ssa.verify`),
+--- which makes the graph of which values are live at once chordal, and
+--- definitions in an order where each comes after those that dominate it are
+--- the reverse of a perfect elimination order of that graph. So giving each
+--- value, at its definition, the lowest-numbered local of its type that no
+--- live value holds uses no more locals of a type than there are values of
+--- that type live at one point. No interference graph is built, and nothing
+--- is moved or retried.
+---
+--- **An instruction's result does not share a local with its operands**, even
+--- one the instruction reads last. Selection may write the result before it
+--- has finished reading the operands, as a checked add does when it tests for
+--- overflow, so an operand is freed only after the result is placed.
+---
+--- **A call's results are placed at the call.** Selection writes every
+--- `Result` that follows a direct call when it selects the call, so they are
+--- given their locals together, before anything the call reads last is freed.
+---
+--- **Every unit shares one `i32` local, which only ever holds 0.** Nothing
+--- writes a unit's local but with a unit, so a value that is never written
+--- reads as 0 wherever it is read.
+---
+--- **A block parameter prefers its argument's local.** When the local a jump
+--- passes is free at the target's start, the parameter takes it, and the move
+--- for it is a no-op that selection leaves out. A local is a preference
+--- only: any free local of the right type is as correct.
+
+import Data.BitSet as BitSet
+import Data.BitSet (BitSet)
+import Turkey.LowIr (Low(..), Op(..))
+import Turkey.Ssa as Ssa
+import Turkey.Ssa (Value(..), Rep(..), RepClass(..), Func(..))
+import Turkey.Wasm as W
+
+--- Where a function's values are held: what `allocate` returns.
+type Locals = Locals {
+	--- Each value's local, by value id. A value of a block the entry does not
+	--- reach has none, and holds -1.
+	local : Array Int
+	--- The type of each local, the function's parameters first, at the
+	--- indices wasm numbers them by.
+	types : Vec W.ValType
+}
+
+type Pool = Pool {
+	source : Func Low
+	typeOf : fun(Rep) -> W.ValType
+	local  : Array Int
+	types  : Vec W.ValType
+	-- Whether each local holds a value that is live.
+	busy : Vec Bool
+	-- The local every unit is held in, or -1 before the first.
+	var unit : Int
+	-- The local each value would rather have, by value id, or -1: that of
+	-- the parameter a jump passes it to.
+	hint : Array Int
+}
+
+--- Returns the locals of `f`'s values, a value of representation `r` being
+--- held in a local of type `typeOf(r)`. Two values live at once never share
+--- a local, and a value never shares one with an operand of the instruction
+--- that defines it. `f`'s parameters are locals 0 up, in order.
+fun allocate(f : Func Low, typeOf : fun(Rep) -> W.ValType) -> Locals {
+	let p = Pool {
+		source = f
+		typeOf = typeOf
+		local  = Array.filled(len(f.reps), -1)
+		types  = []
+		busy   = []
+		unit   = -1
+		hint   = Array.filled(len(f.reps), -1)
+	}
+	for v in f.params { p.local[Ssa.valueId(v)] = fresh(p, typeOf(Ssa.repOf(f, v))) }
+	let (liveIn, liveOut) = Ssa.livenessInOut(f)
+	let preds = Ssa.predecessors(f)
+	-- Reverse postorder puts each block after its dominators, so every value
+	-- live into a block has its local by then. What is busy at a block's
+	-- start is recomputed from its live-in set, so the order need be no more
+	-- than that.
+	for at in Ssa.reversePostorder(f) {
+		let b = Ssa.blockId(at)
+		let block = f.blocks[b]
+		let (ends, entering) = lastUses(f, b, liveOut[b])
+		for var k = 0; k < len(p.busy); k = k + 1 { p.busy[k] = False }
+		for id in BitSet.elements(liveIn[b]) { p.busy[p.local[id]] = True }
+		-- Every parameter is placed before a dead one is freed, since a jump
+		-- writes them all.
+		parameters(p, block.params, preds[b])
+		for q in block.params {
+			if !BitSet.contains(entering, Ssa.valueId(q)) { release(p, Ssa.valueId(q)) }
+		}
+		for var n = 0; n < len(block.insts); n = n + 1 {
+			let i = block.insts[n]
+			place(p, i.result)
+			if let Call(_, _) = i.op {
+				for var later = n + 1; later < len(block.insts); later = later + 1 {
+					match block.insts[later].op {
+						Result(of, _) -> if of == i.result { place(p, block.insts[later].result) }
+						_             -> break
+					}
+				}
+			}
+			for id in ends[n] { release(p, id) }
+		}
+	}
+	Locals { local = p.local, types = p.types }
+}
+
+-- Places the parameters of a block whose predecessors are `preds`. Each
+-- takes the local of an argument some jump passes it, if one is free; each
+-- argument not placed yet is hinted towards its parameter's local.
+fun parameters(p : Pool, params : Vec Value, preds : Vec Ssa.BlockId) -> Unit {
+	for var k = 0; k < len(params); k = k + 1 {
+		var preferred = -1
+		for from in preds {
+			if let Ssa.Jump(_, args) = Ssa.blockAt(p.source, from).term {
+				let a = p.local[Ssa.valueId(args[k])]
+				if preferred < 0 && free(p, a, params[k]) { preferred = a }
+			}
+		}
+		take(p, params[k], preferred)
+		for from in preds {
+			if let Ssa.Jump(_, args) = Ssa.blockAt(p.source, from).term {
+				let id = Ssa.valueId(args[k])
+				if p.local[id] < 0 { p.hint[id] = p.local[Ssa.valueId(params[k])] }
+			}
+		}
+	}
+}
+
+-- Places `v`, unless the call before it already has.
+fun place(p : Pool, v : Value) -> Unit {
+	let id = Ssa.valueId(v)
+	if p.local[id] < 0 { take(p, v, p.hint[id]) }
+}
+
+-- Gives `v` a free local of its type: `preferred` if that is one, or else
+-- the lowest-numbered, or else a new one.
+fun take(p : Pool, v : Value, preferred : Int) -> Unit {
+	let id = Ssa.valueId(v)
+	let r = Ssa.repOf(p.source, v)
+	if r.class_ == Unit {
+		if p.unit < 0 { p.unit = fresh(p, W.I32) }
+		p.local[id] = p.unit
+		return
+	}
+	var k = preferred
+	if !free(p, k, v) {
+		k = 0
+		while k < len(p.types) && !free(p, k, v) { k = k + 1 }
+		if k == len(p.types) { k = fresh(p, p.typeOf(r)) }
+	}
+	p.local[id] = k
+	p.busy[k] = True
+}
+
+-- Whether local `k` may be given `v`: it exists, holds no live value, is of
+-- `v`'s type, and is not the units' local.
+fun free(p : Pool, k : Int, v : Value) -> Bool =
+	k >= 0 && k != p.unit && !p.busy[k] && p.types[k] == p.typeOf(Ssa.repOf(p.source, v))
+
+fun fresh(p : Pool, t : W.ValType) -> Int {
+	Vec.push(p.types, t)
+	Vec.push(p.busy, False)
+	len(p.types) - 1
+}
+
+-- Frees value `id`'s local. The units' local stays taken.
+fun release(p : Pool, id : Int) -> Unit {
+	let k = p.local[id]
+	if k != p.unit { p.busy[k] = False }
+}
+
+-- Returns, for each instruction of block `b`, the values that are live after
+-- it no longer: those it reads for the last time, and its result if nothing
+-- reads it. Returns too what is live at the block's start, its parameters
+-- included.
+fun lastUses(f : Func Low, b : Int, out : BitSet) -> (Array (Vec Int), BitSet) {
+	let block = f.blocks[b]
+	let live = BitSet.new(len(f.reps))
+	BitSet.copyFrom(live, out)
+	for v in Ssa.termUses(block.term) { BitSet.add(live, Ssa.valueId(v)) }
+	let ends : Array (Vec Int) = Array.init(len(block.insts), fun(_) = [])
+	for var n = len(block.insts) - 1; n >= 0; n = n - 1 {
+		let i = block.insts[n]
+		let d = Ssa.valueId(i.result)
+		if !BitSet.remove(live, d) { Vec.push(ends[n], d) }
+		Ssa.eachUse(i, fun(v) {
+			let id = Ssa.valueId(v)
+			if !BitSet.contains(live, id) {
+				Vec.push(ends[n], id)
+				BitSet.add(live, id)
+			}
+		})
+	}
+	(ends, live)
+}

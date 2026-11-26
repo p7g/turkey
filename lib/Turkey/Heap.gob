@@ -1118,11 +1118,11 @@ fun isStatic(value : Ptr) -> Bool =
 	below(Int.subWrapping(Ptr.toInt(value), staticStart), staticBytes)
 
 -- The emitter writes a flat array of four-byte fields -- count, then per
--- entry its return address's distance from `base`, n, and n offsets --
--- because it cannot sort by an address the linker has not assigned yet. The
--- distances keep the table free of relocations, so it is read-only and the
--- loader never writes it. Adding `base` back and sorting once here is what
--- makes the lookup a binary search on the address itself.
+-- entry its return address's distance from `base`, n, and n offsets -- in
+-- ascending order of return address. The distances keep the table free of
+-- relocations, so it is read-only and the loader never writes it. Adding
+-- `base` back here, into entries of a fixed size, is what makes the lookup a
+-- binary search on the address itself.
 foreign "turkey_frame_table_set" fun frameTableSet(table : Ptr, base : Ptr) -> Unit {
 	if Ptr.isNull(table) { return }
 	let count = Ptr.load32(table, 0)
@@ -1138,11 +1138,12 @@ foreign "turkey_frame_table_set" fun frameTableSet(table : Ptr, base : Ptr) -> U
 	for var i = 0; i < count; i = i + 1 {
 		let n = Ptr.load32(p, 4)
 		let key = plus(Ptr.toInt(base), signed32(Ptr.load32(p, 0)))
-		-- The wasm emitter writes sites in ascending order, so its table
-		-- needs no sort; the native emitters write one that is not ascending.
-		-- Checking costs one comparison per entry, where sorting costs n log n
-		-- over tens of thousands of entries at every start. Checking also
-		-- stays correct if an emitter's order changes.
+		-- Every emitter writes its entries ascending: the native ones in the
+		-- order the code is placed, the wasm one by site. Checking costs one
+		-- comparison per entry, where sorting costs n log n over tens of
+		-- thousands of entries at every start. The sort below stays for a
+		-- table that is not ascending, which a compiler older than this
+		-- runtime writes natively.
 		if i > 0 && below(key, previous) { sorted = False }
 		previous = key
 		Ptr.store(entries, entryBytes * i, key)
@@ -1150,7 +1151,23 @@ foreign "turkey_frame_table_set" fun frameTableSet(table : Ptr, base : Ptr) -> U
 		Ptr.store(entries, entryBytes * i + 16, Ptr.add(p, 8))
 		p = Ptr.add(p, 8 + 4 * n)
 	}
-	if !sorted { sortEntries(entries, count) }
+	if !sorted {
+		-- Under `--gc-verify` we assume the table's emitter is as new as this
+		-- runtime, so a table out of order is that emitter's mistake, and one
+		-- the sort would hide. Read `Prim.gcVerify`, the constant itself,
+		-- because this runs before the program's globals are initialized.
+		--
+		-- End the process as the heap verifier does, rather than raise a
+		-- panic: the entry tests for one only after early initialization, so
+		-- the globals' initializer and `main` would run with it pending and
+		-- read globals it left unset.
+		if Prim.gcVerify {
+			let message = Prim.cString("heap verifier: the frame table is not in ascending order\n")
+			let _ = Os.write(2, message, Os.strlen(message))
+			Os.exit(1)
+		}
+		sortEntries(entries, count)
+	}
 	Os.free(frameEntries)
 	frameEntries = entries
 	frameEntryCount = count

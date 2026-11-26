@@ -10,9 +10,6 @@ An import loads a module and names what it brings in. `import Geometry`
 gives the qualified names `Geometry.area` and `Geometry.Shape`, `as` gives
 the module a shorter name, and a list after it brings names in unqualified.
 
-The browser compiles one file at a time, so this lesson's program can't run
-on the page. It shows the output `turkey build Main.gob` gives.
-
 <!-- module: Geometry.gob -->
 ```kotlin
 export (Shape(..), area, unit)

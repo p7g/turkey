@@ -690,6 +690,9 @@ Inference covers everything except:
   needs a complete [signature](declarations.md#signatures).
 * **Recursive groups that use a member at two types**: every function in the
   group that is used polymorphically needs a signature.
+* **The receiver of a method call**: in `x.f(args)`, the type of `x` has to be
+  known somewhere in the definition the call is in, so a parameter used only as
+  a receiver needs an annotation ([Method calls](expressions.md#method-calls)).
 * **A type that only a body under an equality decides**: a type from outside
   a function whose context has an
   [equality constraint](classes.md#equality-constraints) has to be decided

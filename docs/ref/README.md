@@ -182,6 +182,10 @@ left.
 | `ord-inconsistent-with-eq` | warn | an `instance Ord` written by hand for a type whose `Eq` is derived, which can make `<=` hold in neither direction ([Derived instances](classes.md#derived-instances)) |
 | `infinite-recursion` | warn | a function, local function or method that cannot return without first calling itself, so it never returns. For an instance's method, itself is the class's method at the same instance. A call inside a `fun` value is not counted. |
 | `shared-fill` | warn | `Array.filled(n, v)`, `Vec.filled(n, v)` or `FrozenArray.filled(n, v)` with a `v` whose type is an object ([`Object` and `identical`](builtins.md#object-and-identical)), so every slot holds the one object. `Array.init(n, fun(_) = v)` makes one for each. |
+| `single-match` | warn | a `match` in which one arm does something and every other arm is `()` or `{}`, which is an [`if let`](statements.md#if-let-and-if-var). `--fix` rewrites it to one when no earlier arm takes a value the live arm's pattern matches. |
+| `irrefutable-match` | warn | a `match` of one arm, whose pattern matches every value, which is a `let` or, for a function's parameter, a [parameter pattern](declarations.md#functions) |
+| `irrefutable-if-let` | warn | an `if let` or `while let` whose conditions always hold ([Irrefutable patterns](patterns.md#irrefutable-patterns)), so the `else` is never taken, or only a `break` ends the loop |
+| `unreachable-arm` | warn | a `match` arm, or an alternative of `\|`, that the arms and alternatives before it already take every value of ([Exhaustiveness](patterns.md#exhaustiveness)) |
 | `unfulfilled-expect` | warn | a check that an `--@expect` names and that finds nothing in what the directive covers ([Expecting a finding](#expecting-a-finding)) |
 
 ### Expecting a finding

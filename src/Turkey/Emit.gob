@@ -358,12 +358,9 @@ fun emitInsts(
 		b.at = insts[n].at
 		cold.text.at = insts[n].at
 		let op = insts[n].op
-		match A.pollOf(op) {
-			Some((pb, pn)) -> {
-				poll(b, cold, d, l, tag, pb, pn)
-				continue
-			}
-			None -> {}
+		if let Some((pb, pn)) = A.pollOf(op) {
+			poll(b, cold, d, l, tag, pb, pn)
+			continue
 		}
 		if Option.isNone(A.allocationOf(op)) && Option.isNone(A.arrayAllocationOf(op)) {
 			emitInst(b, d, f, a, l, tag, insts[n])
@@ -372,36 +369,29 @@ fun emitInsts(
 		let save = Frame.stubAt(l, at, n)
 		var label = None
 		if n + 1 < upTo {
-			match A.safepointOf(insts[n + 1].op) {
-				Some((sb, sn)) -> {
-					label = Some(safepointLabel(d, tag, sb, sn))
-					n = n + 1
-				}
-				None -> {}
+			if let Some((sb, sn)) = A.safepointOf(insts[n + 1].op) {
+				label = Some(safepointLabel(d, tag, sb, sn))
+				n = n + 1
 			}
 		}
-		match A.allocationOf(op) {
-			Some((dest, allocation)) ->
-				allocate(b, cold, d, f, l, tag, coloured(f, a, dest), allocation, save, label)
-			None -> {}
+		if let Some((dest, allocation)) = A.allocationOf(op) {
+			allocate(b, cold, d, f, l, tag, coloured(f, a, dest), allocation, save, label)
 		}
-		match A.arrayAllocationOf(op) {
-			Some((dest, length, fill, allocation)) ->
-				allocateArray(
-					b,
-					cold,
-					d,
-					f,
-					l,
-					tag,
-					coloured(f, a, dest),
-					coloured(f, a, length),
-					coloured(f, a, fill),
-					allocation,
-					save,
-					label,
-				)
-			None -> {}
+		if let Some((dest, length, fill, allocation)) = A.arrayAllocationOf(op) {
+			allocateArray(
+				b,
+				cold,
+				d,
+				f,
+				l,
+				tag,
+				coloured(f, a, dest),
+				coloured(f, a, length),
+				coloured(f, a, fill),
+				allocation,
+				save,
+				label,
+			)
 		}
 	}
 }
@@ -439,11 +429,10 @@ fun atEdges(f : Func Inst, reads : Array Int) -> Array (Option A.Arm) {
 	let out : Array (Option A.Arm) = Array.filled(len(f.reps), None)
 	let passed = Array.filled(len(f.reps), False)
 	for block in f.blocks {
-		match block.term {
-			Jump(_, args) -> for v in args {
+		if let Jump(_, args) = block.term {
+			for v in args {
 				if reads[Ssa.valueId(v)] == 1 { passed[Ssa.valueId(v)] = True }
 			}
-			_ -> {}
 		}
 	}
 	for block in f.blocks {
@@ -660,26 +649,22 @@ fun saves(b : Code, l : Frame.Layout, saving : Bool) -> Unit {
 fun cfi(b : Code, rule : Cfi) -> Unit = emit(b, Cfi(rule))
 
 -- The rules, on ELF.
-fun exactly(b : Code, rules : Array Cfi) -> Unit = match b.dialect {
-	Asm.Elf   -> for rule in rules { cfi(b, rule) }
-	Asm.MachO -> {}
+fun exactly(b : Code, rules : Array Cfi) -> Unit = if let Asm.Elf = b.dialect {
+	for rule in rules { cfi(b, rule) }
 }
 
 -- On Mach-O, the block frame mode encodes: the frame record at `x29`, and
 -- the pairs below it in the order `saves` stores them. Each pair is a bank
 -- and its lower register, as `Frame.savedPairs` gives it.
-fun frameMode(b : Code, pairs : Vec (Bank, Int)) -> Unit = match b.dialect {
-	Asm.MachO -> {
-		cfi(b, DefCfa(fpColumn, 16))
-		cfi(b, SavedAt(lrColumn, -8))
-		cfi(b, SavedAt(fpColumn, -16))
-		for var k = 0; k < len(pairs); k = k + 1 {
-			let (bank, first) = pairs[k]
-			cfi(b, SavedAt(column(Physical(bank, first)), -16 * k - 24))
-			cfi(b, SavedAt(column(Physical(bank, first + 1)), -16 * k - 32))
-		}
+fun frameMode(b : Code, pairs : Vec (Bank, Int)) -> Unit = if let Asm.MachO = b.dialect {
+	cfi(b, DefCfa(fpColumn, 16))
+	cfi(b, SavedAt(lrColumn, -8))
+	cfi(b, SavedAt(fpColumn, -16))
+	for var k = 0; k < len(pairs); k = k + 1 {
+		let (bank, first) = pairs[k]
+		cfi(b, SavedAt(column(Physical(bank, first)), -16 * k - 24))
+		cfi(b, SavedAt(column(Physical(bank, first + 1)), -16 * k - 32))
 	}
-	Asm.Elf -> {}
 }
 
 -- DWARF's number for a register.
@@ -726,26 +711,19 @@ fun emitInst(
 	-- A safepoint is not an instruction: it is the *position* after the call,
 	-- which is the return address the collector will look up. So it becomes a
 	-- label, and `Turkey.Frame`'s entry for the same (block, index) names it.
-	match A.safepointOf(i.op) {
-		Some((sb, sn)) -> {
-			emit(b, Label(safepointLabel(d, tag, sb, sn)))
-			return
-		}
-		None -> {}
+	if let Some((sb, sn)) = A.safepointOf(i.op) {
+		emit(b, Label(safepointLabel(d, tag, sb, sn)))
+		return
 	}
-	match A.tailCallOf(i.op) {
-		Some(target) -> {
-			tailCall(b, f, a, l, target)
-			return
-		}
-		None -> {}
+	if let Some(target) = A.tailCallOf(i.op) {
+		tailCall(b, f, a, l, target)
+		return
 	}
 	-- A slot whose offset is too wide is the one case that needs an extra
 	-- instruction, so it is settled before the rewrite rather than inside it.
 	let wide = wideSlot(l, i.op)
-	match wide {
-		Some(offset) -> instruction(b, A.MovConst(scratch, offset))
-		None         -> {}
+	if let Some(offset) = wide {
+		instruction(b, A.MovConst(scratch, offset))
 	}
 	let op = A.rewrite(i.op, coloured(f, a, _), placed(l, _, wide))
 	-- A move into the register the value already holds is what a taken hint
@@ -1104,9 +1082,8 @@ fun returnFromStub(
 	let pushed = keptBytes(save) > 0
 	let failed = if pushed { allocationLabel(d, tag, n, "p") } else { exitLabel(d, tag) }
 	instruction(b, A.Bl(slow, A.Standard))
-	match safepoint {
-		Some(label) -> emit(b, Label(label))
-		None        -> {}
+	if let Some(label) = safepoint {
+		emit(b, Label(label))
 	}
 	instruction(b, A.Ldr(scratch, Offset(A.worker, 0), A.W32))
 	instruction(b, A.Cbnz(scratch, failed, A.W32))
@@ -1196,12 +1173,11 @@ fun emitTerm(
 			-- write, and which have finished with the scratch register a
 			-- wide frame address takes.
 			for var i = 0; i < len(params) && i < len(args); i = i + 1 {
-				match edges[Ssa.valueId(args[i])] {
-					Some(op) -> emitInst(b, d, f, a, l, tag, Inst {
+				if let Some(op) = edges[Ssa.valueId(args[i])] {
+					emitInst(b, d, f, a, l, tag, Inst {
 						op = A.rewrite(op, fun(r) = renamed(r, args[i], params[i]), fun(m) = m)
 						at = b.at
 					})
-					None -> {}
 				}
 			}
 			b.at = at
@@ -1406,13 +1382,10 @@ fun emitData(m : Module, asm : Asm.Asm, sites : Int, out : Vec (Item Inst)) -> U
 	-- of the root array instead -- storing to it and rooting it are the same
 	-- store -- so this defines nothing for it.
 	for (name, _) in m.globals {
-		match Asm.globalSlot(asm, name) {
-			Some(_) -> {}
-			None -> {
-				emit(b, Align(3))
-				emit(b, Label(Asm.globalSymbol(asm.dialect, name)))
-				emit(b, Word(0))
-			}
+		if let None = Asm.globalSlot(asm, name) {
+			emit(b, Align(3))
+			emit(b, Label(Asm.globalSymbol(asm.dialect, name)))
+			emit(b, Word(0))
 		}
 	}
 	emit(b, Align(3))

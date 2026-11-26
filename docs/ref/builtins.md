@@ -629,11 +629,8 @@ fun main() {
     write("working... ")
     -- Without this, a program whose output goes to a pipe would show nothing
     -- until the buffer filled or the program ended.
-    match IO.flush(IO.stdout()) {
-        Left(e) -> {
-            let _ = IO.writeText(IO.stderr(), message(e) + "\n")
-        }
-        Right(_) -> {}
+    if let Left(e) = IO.flush(IO.stdout()) {
+        let _ = IO.writeText(IO.stderr(), message(e) + "\n")
     }
     print("done")
 }

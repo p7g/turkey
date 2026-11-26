@@ -202,12 +202,10 @@ fun koccurs(slot : KCell, k : Kind) -> Bool = match kprune(k) {
 fun unifyKinds(a : Kind, b : Kind) -> Bool {
 	let x = kprune(a)
 	let y = kprune(b)
-	match x {
-		KVar(cell) -> match y {
-			KVar(other) -> if cell.id == other.id { return True }
-			_           -> {}
+	if let KVar(cell) = x {
+		if let KVar(other) = y {
+			if cell.id == other.id { return True }
 		}
-		_ -> {}
 	}
 	match x {
 		KVar(cell) -> {
@@ -443,15 +441,12 @@ fun skolemCon(name : String, kind : Kind) -> ConCell {
 --- class name, so they print as the predicate and the family a reader would
 --- recognise: `HasField "cap" r`, `SetField "cap" r` and `Field.cap r`.
 fun shortName(name : String) -> String {
-	match String.splitOnce(name, ".") {
-		Some((before, after)) -> {
-			if before == "%HasField" { return "HasField \"" + after + "\"" }
-			if before == "%SetField" { return "SetField \"" + after + "\"" }
-			if before == "%HasProjection" { return "HasProjection " + after }
-			if before == "%Field" { return "Field." + after }
-			if before == "%Elem" { return "Elem." + after }
-		}
-		None -> {}
+	if let Some((before, after)) = String.splitOnce(name, ".") {
+		if before == "%HasField" { return "HasField \"" + after + "\"" }
+		if before == "%SetField" { return "SetField \"" + after + "\"" }
+		if before == "%HasProjection" { return "HasProjection " + after }
+		if before == "%Field" { return "Field." + after }
+		if before == "%Elem" { return "Elem." + after }
 	}
 	match String.rsplitOnce(name, "#") {
 		None             -> name
@@ -1052,9 +1047,8 @@ fun skolemsInto(t : Type, out : Vec ConCell, seen : Set.Set Int) -> Unit =
 fun openedEscape(t : Type, name : String, level : Int) -> Option String {
 	for c in skolemsOf([t]) {
 		if c.name == name && c.level > level {
-			match openedBy(c) {
-				Some(constructor) -> return Some(constructor)
-				None              -> {}
+			if let Some(constructor) = openedBy(c) {
+				return Some(constructor)
 			}
 		}
 	}
@@ -1083,18 +1077,16 @@ fun escaping(slot : VarCell, t : Type) -> Option String = match prune(t) {
 	TFam(_, arg, _)  -> escaping(slot, arg)
 	TFun(params, ret) -> {
 		for p in params {
-			match escaping(slot, p) {
-				Some(found) -> return Some(found)
-				None        -> {}
+			if let Some(found) = escaping(slot, p) {
+				return Some(found)
 			}
 		}
 		escaping(slot, ret)
 	}
 	TTuple(elems) -> {
 		for e in elems {
-			match escaping(slot, e) {
-				Some(found) -> return Some(found)
-				None        -> {}
+			if let Some(found) = escaping(slot, e) {
+				return Some(found)
 			}
 		}
 		None
@@ -1149,117 +1141,105 @@ fun unifyIn(
 
 	-- Section 4.3: bottom is absorbed by anything it meets. A no-op, not a
 	-- binding -- `join` is what recovers the surviving type.
-	match x {
-		TBottom -> return
-		_       -> {}
+	if let TBottom = x {
+		return
 	}
-	match y {
-		TBottom -> return
-		_       -> {}
+	if let TBottom = y {
+		return
 	}
 
-	match x {
-		TVar(cell) -> {
-			-- Bind the other side instead, if it may be bound: an untouchable
-			-- variable is still a fine *value* for a younger one.
-			if untouchable(cell, fams) {
-				match y {
-					TVar(other) -> if !untouchable(other, fams) {
-						return unifyIn(y, x, where, context, fams, !flipped)
-					}
-					_ -> {}
+	if let TVar(cell) = x {
+		-- Bind the other side instead, if it may be bound: an untouchable
+		-- variable is still a fine *value* for a younger one.
+		if untouchable(cell, fams) {
+			if let TVar(other) = y {
+				if !untouchable(other, fams) {
+					return unifyIn(y, x, where, context, fams, !flipped)
 				}
-			}
-			-- A skolem below the head may be one a given rewrites away:
-			-- under `Elem b ~ Int`, `Option (Elem b)` is `Option Int`, and
-			-- binding a variable from outside to it is no escape. So before
-			-- reporting one, rewrite `y` at every depth and ask again.
-			if Option.isSome(escaping(cell, y)) {
-				let deep = normalizeDeep(y, fams)
-				-- Only if that clears it: an escape still there is reported
-				-- in the types the expression wrote, not the rewritten ones.
-				if !sameType(deep, y) && Option.isNone(escaping(cell, deep)) {
-					return unifyIn(x, deep, where, context, fams, flipped)
-				}
-			}
-			match escaping(cell, y) {
-				Some(out) -> match openedEscape(y, out, cell.level) {
-					Some(opener) -> return typeError(
-						"the type '"
-							+ out
-							+ "' hidden by '"
-							+ shortName(opener)
-							+ "' cannot leave the 'match' arm or "
-							+ "function that opened it",
-						where,
-					)
-					None -> {}
-				}
-				None -> {}
-			}
-			match escaping(cell, y) {
-				Some(out) -> return typeError(
-					"the type variable '"
-						+ out
-						+ "' from a "
-						+ "signature cannot be equal to a type from outside its "
-						+ "function",
-					where,
-				)
-				None -> {}
-			}
-			if occursAndAdjust(cell, y) {
-				-- Under a family the occurrence is no cycle yet: `a ~ Option
-				-- (F a)` holds once `a` is `Option (Option Int)` and `F` of
-				-- that is `Option Int`. Only an occurrence outside every
-				-- family makes the type infinite.
-				if !occursRigidly(x, y) {
-					return match fams {
-						Some(f) -> deferAs(f, x, y, flipped, where, context)
-						None    -> mismatch(x, y, where, context)
-					}
-				}
-				-- One namer for both sides, so the variable keeps its name.
-				let n = namer("")
-				return typeError(
-					"cannot construct the infinite type '"
-						+ showAt(x, n, 0)
-						+ " = "
-						+ showAt(y, n, 0)
-						+ "'",
-					where,
-				)
-			}
-			if !unifyKinds(cell.kind, kindOf(y)) { return kindMismatch(x, y, where) }
-			-- An untouchable variable is not bound, but the equation is
-			-- deferred only after every check a binding would make. The
-			-- occurs check above has already lowered the levels in `y` to
-			-- `cell`'s, as a binding would: the equation belongs to `cell`'s
-			-- scope, and a variable it mentions that stayed at a deeper rank
-			-- would be generalized there, and then bound when the equation is
-			-- solved outside.
-			if untouchable(cell, fams) {
-				return match fams {
-					Some(f) -> deferAs(f, x, y, flipped, where, context)
-					None    -> ()
-				}
-			}
-			cell.ref = Some(y)
-			-- A header variable bound to another variable is that variable
-			-- from now on, and pruning forgets the first. So the mark moves.
-			if isHeaderVar(cell) {
-				if let TVar(other) = prune(y) { markHeaderVar(other) }
-			}
-			return match fams {
-				Some(f) -> f.bound(cell)
-				None    -> ()
 			}
 		}
-		_ -> {}
+		-- A skolem below the head may be one a given rewrites away:
+		-- under `Elem b ~ Int`, `Option (Elem b)` is `Option Int`, and
+		-- binding a variable from outside to it is no escape. So before
+		-- reporting one, rewrite `y` at every depth and ask again.
+		if Option.isSome(escaping(cell, y)) {
+			let deep = normalizeDeep(y, fams)
+			-- Only if that clears it: an escape still there is reported
+			-- in the types the expression wrote, not the rewritten ones.
+			if !sameType(deep, y) && Option.isNone(escaping(cell, deep)) {
+				return unifyIn(x, deep, where, context, fams, flipped)
+			}
+		}
+		if let Some(out) = escaping(cell, y) {
+			if let Some(opener) = openedEscape(y, out, cell.level) {
+				return typeError(
+					"the type '"
+						+ out
+						+ "' hidden by '"
+						+ shortName(opener)
+						+ "' cannot leave the 'match' arm or "
+						+ "function that opened it",
+					where,
+				)
+			}
+		}
+		if let Some(out) = escaping(cell, y) {
+			return typeError(
+				"the type variable '"
+					+ out
+					+ "' from a "
+					+ "signature cannot be equal to a type from outside its "
+					+ "function",
+				where,
+			)
+		}
+		if occursAndAdjust(cell, y) {
+			-- Under a family the occurrence is no cycle yet: `a ~ Option
+			-- (F a)` holds once `a` is `Option (Option Int)` and `F` of
+			-- that is `Option Int`. Only an occurrence outside every
+			-- family makes the type infinite.
+			if !occursRigidly(x, y) {
+				return match fams {
+					Some(f) -> deferAs(f, x, y, flipped, where, context)
+					None    -> mismatch(x, y, where, context)
+				}
+			}
+			-- One namer for both sides, so the variable keeps its name.
+			let n = namer("")
+			return typeError(
+				"cannot construct the infinite type '"
+					+ showAt(x, n, 0)
+					+ " = "
+					+ showAt(y, n, 0)
+					+ "'",
+				where,
+			)
+		}
+		if !unifyKinds(cell.kind, kindOf(y)) { return kindMismatch(x, y, where) }
+		-- An untouchable variable is not bound, but the equation is
+		-- deferred only after every check a binding would make. The
+		-- occurs check above has already lowered the levels in `y` to
+		-- `cell`'s, as a binding would: the equation belongs to `cell`'s
+		-- scope, and a variable it mentions that stayed at a deeper rank
+		-- would be generalized there, and then bound when the equation is
+		-- solved outside.
+		if untouchable(cell, fams) {
+			return if let Some(f) = fams {
+				deferAs(f, x, y, flipped, where, context)
+			}
+		}
+		cell.ref = Some(y)
+		-- A header variable bound to another variable is that variable
+		-- from now on, and pruning forgets the first. So the mark moves.
+		if isHeaderVar(cell) {
+			if let TVar(other) = prune(y) { markHeaderVar(other) }
+		}
+		return if let Some(f) = fams {
+			f.bound(cell)
+		}
 	}
-	match y {
-		TVar(_) -> return unifyIn(y, x, where, context, fams, !flipped)
-		_       -> {}
+	if let TVar(_) = y {
+		return unifyIn(y, x, where, context, fams, !flipped)
 	}
 
 	match (x, y) {
@@ -1319,10 +1299,8 @@ fun unifyRest(
 	fams : Option Families,
 ) -> Unit {
 	if !isFam(x) && !isFam(y) { return mismatch(x, y, where, context) }
-	match (x, y) {
-		(TFam(n1, a1, _), TFam(n2, a2, _)) ->
-			if n1 == n2 && sameType(a1, a2) { return }
-		_ -> {}
+	if let (TFam(n1, a1, _), TFam(n2, a2, _)) = (x, y) {
+		if n1 == n2 && sameType(a1, a2) { return }
 	}
 	match fams {
 		None    -> mismatch(x, y, where, context)
@@ -1403,13 +1381,11 @@ fun join(
 ) -> Type {
 	let x = prune(a)
 	let y = prune(b)
-	match x {
-		TBottom -> return y
-		_       -> {}
+	if let TBottom = x {
+		return y
 	}
-	match y {
-		TBottom -> return x
-		_       -> {}
+	if let TBottom = y {
+		return x
 	}
 	unify(x, y, where, context, fams)
 	x

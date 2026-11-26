@@ -606,10 +606,7 @@ fun place(w : Walk, taken : Taken, id : Int, block : Ssa.Block A.Inst, from : In
 	}
 }
 
-fun stopOnce(w : Walk, why : String) -> Unit = match w.stopped {
-	None    -> { w.stopped = Some(why) }
-	Some(_) -> {}
-}
+fun stopOnce(w : Walk, why : String) -> Unit = if let None = w.stopped { w.stopped = Some(why) }
 
 -- The hint first, then the pool in order. A hint is only ever a preference:
 -- taking it makes a move redundant and missing it makes the move real, and
@@ -694,19 +691,16 @@ fun affinities(f : Func A.Inst) -> (Array (Vec Int), Array (Vec Int)) {
 	let sinks : Array (Vec Int) = Array.init(len(f.reps), fun(_) = [])
 	let sources : Array (Vec Int) = Array.init(len(f.reps), fun(_) = [])
 	for block in f.blocks {
-		match block.term {
-			Jump(target, args) -> {
-				let params = f.blocks[Ssa.blockId(target)].params
-				for var i = 0; i < len(params) && i < len(args); i = i + 1 {
-					let a = Ssa.valueId(args[i])
-					let p = Ssa.valueId(params[i])
-					if a != p {
-						Vec.push(sinks[a], p)
-						Vec.push(sources[p], a)
-					}
+		if let Jump(target, args) = block.term {
+			let params = f.blocks[Ssa.blockId(target)].params
+			for var i = 0; i < len(params) && i < len(args); i = i + 1 {
+				let a = Ssa.valueId(args[i])
+				let p = Ssa.valueId(params[i])
+				if a != p {
+					Vec.push(sinks[a], p)
+					Vec.push(sources[p], a)
 				}
 			}
-			_ -> {}
 		}
 	}
 	(sinks, sources)
@@ -1228,10 +1222,7 @@ fun worstCall(f : Func A.Inst) -> Int {
 			if clobbersOnCall(block.insts[n]) {
 				var here = 0
 				for id in after[n] {
-					match A.bankOf(f.reps[id]) {
-						Gp -> { here = here + 1 }
-						Fp -> {}
-					}
+					if let Gp = A.bankOf(f.reps[id]) { here = here + 1 }
 				}
 				if here > worst { worst = here }
 			}
@@ -1257,9 +1248,8 @@ fun moveHints(f : Func A.Inst) -> Array Int {
 	let out = Array.filled(len(f.reps), -1)
 	for block in f.blocks {
 		for i in block.insts {
-			match A.moveHint(i.op) {
-				Some((id, n)) -> if out[id] < 0 { out[id] = n }
-				None          -> {}
+			if let Some((id, n)) = A.moveHint(i.op) {
+				if out[id] < 0 { out[id] = n }
 			}
 		}
 	}
@@ -1474,12 +1464,9 @@ fun spill(
 			Set.add(splitting, id)
 			continue
 		}
-		match Map.get(remade, id) {
-			Some(op) -> {
-				Map.put(spills.remat, id, op)
-				continue
-			}
-			None -> {}
+		if let Some(op) = Map.get(remade, id) {
+			Map.put(spills.remat, id, op)
+			continue
 		}
 		let slot = match Map.get(roots, id) {
 			Some(n) -> A.RootSlot(n)
@@ -1560,9 +1547,8 @@ fun standIn(
 	id : Int,
 	at : Int,
 ) -> Int {
-	match Map.get(spills.reloadOf, id) {
-		Some(from) -> return reload(g, out, spills, from, at)
-		None       -> {}
+	if let Some(from) = Map.get(spills.reloadOf, id) {
+		return reload(g, out, spills, from, at)
 	}
 	match Map.get(ready, id) {
 		Some(t) -> {
@@ -1595,9 +1581,8 @@ fun inherited(
 	let out = Map.new()
 	let p = onlyPredecessor(preds, b)
 	if p >= 0 {
-		match leaving[p] {
-			Some(m) -> for (k, v) in Map.entries(m) { Map.put(out, k, v) }
-			None    -> {}
+		if let Some(m) = leaving[p] {
+			for (k, v) in Map.entries(m) { Map.put(out, k, v) }
 		}
 	}
 	out
@@ -1652,12 +1637,9 @@ fun storeIfSpilled(
 	at : Int,
 ) -> Unit {
 	if Set.contains(ids, id) {
-		match Map.get(spills.slots, id) {
-			Some(slot) -> {
-				Vec.push(out, A.Inst { op = A.Str(A.Virtual(id), slot, A.W64), at = at })
-				spills.stores = spills.stores + 1
-			}
-			None -> {}
+		if let Some(slot) = Map.get(spills.slots, id) {
+			Vec.push(out, A.Inst { op = A.Str(A.Virtual(id), slot, A.W64), at = at })
+			spills.stores = spills.stores + 1
 		}
 	}
 }
@@ -1669,9 +1651,8 @@ fun reload(g : Func A.Inst, out : Vec A.Inst, spills : Spills, id : Int, at : In
 	Map.put(spills.reloadOf, t, id)
 	match Map.get(spills.slots, id) {
 		Some(slot) -> Vec.push(out, A.Inst { op = A.Ldr(A.Virtual(t), slot, A.W64), at = at })
-		None -> match Map.get(spills.remat, id) {
-			Some(op) -> Vec.push(out, A.Inst { op = remade(op, id, t), at = at })
-			None     -> {}
+		None -> if let Some(op) = Map.get(spills.remat, id) {
+			Vec.push(out, A.Inst { op = remade(op, id, t), at = at })
 		}
 	}
 	t
@@ -1913,34 +1894,31 @@ fun checkRemade(
 ) -> Unit {
 	Ssa.eachDef(i, fun(d) {
 		let t = Ssa.valueId(d)
-		match Map.get(spills.reloadOf, t) {
-			Some(from) -> {
-				match Map.get(spills.remat, from) {
-					Some(op) -> if show(A.Inst { op = remade(op, from, t), at = i.at }) != show(i) {
-						Vec.push(
-							out,
-							"reload %"
-								+ Int.toString(t)
-								+ " at "
-								+ at
-								+ " is not the definition of %"
-								+ Int.toString(from),
-						)
-					}
-					None -> Vec.push(
+		if let Some(from) = Map.get(spills.reloadOf, t) {
+			match Map.get(spills.remat, from) {
+				Some(op) -> if show(A.Inst { op = remade(op, from, t), at = i.at }) != show(i) {
+					Vec.push(
 						out,
 						"reload %"
 							+ Int.toString(t)
 							+ " at "
 							+ at
-							+ " is not a load of %"
-							+ Int.toString(from)
-							+ "'s slot",
+							+ " is not the definition of %"
+							+ Int.toString(from),
 					)
 				}
-				Map.put(ready, t, ())
+				None -> Vec.push(
+					out,
+					"reload %"
+						+ Int.toString(t)
+						+ " at "
+						+ at
+						+ " is not a load of %"
+						+ Int.toString(from)
+						+ "'s slot",
+				)
 			}
-			None -> {}
+			Map.put(ready, t, ())
 		}
 	})
 }

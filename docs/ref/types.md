@@ -78,10 +78,16 @@ An `Int` is a two's-complement signed 64-bit integer, from `-2^63` to
 
 * `+`, `-`, `*` and unary `-` **panic** when the result does not fit. They
   never wrap around.
-* `/` rounds toward zero, and `%` is the remainder, whose sign follows the
-  dividend. So `-7 / 2` is `-3` and `-7 % 2` is `-1`, and
-  `a == (a / b) * b + a % b` for every `b` that is not zero.
-* `/` and `%` panic when the divisor is zero.
+* `/` rounds toward negative infinity (*floored* division), and `%` is the
+  remainder that goes with it, whose sign follows the divisor. So `-7 / 2` is
+  `-4` and `-7 % 2` is `1`. For every `b` that is not zero, `a / b` and
+  `a % b` satisfy `a == (a / b) * b + a % b` as arithmetic on integers;
+  evaluating the right-hand side in `Int` can overflow, because `(a / b) * b`
+  falls outside the range when `a` is within `b` of `Int.minValue()` or
+  `Int.maxValue()`. For a positive `b`, `a % b` is always in `0` to `b - 1`,
+  which is what an index into `b` buckets or a position on a clock needs.
+* `/` and `%` panic when the divisor is zero, and `/` panics on the one
+  quotient that does not fit, `Int.minValue() / -1`.
 
 <!-- run -->
 ```kotlin
@@ -89,13 +95,19 @@ fun main() {
     print(-7 / 2)
     print(-7 % 2)
     print(7 / -2)
+    print(7 % -2)
+    print(-7 / -2)
+    print(-7 % -2)
 }
 ```
 
 ```text
--3
+-4
+1
+-4
 -1
--3
+3
+-1
 ```
 
 <!-- panic: integer overflow -->
@@ -110,7 +122,7 @@ fun main() {
 ```
 
 The library module `Int` has arithmetic that wraps around or returns an
-`Option` instead of panicking, a floored modulus (`Int.mod`), and the bitwise
+`Option` instead of panicking, division that rounds toward zero, and the bitwise
 operations, which the [bitwise operators](expressions.md#bitwise-operators)
 `&`, `|`, `^`, `<<` and `>>` also spell. The shifts panic when the shift amount
 is outside 0 to 63 rather than masking it, and `>>` copies the sign bit, where
@@ -123,8 +135,10 @@ fun main() {
 }
 ```
 
-`Int.floorDiv` is the quotient that pairs with `Int.mod`, rounding toward
-negative infinity, and `Int.divMod` returns both. `Int.gcd` and `Int.lcm` are
+`Int.quot` is the quotient rounded toward zero, and `Int.rem` the remainder
+that pairs with it, whose sign follows the dividend: `Int.quot(-7, 2)` is `-3`
+and `Int.rem(-7, 2)` is `-1`. `Int.divMod` returns `(a / b, a % b)` and
+`Int.quotRem` returns `(Int.quot(a, b), Int.rem(a, b))`. `Int.gcd` and `Int.lcm` are
 never negative, `Int.pow` and `Int.powMod` raise to a power (a negative
 exponent panics, and `pow` panics on overflow like `*`; `powMod` never
 overflows), and `Int.isqrt` is the floor of the square root. `Int.countOnes`,
@@ -137,6 +151,7 @@ outside that range panics.
 ```kotlin
 fun main() {
     print(Int.divMod(-7, 2))
+    print(Int.quotRem(-7, 2))
     print(Int.gcd(12, 18))
     print(Int.lcm(4, 6))
     print(Int.pow(2, 10))
@@ -150,6 +165,7 @@ fun main() {
 
 ```text
 (-4, 1)
+(-3, -1)
 6
 12
 1024

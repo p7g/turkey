@@ -17,20 +17,22 @@ type NotText = NotText { path : String }
 instance Error NotText { fun message(e) = e.path + " is not UTF-8" }
 
 fun readBytes(path : String) -> Either SomeError (Array Byte) {
-    let b = Error.promote(File.readAll(path))?
+    let b = File.readAll(path)?
     Right(IO.bytes(b))
 }
 
 fun readText(path : String) -> Either SomeError String = match File.readText(path) {
     Right(s) -> Right(s)
-    Left(Left(_)) -> Left(fail(NotText { path }))
-    Left(Right(e)) -> Left(fail(e))
+    Left(e) -> match Error.cast(e) : Option IO.InvalidUTF8 {
+        Some(_) -> throw(NotText { path })
+        None -> Left(e)
+    }
 }
 
 --- Replace `path`'s contents with `text`, making its directory if need be.
 fun writeText(path : String, text : String) -> Either SomeError Unit {
-    if let Some(parent) = parentOf(path) { Error.promote(File.createDirAll(parent))? }
-    Error.promote(File.writeText(path, text))?
+    if let Some(parent) = parentOf(path) { File.createDirAll(parent)? }
+    File.writeText(path, text)?
     Right(())
 }
 
@@ -65,7 +67,7 @@ fun filesUnder(directory : String) -> Either SomeError (Array String) {
 }
 
 fun collect(directory : String, prefix : String, out : Vec String) -> Either SomeError Unit {
-    let names = Error.promote(File.listPath(directory))?
+    let names = File.listPath(directory)?
     for name in names {
         let path = directory + "/" + name
         if isDirectory(path) {
@@ -94,8 +96,8 @@ fun writeOut(work : String, files : Array (String, String)) -> Either SomeError 
         writeText(directory + "/used", "")?
         return Right(directory)
     }
-    Error.promote(File.createDirAll(work))?
-    let staging = Error.promote(File.temporaryDir("turkey-case-"))?
+    File.createDirAll(work)?
+    let staging = File.temporaryDir("turkey-case-")?
     for (name, text) in files { writeText(staging + "/" + name, text)? }
     writeText(staging + "/used", "")?
     -- A rename that finds the directory there lost a race to a run writing
@@ -103,7 +105,7 @@ fun writeOut(work : String, files : Array (String, String)) -> Either SomeError 
     let renamed = File.rename(staging, directory)
     let _ = File.removeTree(staging)
     if let Left(e) = renamed {
-        if !exists(directory) { return Left(fail(e)) }
+        if !exists(directory) { return Left(e) }
     }
     Right(directory)
 }

@@ -1,11 +1,22 @@
-# Publishes the standard library's API documentation to GitHub Pages.
+# Publishes the standard library's API documentation and the browser
+# playground to GitHub Pages, one site: the documentation at the root and the
+# playground under `playground/`.
 #
 # `scripts/docs.sh` builds `turkey` from the committed bootstrap if it is not
 # there and runs `turkey doc --html` over the library, which writes the static
-# site and `docs.json`, the same description as JSON. Both are published. No
-# test runs here: the suite has its own workflow, and this one runs only on
+# site and `docs.json`, the same description as JSON. Both are published. The
+# playground is `turkey.wasm` (the compiler written for `wasm32-wasi`) and
+# `lib.tar.gz` (the library) built from the same checkout and assembled by
+# `scripts/playground-assemble.sh`, with the commit in the URLs of those two
+# files so that a cache cannot pair one deploy's compiler with another's
+# library. No test runs here: the suite has its own workflow, and this one runs only on
 # `main`, and only when a path the output depends on changes, so that neither a
 # pull request nor an unrelated push costs a build.
+#
+# Pages cannot set response headers, so the playground cannot be
+# cross-origin isolated (COOP and COEP). It is single-threaded and needs no
+# isolation; shared memory and threads would, through coi-serviceworker or
+# another host.
 #
 # Needs Settings > Pages > Source set to "GitHub Actions" once.
 name: docs
@@ -20,7 +31,10 @@ on:
       - lib/**
       - src/**
       - bootstrap/**
+      - playground/**
       - scripts/docs.sh
+      - scripts/lib-tar.sh
+      - scripts/playground-assemble.sh
       - scripts/build.sh
       - .github/workflows/docs.yml
   workflow_dispatch:
@@ -47,6 +61,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sh scripts/docs.sh site
+      # `docs.sh` built `turkey` into build/stages. The wasm, the tar and the
+      # assembly come last, from this checkout, so the three agree.
+      - run: |
+          mkdir -p build
+          build/stages/turkey build --target wasm32-wasi -o build/turkey.wasm src/Main.gob
+          sh scripts/lib-tar.sh build/lib.tar.gz
+          sh scripts/playground-assemble.sh build/turkey.wasm build/lib.tar.gz site/playground "$(git rev-parse --short=12 HEAD)"
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site

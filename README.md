@@ -370,6 +370,8 @@ directory to `runtimepath`, or point a plugin manager at it
 * It sets the formatter's layout: tabs, a tab counting as 4 columns, and
   comments wrapped at 100. Set `g:turkey_recommended_style = 0` to keep your
   own settings.
+* Reindenting leaves a multi-line string's lines as they are, spaces
+  included, since their indentation is part of the string.
 * `:TurkeyFormat` formats the buffer, saved or not, and with or without a
   file, as one undoable change. A buffer that does not parse is left alone
   and the error is shown.

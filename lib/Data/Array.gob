@@ -35,7 +35,7 @@ import Debug (Debug(..))
 import Data.Functor (Functor(..))
 import Control.Applicative (Applicative(..))
 import Control.Monad (Monad(..))
-import Iter (Iterator(..))
+import Iter (Iterator(..), Step(..))
 import Data.Index (Index(..), SetIndex(..), Length(..))
 import Data.Semigroup (Semigroup(..))
 import Data.Monoid (Monoid(..))
@@ -99,11 +99,14 @@ fun init(length : Int, f : fun(Int) -> a) -> Array a {
 fun map[Iterator c, Length c](xs : c, f : fun(Item c) -> b) -> Array b {
 	let n = len(xs)
 	let out = Storage.uninitialized(n)
-	let cursor = iter(xs)
+	var cursor = iter(xs)
 	for var i = 0; i < n; i = i + 1 {
 		match next(xs, cursor) {
-			Some(x) -> { out[i] = f(x) }
-			None    -> endedEarly("Array.map", i, n)
+			Yield(x, after) -> {
+				out[i] = f(x)
+				cursor = after
+			}
+			Done -> endedEarly("Array.map", i, n)
 		}
 	}
 	Array(out)
@@ -249,20 +252,21 @@ instance SetIndex (Array a) {
 
 instance Length (Array a) { fun len(xs) = len(raw(xs)) }
 
-type ArrayCursor = ArrayCursor { var at : Int }
-
 instance Iterator (Array a) {
 	type Item = a
-	type Cursor = ArrayCursor
-	fun iter(xs) = ArrayCursor { at = 0 }
+	type Cursor = Int
+	fun iter(_) = 0
 	-- Reads the storage directly rather than through `get`, whose test is the
 	-- one made here against the same length.
-	fun next(xs, cur) {
+	-- No early `return`: one `if` leaves the consumer's `match` on the
+	-- `Step` a join it can see through, where a `return` would leave one it
+	-- cannot, and the `Yield` would be built and taken apart per element.
+	-- The end is the `if`'s first arm because its `else` arm is laid out as
+	-- the fall-through: the other way round, every element takes two
+	-- branches instead of one.
+	fun next(xs, at) {
 		let storage = raw(xs)
-		if cur.at >= len(storage) { return None }
-		let x = storage[cur.at]
-		cur.at = cur.at + 1
-		Some(x)
+		if at >= len(storage) { Done } else { Yield(storage[at], at + 1) }
 	}
 }
 

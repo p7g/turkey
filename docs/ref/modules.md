@@ -1126,7 +1126,7 @@ Within a module, a name is looked up in this order, and the first match wins:
 So a module's own declaration **shadows** an imported name of the same
 spelling, and an import shadows the Prelude. A module can define its own
 `print` or `map`, and its own type called `Option`; the operators, `for`
-loops, indexing and `?` still use the Prelude's classes and types.
+loops, indexing, `?` and `!` still use the Prelude's classes and types.
 
 <!-- run -->
 ```kotlin

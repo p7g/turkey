@@ -58,7 +58,7 @@ no Prelude operator, and is for [declared operators](#declared-operators).
 
 | Group | Operators | Associativity | Binds tighter than |
 |---|---|---|---|
-| | `f(...)` `a[i]` `a.f` `a.0` `e?` | left | everything below: call, index, field, projection, [`?`](do-notation.md) |
+| | `f(...)` `a[i]` `a.f` `a.0` `e?` `e!` | left | everything below: call, index, field, projection, [`?`](do-notation.md), [`!`](do-notation.md#unwrapping-with-) |
 | | `-e` `!e` | prefix | every group: negation, logical not |
 | `Multiplication` | `*` `/` `%` | left | `Addition` |
 | `Addition` | `+` `-` | left | `Comparison` |
@@ -713,6 +713,8 @@ its holes. Each hole holds exactly one expression, of any type with a
 value. `show` of a `String` is the string itself, so a string goes in without
 quotes. The holes are evaluated once each, left to right, and the literal's
 type is always `String`.
+
+A [multi-line string](lexical.md#multi-line-strings) takes holes the same way.
 
 <!-- run -->
 ```kotlin

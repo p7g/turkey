@@ -40,13 +40,19 @@ syn region turkeyBlockComment start="{-" end="-}" contains=turkeyBlockComment,tu
 syn match turkeyDirective "--@[^( \t]*\%(([^)]*)\)\=" nextgroup=turkeyDirectiveReason
 syn match turkeyDirectiveReason contained ".*$" contains=turkeyTodo
 
-" Strings and characters. A string cannot span lines. Escapes are exactly
-" \n \t \r \0 \\ \" \' \$ and \u{H...H}; anything else after a backslash is
-" an error. `${` opens a hole, which holds code up to the `}` that matches
+" Strings and characters. A one-line string cannot span lines. Escapes are
+" exactly \n \t \r \0 \\ \" \' \$ and \u{H...H}; anything else after a
+" backslash is an error, except that a multi-line string may end a line in a
+" backslash. `${` opens a hole, which holds code up to the `}` that matches
 " it, so the braces of a record or a block inside it nest.
+"
+" A multi-line string opens with `"""` at the end of a line and closes with a
+" `"""` that starts its own line. A hole in it is a one-line string's hole. It
+" is defined after the one-line string so that it wins where both match.
 syn match turkeyEscapeError contained "\\."
 syn match turkeyEscape contained "\\\(u{\x\{1,6}}\|[ntr0\\"'$]\)"
 syn region turkeyString start=+"+ skip=+\\"+ end=+"+ oneline contains=turkeyEscape,turkeyEscapeError,turkeyHole
+syn region turkeyMultiString start=+"""\r\=$+ end=+^\s*\zs"""+ contains=turkeyEscape,turkeyEscapeError,turkeyHole
 " Code in a hole: every group but those that only make sense elsewhere.
 syn cluster turkeyHoleCode contains=ALLBUT,turkeyTodo,turkeyDirectiveReason,turkeyEscape,turkeyEscapeError,turkeyHole
 syn region turkeyHole contained matchgroup=turkeyHoleDelimiter start=+\${+ end=+}+ oneline contains=@turkeyHoleCode
@@ -102,6 +108,7 @@ hi def link turkeyOperator Operator
 hi def link turkeyNumber Number
 hi def link turkeyFloat Float
 hi def link turkeyString String
+hi def link turkeyMultiString String
 hi def link turkeyChar Character
 hi def link turkeyEscape SpecialChar
 hi def link turkeyEscapeError Error

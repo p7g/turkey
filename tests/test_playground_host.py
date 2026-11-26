@@ -24,14 +24,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DRIVER = REPO_ROOT / "tests" / "playground_host.mjs"
 VENDOR = REPO_ROOT / "playground" / "vendor" / "browser_wasi_shim"
 
-# V8's engine stack for node, in KiB. Its default, 864 KiB on arm64 macOS, is
-# not enough for every compile: V8 first runs each function in Liftoff, its
-# baseline tier, which gives every wasm local a stack slot, and the compiler's
-# largest functions declare thousands of locals. Compiled by Liftoff alone,
-# hello world needs about 1.4 MiB and a 211-line program 2.1 MiB. Under the
-# default tiering, what a compile needs depends on when TurboFan replaces the
-# hot functions, so the default would make these tests fail at random. 4 MiB
-# fits under the 8 MiB main-thread stack of both CI and macOS.
+# V8's engine stack for node, in KiB. V8 first runs each function in Liftoff,
+# its baseline tier, which gives every wasm local a stack slot, and what a
+# compile needs depends on when TurboFan replaces the hot functions. Compiled
+# by Liftoff alone, hello world needs about 100 KiB and a 211-line program
+# about 140 KiB, against a default of 864 KiB on arm64 macOS. 4 MiB leaves a
+# deeper compile room, and fits under the 8 MiB main-thread stack of both CI
+# and macOS.
 STACK_KIB = 4096
 
 

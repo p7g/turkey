@@ -338,9 +338,9 @@ fun expr(e : Expr, out : Vec Span) -> Unit {
 		}
 		EReturn(value) | EBreak(value) -> optExpr(value, parts)
 		EBlock(stmts)                  -> for s in stmts { stmt(s, parts) }
-		EQuestion(inner, bind) -> {
+		EQuestion(inner, fn) | EUnwrap(inner, fn) -> {
 			expr(inner, parts)
-			optExpr(bind, parts)
+			optExpr(fn, parts)
 		}
 	})
 }
@@ -372,13 +372,15 @@ fun arm(a : Arm, out : Vec Span) -> Unit {
 
 -- -- the text ------------------------------------------------------------------------
 
--- What covers a stretch of the text: a token, or the comment at an index into
--- the program's comments.
-type Cover = ByToken(Span) | ByComment(Int)
+-- What covers a stretch of the text: a token, a string literal or a piece of
+-- one between its holes, or the comment at an index into the program's
+-- comments. A string and a comment can span lines, and a line inside either
+-- is never blank.
+type Cover = ByToken(Span) | ByString(Span) | ByComment(Int)
 
 fun coverSpan(program : Program, c : Cover) -> Span = match c {
-	ByToken(s)   -> s
-	ByComment(i) -> program.comments[i].span
+	ByToken(s) | ByString(s) -> s
+	ByComment(i)             -> program.comments[i].span
 }
 
 -- Walks the text once, code point by code point, beside the tokens and
@@ -387,8 +389,9 @@ fun checkText(program : Program, source : Source) -> Unit {
 	let covers : Vec Cover = []
 	for tok in Lexer.tokenizeRaw(source).tokens {
 		match tok.kind {
-			KEof -> {}
-			_    -> Vec.push(covers, ByToken(tok.span))
+			KEof                                             -> {}
+			KString | KStringStart | KStringMid | KStringEnd -> Vec.push(covers, ByString(tok.span))
+			_                                                -> Vec.push(covers, ByToken(tok.span))
 		}
 	}
 	for var i = 0; i < len(program.comments); i = i + 1 { Vec.push(covers, ByComment(i)) }
@@ -420,14 +423,15 @@ fun checkText(program : Program, source : Source) -> Unit {
 			if Source.before(line, col, s.endLine, s.endCol) { break }
 			next = next + 1
 		}
-		var inComment = False
+		var inText = False
 		var covered = False
 		if next < len(ordered) {
 			let s = coverSpan(program, ordered[next])
 			if !Source.before(line, col, s.line, s.col) {
 				covered = True
+				if let ByString(_) = ordered[next] { inText = True }
 				if let ByComment(i) = ordered[next] {
-					inComment = True
+					inText = True
 					if Option.isNone(open) && s.line == line && s.col == col {
 						open = Some((i, at, s))
 					}
@@ -452,12 +456,12 @@ fun checkText(program : Program, source : Source) -> Unit {
 			internal("the character '" + Char.toString(c) + "' is in no token and no comment", here)
 		}
 		if c == '\n' {
-			if lineBlank && !inComment { Vec.push(blank, line) }
+			if lineBlank && !inText { Vec.push(blank, line) }
 			line = line + 1
 			col = 1
 			lineBlank = True
 		} else {
-			if inComment || !space { lineBlank = False }
+			if inText || !space { lineBlank = False }
 			col = col + 1
 		}
 		at = after

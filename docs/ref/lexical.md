@@ -139,7 +139,9 @@ before `--`, which begins a comment. Some runs the language spells itself:
 &&  ||  !   =   ->  ~
 ```
 
-`&&`, `||` and `!` are built in, and `=`, `->` and `~` are punctuation. The
+`&&`, `||` and `!` are built in, and `=`, `->` and `~` are punctuation. `!`
+is both the prefix "not" and the postfix [unwrap](do-notation.md#unwrapping-with-),
+and only as a run of its own: `x!=y` is `x`, `!=` and `y`. The
 arithmetic, comparison and bitwise operators are
 [declared by the Prelude](expressions.md#operators-are-class-methods), in
 groups the language fixes. `|` is also punctuation in patterns and type
@@ -291,8 +293,9 @@ escape ::= "\n" | "\t" | "\r" | "\0" | "\\" | "\"" | "\'" | "\$" | "\u{" hex{1,6
 hole   ::= "${" expression "}"
 ```
 
-A string literal is written in double quotes and cannot span lines. Its value
-is a `String`: an immutable sequence of bytes that is always valid UTF-8
+A string literal is written in double quotes and cannot span lines; a
+[multi-line string](#multi-line-strings) can. Its value is a `String`: an
+immutable sequence of bytes that is always valid UTF-8
 ([Types](types.md#string)).
 
 `${` opens a *hole*, which holds an expression and ends at the `}` that
@@ -352,6 +355,104 @@ fun main() {
 }
 ```
 
+### Multi-line strings
+
+```ebnf
+STRING ::= '"""' newline ( indent text-line? newline )* indent '"""'
+```
+
+A multi-line string starts with `"""` at the end of a line and ends with a
+`"""` that starts a line of its own, after nothing but spaces and tabs. Its
+value is a `String`, like that of any string literal.
+
+The spaces and tabs before the closing `"""` are the string's *indentation*.
+Every line of text must start with exactly that indentation, the same spaces
+and tabs in the same order, and the indentation is not part of the value. So
+the string can be indented along with the code around it. Indentation past
+the closing line's is kept. A line holding only spaces and tabs may be
+indented less, and is then an empty line.
+
+The lines of text are joined by line feeds, and the line break before the
+closing `"""` is not part of the value. So the text ends in a line feed only
+when its last line is empty, or ends in `\n`. A `\` at the end of a line
+leaves out that line break, joining the line to the next. The other escapes
+are those of a one-line string, and a `"` or `""` inside the text needs none;
+write `\"""` for three quotes in a row. Every line break is a line feed in
+the value, even in a file whose lines end in a carriage return and a line
+feed.
+
+Holes are those of a one-line string, and each one must end on the line it
+starts on. The indentation is taken from the lines of text only, never from
+the code in a hole.
+
+<!-- run -->
+```kotlin
+fun main() {
+    let name = "world"
+    print("""
+        Hello, ${name}
+          ${String.codePointCount(name)} letters${String.repeat("!", 3)}
+        """)
+}
+```
+
+```text
+Hello, world
+  5 letters!!!
+```
+
+<!-- run -->
+```kotlin
+fun usage() -> String {
+    """
+    usage: greet NAME
+      -l   greet at length
+    """
+}
+
+fun main() {
+    print(usage())
+    print("""
+        a \
+        single line
+        """)
+}
+```
+
+```text
+usage: greet NAME
+  -l   greet at length
+a single line
+```
+
+So `usage` returns the same string as the one-line literal
+
+```
+"usage: greet NAME\n  -l   greet at length"
+```
+
+Text on the line of the opening `"""` is an error, and so is a line of text
+indented less than the closing `"""`:
+
+<!-- error: this multi-line string has text on the line of its opening '"""'; start the text on the next line -->
+```kotlin
+fun main() {
+    print("""Hello,
+        world
+        """)
+}
+```
+
+<!-- error: this line of a multi-line string does not start with the indentation of its closing '"""' -->
+```kotlin
+fun main() {
+    print("""
+        Hello,
+      world
+        """)
+}
+```
+
 ### Character literals
 
 ```ebnf
@@ -390,7 +491,8 @@ statement, so it can put several statements on one line.
 Precisely, a line break is a separator when all three of these hold:
 
 1. **The token before it can end a statement**: an identifier, a constructor
-   name, a literal, `)`, `]`, `}`, `return`, `break`, `continue`, or `?`.
+   name, a literal, `)`, `]`, `}`, `return`, `break`, `continue`, `?`, or
+   `!`.
 2. **The token after it can start a statement**: an identifier, a constructor
    name, a literal, `(`, `[`, `{`, `-`, `!`, `..`, `\`, or one of the keywords
    `class`, `continue`, `break`, `do`, `for`, `foreign`, `fun`, `if`,
@@ -443,6 +545,17 @@ break changes the meaning of a program:
   included, continues the line before it.
 * A line that starts with `(` or `[` begins a new statement. It is not a call
   or an index applied to the line before.
+* A line that ends in `!` ends the statement there, because a postfix
+  [`!`](do-notation.md#unwrapping-with-) can end one. So a prefix `!` must
+  be on the same line as its operand:
+
+<!-- error: expected an expression -->
+```kotlin
+fun main() {
+    let ready = !
+        True
+}
+```
 
 In a record literal, record pattern or record declaration, a line break that
 separates is a field separator, so commas between fields are optional when

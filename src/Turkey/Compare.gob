@@ -89,7 +89,23 @@ fun sameVar(c : C, x : String, y : String) -> Bool {
 
 -- Two literals are the same when they are written the same, which `0x10` and
 -- `16` are not. The text decides the value.
-fun lit(x : Lit, t : String, y : Lit, u : String) -> Bool = litKind(x) == litKind(y) && t == u
+--
+-- Two multi-line strings are the same when their values are. Moving every line
+-- of one by the same indentation changes its text but not its value, and the
+-- formatter does exactly that.
+fun lit(x : Lit, t : String, y : Lit, u : String) -> Bool = match (x, y) {
+	(LString(v), LString(w)) -> if isMultiLine(t) && isMultiLine(u) { v == w } else { t == u }
+	_                        -> litKind(x) == litKind(y) && t == u
+}
+
+fun isMultiLine(spelled : String) -> Bool = String.startsWith(spelled, "\"\"\"")
+
+-- Two pieces of a string literal with holes are the same as `lit` decides for
+-- two literals. A first piece is spelled without its opening `"`.
+fun pieces(xs : Vec (String, String), ys : Vec (String, String)) -> Bool {
+	let multiLine = isMultiLine("\"" + xs[0].1) && isMultiLine("\"" + ys[0].1)
+	pairwise(xs, ys, fun((v, s), (w, t)) = if multiLine { v == w } else { s == t })
+}
 
 -- -- types and patterns -------------------------------------------------------------
 
@@ -163,9 +179,9 @@ fun exprs(c : C, xs : Vec Expr, ys : Vec Expr) -> Bool = pairwise(xs, ys, fun(x,
 fun optExpr(c : C, x : Option Expr, y : Option Expr) -> Bool =
 	optional(x, y, fun(x, y) = expr(c, x, y))
 
--- The method references that `EIndex`, `EUnary`, `EBinary`, `EForIn` and
--- `EQuestion` carry are left out: the parser writes the same ones for the same
--- syntax, and resolution is what fills them in.
+-- The method references that `EIndex`, `EUnary`, `EBinary`, `EForIn`,
+-- `EQuestion` and `EUnwrap` carry are left out: the parser writes the same
+-- ones for the same syntax, and resolution is what fills them in.
 fun exprKind(c : C, x : ExprKind, y : ExprKind) -> Bool = match (x, y) {
 	(ELit(l, t), ELit(m, u))   -> lit(l, t, m, u)
 	(EUnit, EUnit)             -> True
@@ -202,10 +218,10 @@ fun exprKind(c : C, x : ExprKind, y : ExprKind) -> Bool = match (x, y) {
 	(EContinue, EContinue)               -> True
 	(EBlock(xs), EBlock(ys))             -> pairwise(xs, ys, fun(x, y) = stmt(c, x, y))
 	(EQuestion(e, _), EQuestion(f, _))   -> expr(c, e, f)
+	(EUnwrap(e, _), EUnwrap(f, _))       -> expr(c, e, f)
 	(EDo(e), EDo(f))                     -> expr(c, e, f)
 	(EParen(e), EParen(f))               -> expr(c, e, f)
-	(EInterp(xs, e), EInterp(ys, f)) ->
-		pairwise(xs, ys, fun((_, s), (_, t)) = s == t) && exprs(c, e, f)
+	(EInterp(xs, e), EInterp(ys, f))     -> pieces(xs, ys) && exprs(c, e, f)
 	(ELit(_, _), _)
 	| (EUnit, _)
 	| (EVar(_, _), _)
@@ -235,6 +251,7 @@ fun exprKind(c : C, x : ExprKind, y : ExprKind) -> Bool = match (x, y) {
 	| (EContinue, _)
 	| (EBlock(_), _)
 	| (EQuestion(_, _), _)
+	| (EUnwrap(_, _), _)
 	| (EDo(_), _)
 	| (EParen(_), _)
 	| (EInterp(_, _), _) -> False

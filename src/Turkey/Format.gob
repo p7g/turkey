@@ -37,7 +37,7 @@ import Turkey.Pretty (Doc, Row(..), RowKind(..))
 import Turkey.Source as Source
 import Turkey.Source (Source(..), Span(..))
 import Turkey.Token as Token
-import Turkey.Token (Comment(..), Kind(..), Token(..))
+import Turkey.Token (Comment(..), Kind(..), Token(..), Value(..))
 
 --- What formatting a file comes to: its text formatted, or why the formatter
 --- refuses it, which is a fault in the formatter and not in the file.
@@ -157,8 +157,8 @@ fun reinsert(f : F, all : Vec Comment, out : String, pads : Vec P.Pad) -> Either
 	if Option.isSome(problem) { return Left("the formatted text does not lex") }
 	let outLines = String.lines(out)
 	let laidTokens = significant(lexed.tokens)
-	let from = Vec.map(f.tokens, fun(t) = slice(f.lines, t.span))
-	let to = Vec.map(laidTokens, fun(t) = slice(outLines, t.span))
+	let from = Vec.map(f.tokens, fun(t) = tokenKey(f.lines, t))
+	let to = Vec.map(laidTokens, fun(t) = tokenKey(outLines, t))
 	let place = match aligned(from, to) {
 		Some(p) -> p
 		None    -> return Left("the formatted text does not match the source token for token")
@@ -331,6 +331,14 @@ fun insert(
 
 fun inside(inner : Span, outer : Span) -> Bool =
 	!lt(startOf(inner), startOf(outer)) && !lt(endOf(outer), endOf(inner))
+
+-- What `reinsert` matches token `t` of `lines` by: its text as written, or
+-- for a piece of a string literal, its kind and value. The formatter may move
+-- a multi-line string's lines, which changes its text but not its value.
+fun tokenKey(lines : Vec String, t : Token) -> String = match (t.kind, t.value) {
+	(KString | KStringStart | KStringMid | KStringEnd, VText(v)) -> Token.kindName(t.kind) + ":" + v
+	_                                                            -> slice(lines, t.span)
+}
 
 -- For each of the source's tokens `from`, the index of the token of `to` that
 -- is the same token in the formatted text, or -1 for a token the formatter
@@ -583,11 +591,39 @@ fun written(f : F, s : Span) -> String = slice(f.lines, s)
 -- lines after it keep their places relative to it.
 fun kept(f : F, s : Span) -> Doc {
 	Vec.push(f.keptSpans, s)
-	let line = if s.line <= len(f.lines) { f.lines[s.line - 1] } else { "" }
-	let cs = String.toCodePoints(line)
+	P.shifted(String.trimEnd(written(f, s)), indentOf(f, s.line))
+}
+
+-- The spaces and tabs that start source line `line`.
+fun indentOf(f : F, line : Int) -> String {
+	let text = if line <= len(f.lines) { f.lines[line - 1] } else { "" }
+	let cs = String.toCodePoints(text)
 	var n = 0
 	while n < len(cs) && (cs[n] == ' ' || cs[n] == '\t') { n = n + 1 }
-	P.shifted(String.trimEnd(written(f, s)), String.fromCodePoints(Array.slice(cs, 0, n)))
+	String.fromCodePoints(Array.slice(cs, 0, n))
+}
+
+-- A literal at `s`, as written.
+fun literalDoc(f : F, s : Span, spelled : String) -> Doc {
+	if s.line == s.endLine { return P.text(spelled) }
+	literalText(f, s, spelled)
+}
+
+-- Text of the literal at `s`, spelled `spelled`, which may span lines.
+--
+-- A multi-line string's later lines move with the line it starts on when that
+-- keeps its value, which is when its closing line starts with that line's
+-- indentation. Every line of its text then starts with that indentation too,
+-- since it starts with the closing line's, and the string's indentation and
+-- its text move together. Otherwise its later lines stay where they are, and
+-- the string keeps its value but not its place relative to the code around it.
+fun literalText(f : F, s : Span, spelled : String) -> Doc {
+	let first = indentOf(f, s.line)
+	if String.startsWith(indentOf(f, s.endLine), first) {
+		P.shifted(spelled, first)
+	} else {
+		P.raw(spelled)
+	}
 }
 
 -- -- tokens -------------------------------------------------------------------------
@@ -1360,9 +1396,8 @@ fun typeDeclDoc(f : F, t : TypeDecl) -> Doc {
 			)
 	}
 	let head = P.text("type " + t.name + params + derives)
-	match t.alias {
-		Some(alias) -> return P.cat([head, P.text(" = "), typeDoc(f, alias)])
-		None        -> {}
+	if let Some(alias) = t.alias {
+		return P.cat([head, P.text(" = "), typeDoc(f, alias)])
 	}
 	let variants = Option.unwrapOr(t.variants, [])
 	let equals = findToken(f, startOf(t.span), "=")
@@ -1470,9 +1505,8 @@ fun record(f : F, open : Int, close : Pos, fields : Vec Field, rest : Bool) -> D
 	if commented || opensLine(f, open) || P.isHard(s.head) { return broken }
 	let inline = []
 	for r in table {
-		match r.kind {
-			Plain | Aligned -> Vec.push(inline, P.cat([r.left, r.right]))
-			_               -> {}
+		if let Plain | Aligned = r.kind {
+			Vec.push(inline, P.cat([r.left, r.right]))
 		}
 	}
 	let oneLine = P.cat([P.text("{ "), joined(inline, P.text(", ")), P.text(" }")])
@@ -1803,7 +1837,7 @@ fun patDoc(f : F, p : Pat) -> Doc {
 			})
 			P.cat([P.text(name + " "), record(f, open, closerOf(p.span), items, rest)])
 		}
-		PLit(_, spelled) -> P.raw(spelled)
+		PLit(_, spelled) -> literalDoc(f, p.span, spelled)
 		PTuple(xs)       -> list(f, tokenFrom(f, startOf(p.span)), "(", ")", patEntries(f, xs))
 		PAnnot(inner, t) -> P.cat([patDoc(f, inner), P.text(" : "), typeDoc(f, t)])
 		POr(alts)        -> joined(Vec.map(alts, patDoc(f, _)), P.text(" | "))
@@ -1857,8 +1891,8 @@ fun exprAt(f : F, e : Expr, depth : Int) -> Doc {
 }
 
 fun exprKind(f : F, e : Expr, depth : Int) -> Doc = match e.kind {
-	ELit(_, spelled)       -> P.raw(spelled)
-	EInterp(pieces, holes) -> interpolation(f, pieces, holes)
+	ELit(_, spelled)       -> literalDoc(f, e.span, spelled)
+	EInterp(pieces, holes) -> interpolation(f, e.span, pieces, holes)
 	EUnit                  -> P.text("()")
 	EVar(name, _) -> P.text(if String.startsWith(name, shorthandPrefix) { "_" } else { name })
 	ECon(name)             -> P.text(name)
@@ -1959,6 +1993,7 @@ fun exprKind(f : F, e : Expr, depth : Int) -> Doc = match e.kind {
 		if expand { P.forced(d) } else { P.group(d) }
 	}
 	EQuestion(inner, _) -> P.cat([exprDoc(f, inner), P.text("?")])
+	EUnwrap(inner, _)   -> P.cat([exprDoc(f, inner), P.text("!")])
 	EDo(b)              -> P.cat([P.text("do "), exprDoc(f, b)])
 	EParen(inner)       -> P.cat([P.text("("), exprDoc(f, inner), P.text(")")])
 }
@@ -2190,19 +2225,20 @@ fun arrayDoc(f : F, e : Expr, xs : Vec Expr) -> Doc {
 	P.group(P.ifBreak(broken, P.cat([P.text("["), joined(items, P.text(", ")), P.text("]")])))
 }
 
--- A string literal cannot hold a line break, so each hole is printed flat and
--- the literal on one line, however long. A hole that begins with a comment
--- keeps a space after its `${`, which would otherwise read as `{-` opening
--- one. `\u{24}` is `$`, spelled so because the compiler in `bootstrap/` that
--- builds this file does not know `\$`.
-fun interpolation(f : F, pieces : Vec (String, String), holes : Vec Expr) -> Doc {
-	let parts = [P.raw("\"" + pieces[0].1)]
+-- The literal at `s`. A hole cannot span lines, so each hole is printed flat
+-- and on the line it is written on, however long. A multi-line string's text
+-- moves as `literalText` moves it. A hole that begins with a comment keeps a
+-- space after its `${`, which would otherwise read as `{-` opening one.
+-- `\u{24}` is `$`, spelled so because the compiler in `bootstrap/` that builds
+-- this file does not know `\$`.
+fun interpolation(f : F, s : Span, pieces : Vec (String, String), holes : Vec Expr) -> Doc {
+	let parts = [literalText(f, s, "\"" + pieces[0].1)]
 	for var i = 0; i < len(holes); i = i + 1 {
 		let after = if i + 1 == len(holes) { "\"" } else { "" }
 		let comment = len(Map.getOr(f.inlineBefore, positionKey(holes[i].span), [])) > 0
 		Vec.push(parts, P.raw(if comment { "\u{24}{ " } else { "\u{24}{" }))
 		Vec.push(parts, P.flat(exprDoc(f, holes[i])))
-		Vec.push(parts, P.raw("}" + pieces[i + 1].1 + after))
+		Vec.push(parts, literalText(f, s, "}" + pieces[i + 1].1 + after))
 	}
 	P.cat(parts)
 }

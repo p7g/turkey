@@ -5,9 +5,10 @@
 `String.codePoints(s)`. Its pattern can take each element apart, as
 `(word, n)` does a map's entries.
 
-`[]` is an empty array. An array has a fixed length and a `Vec` grows, and
-the program doesn't have to state which one a literal is:
-`Vec.push(long, word)` needs a `Vec`, so `long` is one. A `Map` is indexed
+An array literal such as `[]` is an `Array`, a `Vec` or a `FrozenArray`,
+decided by how its value is used. An `Array` has a fixed length and a `Vec`
+grows: `Vec.push(long, word)` needs a `Vec`, so `long` is one, and `words`,
+which nothing decides, defaults to an `Array`. A `Map` is indexed
 by its keys, and `Map.get` returns an `Option`, since a key may be missing.
 
 `continue` goes on to the next element and `break` leaves the loop.

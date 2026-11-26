@@ -11,10 +11,10 @@ in, so a type has to ask: otherwise reordering its constructors would
 reorder every sort without warning. A record compares its fields from first
 to last.
 
-`Debug` is derived for every type. It prints a value as Turkey would build
-it, and that is what `print` shows for each element of a collection. `dbg(x)`
-writes `debug(x)` to standard error and returns `x`, so it can wrap any
-expression.
+`Debug` is derived, without asking, for every type whose fields have it. It
+prints a value as Turkey would build it, and that is what `print` shows for
+each element of a collection. `dbg(x)` writes `debug(x)` to standard error
+and returns `x`, so it can wrap any expression.
 
 <!-- run -->
 ```kotlin

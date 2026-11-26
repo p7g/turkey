@@ -30,8 +30,9 @@ and `sh scripts/test.sh docs/tutorial` runs them. The `run` and `panic`
 examples also run with `--target wasm32-wasi`, since that is what the
 browser runs. `<!-- skip: wasm32-wasi: REASON -->`, on the line before an
 example's directive, skips it there, and the page shows that program with
-its recorded output and the reason, with Run turned off. A program with
-`module` files is shown the same way, since the browser compiles one file.
+its recorded output and the reason, with Run turned off. The `module`
+files before the program go in the editor with it, a tab each, after the
+program's own tab, `main.gob`.
 
 **The programs are what `turkey format` writes.** The page's Format button
 would otherwise change a lesson's program, and the site's build refuses a

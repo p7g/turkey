@@ -1,9 +1,9 @@
 # Hello, Turkey
 
-Turkey is a statically typed language in the ML family. Its types are
-inferred, its data is built from records and variants, and type classes give
-operators and loops their meaning. Its compiler is written in Turkey, and on
-this page it runs in your browser.
+Turkey is a statically typed language in the ML family, with inferred types,
+data built from records and variants, and type classes that give operators
+and loops their meaning. The compiler is written in Turkey, and on this page
+it runs in your browser.
 
 A program starts at `main`, a function that takes nothing and returns
 nothing. `print` writes a value and a line break.

@@ -14,7 +14,7 @@ The `a`, `l` and `r` are type parameters, so `Int.parse` returns an
 `Right` holds the result.
 
 `x!` takes the value out of an `Option` or an `Either`, and panics if there
-is none. It is for a value the program's own logic knows is there.
+is none. Use it where the program's own logic makes sure the value is there.
 
 <!-- run -->
 ```kotlin
@@ -73,7 +73,7 @@ panic: unwrapped None
   at main (Main.gob:5:32)
 ```
 
-A failure the caller should handle is better returned than panicked on.
+Return a failure the caller should handle instead of panicking on it.
 [Errors as values](11-errors.md) shows how `?` passes one along.
 
 ## In the reference

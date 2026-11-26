@@ -1,8 +1,8 @@
 # Values, `let` and `var`
 
 `let` gives a value a name. The program names an `Int`, a `Float`, a `Char`,
-a `String` and a `Bool`, and nothing says which is which: the compiler works
-out every name's type. A number literal takes its type from how it is used:
+a `String` and a `Bool` without writing a type: the compiler works out every
+name's type. A number literal takes its type from how it is used:
 `12` is an `Int` here, since `total` is made from it and passed to
 `Float.fromInt`, and the same `12` could be a `Float` elsewhere.
 
@@ -49,8 +49,8 @@ fun main() {
 }
 ```
 
-A later `let` can reuse a name, which hides the earlier one. That is how a
-value changes type as a program works on it:
+A later `let` can reuse a name and hide the earlier one, which lets a value
+change type as a program works on it:
 
 <!-- run -->
 ```kotlin

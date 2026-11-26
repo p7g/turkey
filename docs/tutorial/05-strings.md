@@ -36,9 +36,8 @@ Order:
   apples + pears + figs
 ```
 
-`print(fruits)` shows the strings in quotes, because a collection shows each
-element as Turkey would write it, so `["a,b"]` and `["a", "b"]` can't print
-alike.
+`print(fruits)` shows the strings in quotes. A collection shows each element
+as Turkey would write it, so `["a,b"]` and `["a", "b"]` can't print alike.
 
 A string is UTF-8, and it has no `len` and no index: "length" could mean
 bytes, code points or what a reader sees, so each has its own function.

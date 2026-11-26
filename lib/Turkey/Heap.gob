@@ -716,6 +716,15 @@ fun takeRegion(sizeClass : Int) -> Ptr {
 		let slotBytes = classSlot(sizeClass)
 		region = newRegion(slotBytes, slotBytes, sizeClass, False)
 		if Ptr.isNull(region) { return region }
+		if censusKept { Ptr.store(censusTakenNew, times8(sizeClass), Ptr.load(censusTakenNew, times8(sizeClass)) + 1) }
+	} else if censusKept {
+		Ptr.store(censusTakenAvailable, times8(sizeClass), Ptr.load(censusTakenAvailable, times8(sizeClass)) + 1)
+		Ptr.store(
+			censusOffered,
+			times8(sizeClass),
+			Ptr.load(censusOffered, times8(sizeClass))
+				+ (Ptr.load32(region, regionCapacity) - Ptr.load32(region, regionUsed)) * classSlot(sizeClass),
+		)
 	}
 	Ptr.store(available, times8(sizeClass), Ptr.load(region, regionAvailableNext) : Ptr)
 	region
@@ -827,12 +836,12 @@ fun newRegion(bytes : Int, slotSize : Int, sizeClass : Int, large : Bool) -> Ptr
 		spare = Ptr.load(made, regionNext)
 		spareCount = spareCount - 1
 	}
-	let sizes = if !sizesKept {
+	let sizes = if !sizesKept && !censusTables() {
 		Ptr.null()
 	} else if reused {
 		Ptr.load(made, regionSizes)
 	} else {
-		Os.malloc(regionBytes)
+		Os.malloc(if sizesKept { regionBytes } else { censusTableBytes() })
 	}
 	if (sizesKept && Ptr.isNull(sizes)) || !tableInsert(made) {
 		Os.free(sizes)
@@ -900,7 +909,7 @@ fun allocate(size : Int, kind : Int, frame : Ptr) -> Ptr {
 	let cursor = cursorOf(classOf(size))
 	let free : Int = Ptr.load(cursor, cursorFree)
 	if free == 0 { return allocateSlow(size, kind, frame) }
-	taken(takeSlot(cursor, free), size, kind)
+	taken(takeSlot(cursor, free), size, kind, frame)
 }
 
 fun allocateSlow(size : Int, kind : Int, frame : Ptr) -> Ptr {
@@ -922,7 +931,7 @@ fun allocateSlow(size : Int, kind : Int, frame : Ptr) -> Ptr {
 		return Ptr.null()
 	}
 	let object = slotFor(size)
-	if !Ptr.isNull(object) { return taken(object, size, kind) }
+	if !Ptr.isNull(object) { return taken(object, size, kind, frame) }
 	-- No memory for a region, though the threshold was not reached: the heap
 	-- grows by up to a threshold between collections, set from the live set,
 	-- which can be more than the memory left. So collect everything and try
@@ -933,7 +942,7 @@ fun allocateSlow(size : Int, kind : Int, frame : Ptr) -> Ptr {
 	if Process.pending() { return Ptr.null() }
 	let again = slotFor(size)
 	if Ptr.isNull(again) { return outOfMemory() }
-	taken(again, size, kind)
+	taken(again, size, kind, frame)
 }
 
 -- A slot of `size` bytes, its header unwritten, or null if there is no memory
@@ -1016,7 +1025,8 @@ fun stressDue() -> Bool {
 
 -- A fresh slot for an object of `size` bytes and of `kind`, recorded in the
 -- size table and the statistics where they are kept.
-fun taken(object : Ptr, size : Int, kind : Int) -> Ptr {
+fun taken(object : Ptr, size : Int, kind : Int, frame : Ptr) -> Ptr {
+	if censusKept { censusNote(object, size, frame) }
 	if sizesKept {
 		let region = regionOf(object)
 		Ptr.store(Ptr.load(region, regionSizes), Ptr.diff(object, region), size)
@@ -1572,6 +1582,7 @@ fun drain() -> Unit {
 			Ptr.store(stack, times8(top), Ptr.fromInt(next))
 			top = plus(top, 1)
 		}
+		if scanLog { let _ = Ptr.atomicAdd(scanCounts, 0, Int.mulWrapping(Int.subWrapping(end, field), per)) }
 		-- `at` is the run's offset and `k` the word's within it.
 		var at = plus(first, Int.mulWrapping(field, stride))
 		let stop = plus(first, Int.mulWrapping(end, stride))
@@ -1842,6 +1853,12 @@ fun run(task : Int) -> Unit {
 		-- remembered after.
 		for var at = Ptr.toInt(a); at < Ptr.toInt(b); at = plus(at, 8) {
 			let parent : Ptr = Ptr.load(Ptr.fromInt(at), 0)
+			if scanLog {
+				let h = Ptr.load32(parent, 0)
+				let words = if (h >> 8 & 255) == arrayKind { Int.mulWrapping(h >> 16, Ptr.load(parent, arrayLength)) } else { h >> 16 }
+				let _ = Ptr.atomicAdd(scanCounts, 8, 1)
+				let _ = Ptr.atomicAdd(scanCounts, 16, words)
+			}
 			promote(parent)
 			push(parent)
 		}
@@ -2065,13 +2082,16 @@ type Asked = Due | Full | Minor
 -- A collection, with every other worker stopped. If another worker is
 -- stopping them already, it collects and this one does not.
 fun collectFrom(frame : Ptr, asked : Asked) -> Unit {
+	if timeLog { timeAsked = nanoseconds() }
 	if !Workers.stopTheWorld() { return }
 	collectStopped(frame, asked)
 	Workers.startTheWorld()
 }
 
 fun collectStopped(frame : Ptr, asked : Asked) -> Unit {
+	let timeStarted = if timeLog { nanoseconds() } else { 0 }
 	retire()
+	statsRegionsBefore = regionBytesInUse
 	minor = generational
 		&& match asked {
 			Due   -> !fullDue()
@@ -2091,9 +2111,29 @@ fun collectStopped(frame : Ptr, asked : Asked) -> Unit {
 		clearMarks()
 		rememberedCountSet(0)
 	}
+	let scanStarted = if scanLog { nanoseconds() } else { 0 }
+	if scanLog { Memory.fill(scanCounts, 24, 0) }
 	markFrom(frame)
 	if Process.pending() { return }
-	let marked = if wanted { nanoseconds() } else { 0 }
+	if scanLog {
+		let markNanos = nanoseconds() - scanStarted
+		textLength = 0
+		put(if minor { Prim.cString("[scan minor] words ") } else { Prim.cString("[scan full] words ") })
+		putInt(Ptr.load(scanCounts, 0))
+		put(Prim.cString(" remembered "))
+		putInt(Ptr.load(scanCounts, 8))
+		put(Prim.cString(" remembered-words "))
+		putInt(Ptr.load(scanCounts, 16))
+		put(Prim.cString(" mark-us "))
+		putInt(markNanos / 1000)
+		put(Prim.cString(" held "))
+		putInt(regionBytesInUse)
+		put(Prim.cString("\n"))
+		writeLine()
+	}
+	let marked = if wanted || timeLog { nanoseconds() } else { 0 }
+	if censusKept { census() }
+	let censused = if timeLog { nanoseconds() } else { 0 }
 	if verify { verifyAt(Check.BeforeSweeping, frame) }
 	sweep()
 	if verify { verifyAt(Check.AfterSweeping, frame) }
@@ -2107,7 +2147,43 @@ fun collectStopped(frame : Ptr, asked : Asked) -> Unit {
 		Some(n) -> n
 		None    -> maxInt()
 	}
+	if youngBytes > 0 { threshold = youngBytes }
+	if targetBytes > 0 {
+		let room = targetBytes - regionBytesInUse
+		if room < threshold { threshold = room }
+		if threshold < 0x400_0000 { threshold = 0x400_0000 }
+		nextFull = room < liveBytesAfterFull / 4
+	}
 	if let Wasi = Target.os { threshold = belowCeiling(threshold) }
+	if timeLog {
+		let swept = nanoseconds()
+		textLength = 0
+		put(if minor { Prim.cString("[time] minor") } else { Prim.cString("[time] full") })
+		put(Prim.cString(" gc "))
+		putInt(collections)
+		put(Prim.cString(" held "))
+		putInt(statsRegionsBefore)
+		put(Prim.cString(" after "))
+		putInt(regionBytesInUse)
+		put(Prim.cString(" spares "))
+		putInt(spareCount * regionBytes)
+		put(Prim.cString(" kept "))
+		putInt(liveBytes)
+		put(Prim.cString(" threshold "))
+		putInt(threshold)
+		put(Prim.cString(" stop-us "))
+		putInt((timeStarted - timeAsked) / 1000)
+		put(Prim.cString(" mark-us "))
+		putInt((marked - timeStarted) / 1000)
+		put(Prim.cString(" sweep-us "))
+		putInt((swept - censused) / 1000)
+		put(Prim.cString(" regiontable "))
+		putInt(regionTableCapacity * 8)
+		put(Prim.cString(" markstack "))
+		putInt(markStackBytes())
+		put(Prim.cString("\n"))
+		writeLine()
+	}
 	if minor { statsMinor = statsMinor + 1 }
 	collections = collections + 1
 	if wanted {
@@ -2130,9 +2206,20 @@ fun fullDue() -> Bool {
 	-- Near wasm32's ceiling, since a minor collection frees no old object
 	-- that has died, and the next must free everything it can.
 	if let Wasi = Target.os { if roomUnderCeiling() < threshold { return True } }
+	if nextFull { return True }
 	let floor = if liveBytesAfterFull > 65536 { liveBytesAfterFull } else { 65536 }
-	Float.fromInt(liveBytes) >= Float.fromInt(floor) * 1.5
+	Float.fromInt(liveBytes) >= Float.fromInt(floor) * fullFactor
 }
+
+fun bytesFrom(s : Ptr) -> Int = if Ptr.isNull(s) { 0 } else { decimalFrom(s) }
+
+var youngBytes : Int = bytesFrom(Os.getenv(Prim.cString("TURKEY_GC_YOUNG_BYTES")))
+var targetBytes : Int = bytesFrom(Os.getenv(Prim.cString("TURKEY_GC_TARGET_BYTES")))
+var nextFull : Bool = False
+var scanLog : Bool = present(Prim.cString("TURKEY_GC_SCANLOG"))
+var scanCounts : Ptr = zeroed(24)
+var timeLog : Bool = present(Prim.cString("TURKEY_GC_TIMELOG"))
+var timeAsked : Int = 0
 
 -- The memory left under wasm32's 4 GiB ceiling, which no `memory.grow`
 -- passes, less 64 MiB kept for what the collector itself allocates while it
@@ -2158,6 +2245,10 @@ fun belowCeiling(wanted : Int) -> Int {
 	let least = liveBytesAfterFull / 8
 	if room > least { room } else { least }
 }
+
+var fullFactor : Float = fullFactorFrom(Os.getenv(Prim.cString("TURKEY_GC_FULL_FACTOR")))
+
+fun fullFactorFrom(s : Ptr) -> Float = if Ptr.isNull(s) { 1.5 } else { scaleFrom(s) }
 
 -- Before a full collection's marking: no object is marked.
 fun clearMarks() -> Unit {
@@ -2259,6 +2350,206 @@ fun release(region : Ptr) -> Unit {
 	Os.free(region)
 }
 
+-- -- census (measurement build) --------------------------------------------------------
+--
+-- In a `--gc-stats` build without `--gc-verify`, each region's size-table word
+-- holds a census table instead: per slot, the allocating call's return
+-- address in the high half's place and the requested size, so that a full
+-- collection can report live bytes by size class and by allocation site.
+
+let censusKept : Bool = Prim.gcStats && !Prim.gcVerify
+var statsRegionsBefore : Int = 0
+fun censusTables() -> Bool = censusKept
+-- Each region's census table: natively, per slot, the requested size (8
+-- bytes, at 16 per slot for the old site layout); then on every target, one
+-- byte per slot, the collection count at the slot's allocation, mod 256.
+fun censusBirthAt() -> Int = match Target.os {
+	Wasi -> 0
+	_    -> regionBytes
+}
+fun censusTableBytes() -> Int = plus(censusBirthAt(), 4096)
+var censusClasses : Ptr = Ptr.null()
+let censusClassWords : Int = 20
+var censusBirths : Ptr = zeroed(8 * 4 * 256)
+var censusFull : Int = 0
+-- Slot bytes allocated per class since the last census, and per class the
+-- regions taken off the available list and made (spare or fresh) since.
+var censusAllocated : Ptr = zeroed(8 * (regionClasses + 1))
+var censusTakenAvailable : Ptr = zeroed(8 * (regionClasses + 1))
+var censusTakenNew : Ptr = zeroed(8 * (regionClasses + 1))
+var censusOffered : Ptr = zeroed(8 * (regionClasses + 1))
+
+fun censusNote(object : Ptr, size : Int, frame : Ptr) -> Unit {
+	let region = regionOf(object)
+	let table : Ptr = Ptr.load(region, regionSizes)
+	if Ptr.isNull(table) { return }
+	let cls = Ptr.load32(region, regionSizeClass)
+	let index = if cls == regionClasses { 0 } else { slotOf(region, object) }
+	let slotBytes : Int = if cls == regionClasses { Ptr.load(region, regionReserved) } else { Ptr.load(region, regionSlotSize) }
+	let _ = Ptr.atomicAdd(censusAllocated, times8(cls), slotBytes)
+	if censusBirthAt() > 0 { Ptr.store(table, times8(index) * 2, size) }
+	Ptr.store(table, plus(censusBirthAt(), index), Byte.truncate(collections & 255))
+}
+
+fun classAdd(cls : Int, word : Int, n : Int) -> Unit {
+	let at = times8(cls * censusClassWords + word)
+	Ptr.store(censusClasses, at, plus(Ptr.load(censusClasses, at), n))
+}
+
+fun classGet(cls : Int, word : Int) -> Int = Ptr.load(censusClasses, times8(cls * censusClassWords + word))
+
+fun birthAdd(birth : Int, word : Int, n : Int) -> Unit {
+	let at = times8(birth * 4 + word)
+	Ptr.store(censusBirths, at, plus(Ptr.load(censusBirths, at), n))
+}
+
+-- The heap after a collection's marking and before its sweep, by size class
+-- and by birth. Class words:
+--   0 regions with a marked object, 1 regions with none, 2 their slots,
+--   3 marked slots, 4 marked slot bytes, 5 marked requested bytes (native),
+--   6 reserved bytes of all regions, 7 dead old slot bytes (allocated,
+--   unmarked, generation old), 8 young garbage slot bytes (allocated,
+--   unmarked, young), 9 free slot bytes (unallocated), 10 slot bytes free
+--   after the sweep in regions it keeps, 11 marked pointer-free objects
+--   (header count 0), 12 their slot bytes, 13 marked objects whose traced
+--   words are 0, 14 traced words of marked objects, 15 marked objects,
+--   16 dead old requested bytes (native), 17 young garbage requested bytes.
+-- Birth words, by the collection count at allocation mod 256: 0 marked slot
+-- bytes, 1 marked traced words, 2 dead old slot bytes, 3 young garbage bytes.
+fun census() -> Unit {
+	censusFull = censusFull + 1
+	if Ptr.isNull(censusClasses) { censusClasses = zeroed(8 * censusClassWords * (regionClasses + 1)) }
+	Memory.fill(censusClasses, 8 * censusClassWords * (regionClasses + 1), 0)
+	Memory.fill(censusBirths, 8 * 4 * 256, 0)
+	let birthAt = censusBirthAt()
+	var region = regions
+	while !Ptr.isNull(region) {
+		let cls = Ptr.load32(region, regionSizeClass)
+		let live = Ptr.load32(region, regionLive)
+		let capacity = Ptr.load32(region, regionCapacity)
+		let slotSize : Int = Ptr.load(region, regionSlotSize)
+		let reserved : Int = Ptr.load(region, regionReserved)
+		let table : Ptr = Ptr.load(region, regionSizes)
+		let slotBytes = if cls == regionClasses { reserved } else { slotSize }
+		classAdd(cls, 6, reserved)
+		if live == 0 {
+			classAdd(cls, 1, 1)
+		} else {
+			classAdd(cls, 0, 1)
+			classAdd(cls, 2, capacity)
+			classAdd(cls, 3, live)
+			classAdd(cls, 10, (capacity - live) * slotBytes)
+		}
+		for var i = 0; i < capacity; i = i + 1 {
+			if !testBit(region, regionAllocated, i) {
+				classAdd(cls, 9, slotBytes)
+			} else {
+				let object = Ptr.add(region, plus(regionData, Int.mulWrapping(i, slotSize)))
+				let birth = if Ptr.isNull(table) { 0 } else { Byte.toInt(Ptr.load(table, plus(birthAt, i))) }
+				let size : Int = if Ptr.isNull(table) || birthAt == 0 { slotBytes } else { Ptr.load(table, times8(i) * 2) }
+				let header = Ptr.load32(object, 0)
+				if testBit(region, regionMarked, i) {
+					let kind = header >> 8 & 255
+					let count = header >> 16
+					let words = if kind == arrayKind {
+						if count > 0 { Int.mulWrapping(count, Ptr.load(object, arrayLength)) } else { 0 }
+					} else {
+						count
+					}
+					classAdd(cls, 4, slotBytes)
+					classAdd(cls, 5, size)
+					classAdd(cls, 15, 1)
+					classAdd(cls, 14, words)
+					if count == 0 {
+						classAdd(cls, 11, 1)
+						classAdd(cls, 12, slotBytes)
+					}
+					if words == 0 { classAdd(cls, 13, 1) }
+					birthAdd(birth, 0, slotBytes)
+					birthAdd(birth, 1, words)
+				} else if header & 255 != 0 {
+					classAdd(cls, 7, slotBytes)
+					classAdd(cls, 16, size)
+					birthAdd(birth, 2, slotBytes)
+				} else {
+					classAdd(cls, 8, slotBytes)
+					classAdd(cls, 17, size)
+					birthAdd(birth, 3, slotBytes)
+				}
+			}
+		}
+		region = Ptr.load(region, regionNext)
+	}
+	textLength = 0
+	put(Prim.cString("[census "))
+	putInt(censusFull)
+	put(if minor { Prim.cString(" minor") } else { Prim.cString(" full") })
+	put(Prim.cString("] at gc "))
+	putInt(collections)
+	put(Prim.cString(" regions "))
+	putInt(statsRegionsBefore)
+	put(Prim.cString(" peak "))
+	putInt(regionBytesPeak)
+	put(Prim.cString(" spares "))
+	putInt(spareCount)
+	put(Prim.cString(" regiontable "))
+	putInt(regionTableCapacity * 8)
+	put(Prim.cString(" markstack "))
+	putInt(markStackBytes())
+	if let Wasi = Target.os {
+		put(Prim.cString(" memoryleft "))
+		putInt(Wasi.memoryLeft())
+	}
+	put(Prim.cString("\n"))
+	writeLine()
+	for var c = 0; c <= regionClasses; c = c + 1 {
+		if classGet(c, 0) + classGet(c, 1) > 0 || Ptr.load(censusAllocated, times8(c)) > 0 {
+			put(Prim.cString("[class] "))
+			putInt(c)
+			put(Prim.cString(" "))
+			putInt(if c < regionClasses { classSlot(c) } else { 0 })
+			for var w = 0; w < 18; w = w + 1 {
+				put(Prim.cString(" "))
+				putInt(classGet(c, w))
+			}
+			put(Prim.cString(" "))
+			putInt(Ptr.load(censusAllocated, times8(c)))
+			put(Prim.cString(" "))
+			putInt(Ptr.load(censusTakenAvailable, times8(c)))
+			put(Prim.cString(" "))
+			putInt(Ptr.load(censusTakenNew, times8(c)))
+			put(Prim.cString("\n"))
+			writeLine()
+		}
+	}
+	Memory.fill(censusAllocated, 8 * (regionClasses + 1), 0)
+	Memory.fill(censusTakenAvailable, 8 * (regionClasses + 1), 0)
+	Memory.fill(censusTakenNew, 8 * (regionClasses + 1), 0)
+	Memory.fill(censusOffered, 8 * (regionClasses + 1), 0)
+	for var b = 0; b < 256; b = b + 1 {
+		let any = Ptr.load(censusBirths, times8(b * 4)) + Ptr.load(censusBirths, times8(b * 4 + 2)) + Ptr.load(censusBirths, times8(b * 4 + 3))
+		if any > 0 {
+			put(Prim.cString("[birth] "))
+			putInt(b)
+			for var w = 0; w < 4; w = w + 1 {
+				put(Prim.cString(" "))
+				putInt(Ptr.load(censusBirths, times8(b * 4 + w)))
+			}
+			put(Prim.cString("\n"))
+			writeLine()
+		}
+	}
+}
+
+-- The bytes of every worker's mark stack.
+fun markStackBytes() -> Int {
+	var n = 0
+	for var i = 0; i < Workers.threadLimit(); i = i + 1 {
+		n = n + times8(Ptr.load(Ptr.add(markers, markerBytes * i), 16))
+	}
+	n
+}
+
 -- -- statistics -------------------------------------------------------------------------
 
 fun nanoseconds() -> Int {
@@ -2292,6 +2583,14 @@ fun logCollection(started : Int, liveBefore : Int, allocsSince : Int) -> Unit {
 	putInt(freedNow)
 	put(Prim.cString(", next threshold "))
 	putInt(threshold)
+	put(Prim.cString(", regions "))
+	putInt(statsRegionsBefore)
+	put(Prim.cString(" -> "))
+	putInt(regionBytesInUse)
+	put(Prim.cString(", spare "))
+	putInt(spareCount * regionBytes)
+	put(Prim.cString(", kept "))
+	putInt(liveBytes)
 	put(Prim.cString(", "))
 	putFixed(nanos, 1000000, 3)
 	put(Prim.cString(" ms\n"))

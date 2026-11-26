@@ -379,17 +379,24 @@ write `\"""` for three quotes in a row. Every line break is a line feed in
 the value, even in a file whose lines end in a carriage return and a line
 feed.
 
-A multi-line string cannot hold a hole. `${` in its text is an error, and
-`\${` writes the text `${`.
+Holes are those of a one-line string, and each one must end on the line it
+starts on. The indentation is taken from the lines of text only, never from
+the code in a hole.
 
-<!-- error: a multi-line string cannot hold a '${' hole; write '\${' for the text -->
+<!-- run -->
 ```kotlin
 fun main() {
     let name = "world"
     print("""
         Hello, ${name}
+          ${String.codePointCount(name)} letters${String.repeat("!", 3)}
         """)
 }
+```
+
+```text
+Hello, world
+  5 letters!!!
 ```
 
 <!-- run -->

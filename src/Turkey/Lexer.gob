@@ -42,11 +42,13 @@ type Lexer = Lexer {
 	holes : Vec Hole
 }
 
--- A hole being lexed: how many of its own `{` are still open, and where its
--- string literal begins, which is what an unclosed hole's error points at.
+-- A hole being lexed: how many of its own `{` are still open, where its
+-- string literal begins, which is what an unclosed hole's error points at,
+-- and the indentation of its literal when that is a multi-line string.
 type Hole = Hole {
 	var depth : Int
 	literal   : Span
+	indent    : Option String
 }
 
 --- A file's tokens, and what the tokens leave out: its comments in source
@@ -253,7 +255,10 @@ fun lexOne(lx : Lexer, start : Span, c : Char, tokens : Vec Token) -> Token {
 			if hole.depth == 0 {
 				let _ = Vec.pop(lx.holes)
 				bump(lx)
-				return lexPiece(lx, start, hole.literal, False)
+				return match hole.indent {
+					None         -> lexPiece(lx, start, hole.literal, False)
+					Some(indent) -> lexMultiLinePiece(lx, start, hole.literal, indent, False)
+				}
 			}
 			hole.depth = hole.depth - 1
 		}
@@ -655,7 +660,7 @@ fun lexPiece(lx : Lexer, start : Span, literal : Span, first : Bool) -> Token {
 				}
 				if c == '$' && charIs(peekAt(lx, 1), '{') {
 					bumpBy(lx, 2)
-					Vec.push(lx.holes, Hole { depth = 0, literal = literal })
+					Vec.push(lx.holes, Hole { depth = 0, literal = literal, indent = None })
 					let kind = if first { KStringStart } else { KStringMid }
 					return plain(kind, VText(String.build(b)), start)
 				}
@@ -679,8 +684,9 @@ fun lexPiece(lx : Lexer, start : Span, literal : Span, first : Bool) -> Token {
 -- with exactly that indentation, which is left out of the value; a line of
 -- only spaces and tabs may have less, and is then empty. The lines are joined
 -- by line feeds, so the line break before the closing line is not part of the
--- value. Escapes are those of a one-line string, and a `\` at the end of a
--- line leaves out its line break. A multi-line string holds no holes.
+-- value. Escapes and holes are those of a one-line string, and a `\` at the
+-- end of a line leaves out its line break. A hole cannot span lines, so the
+-- indentation is stripped only from text, never from the code in a hole.
 --
 -- The indentation is known only at the closing line, and every line before it
 -- is read relative to it. So read the literal twice: once to find the closing
@@ -723,37 +729,58 @@ fun lexMultiLineString(lx : Lexer, start : Span) -> Token {
 	lx.at = at
 	lx.line = line
 	lx.col = col
+	lexMultiLinePiece(lx, start, start, indent, True)
+}
+
+-- Lexes the text of a multi-line string with indentation `indent` up to its
+-- closing `"""` or its next `${`, whichever comes first, from the start of
+-- its first line of text (when `first`) or just after the `}` that closed a
+-- hole, partway through a line. At a `${` it opens a hole, as `lexPiece`
+-- does. The piece's token begins at `start`, and an error points at
+-- `literal`, where the whole literal begins.
+fun lexMultiLinePiece(
+	lx : Lexer,
+	start : Span,
+	literal : Span,
+	indent : String,
+	first : Bool,
+) -> Token {
 	let b = String.builder()
 	-- Whether a line break ended the last line of text. Its line feed is
 	-- pushed only once another line of text follows.
 	var broke = False
+	-- Whether the lexer is at the start of a line, before its indentation.
+	var atLineStart = first
 	loop {
-		let lineStart = here(lx)
-		let leading = spacesAndTabs(lx)
-		if matchesAt(lx.src, lx.at, "\"\"\"") {
-			bumpBy(lx, 3)
-			break
-		}
-		if broke { String.push(b, "\n") }
-		broke = False
-		if endsLine(lx) {
-			if let Some(rest) = String.stripPrefix(leading, indent) { String.push(b, rest) }
-			skipLineBreak(lx)
-			broke = True
-			continue
-		}
-		match String.stripPrefix(leading, indent) {
-			Some(rest) -> String.push(b, rest)
-			None -> {
-				return oops(
-					lx,
-					"this line of a multi-line string does not start with the "
-						+ "indentation of its closing '\"\"\"'",
-					lineStart,
-					broken(start),
-				)
+		if atLineStart {
+			let lineStart = here(lx)
+			let leading = spacesAndTabs(lx)
+			if matchesAt(lx.src, lx.at, "\"\"\"") {
+				bumpBy(lx, 3)
+				break
+			}
+			if broke { String.push(b, "\n") }
+			broke = False
+			if endsLine(lx) {
+				if let Some(rest) = String.stripPrefix(leading, indent) { String.push(b, rest) }
+				skipLineBreak(lx)
+				broke = True
+				continue
+			}
+			match String.stripPrefix(leading, indent) {
+				Some(rest) -> String.push(b, rest)
+				None -> {
+					return oops(
+						lx,
+						"this line of a multi-line string does not start with the "
+							+ "indentation of its closing '\"\"\"'",
+						lineStart,
+						broken(start),
+					)
+				}
 			}
 		}
+		atLineStart = True
 		loop {
 			if endsLine(lx) {
 				skipLineBreak(lx)
@@ -765,14 +792,15 @@ fun lexMultiLineString(lx : Lexer, start : Span) -> Token {
 				-- cannot end first.
 				None -> { return internal(lx, "a multi-line string lost its closing line", start) }
 				Some(c) -> {
-					-- `\u{24}` is `$`, as in `unclosedHole`.
 					if c == '$' && charIs(peekAt(lx, 1), '{') {
-						return oops(
-							lx,
-							"a multi-line string cannot hold a '\u{24}{' hole; write '\\\u{24}{' for the text",
-							here(lx),
-							broken(start),
-						)
+						bumpBy(lx, 2)
+						Vec.push(lx.holes, Hole {
+							depth   = 0
+							literal = literal
+							indent  = Some(indent)
+						})
+						let kind = if first { KStringStart } else { KStringMid }
+						return plain(kind, VText(String.build(b)), start)
 					}
 					if c == '\\' && continuesLine(lx) {
 						bump(lx)
@@ -791,7 +819,7 @@ fun lexMultiLineString(lx : Lexer, start : Span) -> Token {
 			}
 		}
 	}
-	plain(KString, VText(String.build(b)), start)
+	plain(if first { KString } else { KStringEnd }, VText(String.build(b)), start)
 }
 
 -- Returns the indentation of the closing line of the multi-line string whose

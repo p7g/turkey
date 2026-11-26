@@ -168,7 +168,9 @@ function! s:InMultiString(lnum) abort
   " string, and one that starts with `"""` and goes on closes one. A line of
   " only `"""` could do either, so each one in between flips the answer.
   if s:HasSyntax()
-    return synIDattr(synID(a:lnum, 1, 1), "name") ==# 'turkeyMultiString'
+    " A line of text can start with a hole, which is innermost there.
+    return index(map(synstack(a:lnum, 1), 'synIDattr(v:val, "name")'),
+          \ 'turkeyMultiString') >= 0
   endif
   let flips = 0
   let l = a:lnum - 1

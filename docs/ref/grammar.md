@@ -25,8 +25,11 @@ INDEX   ::= "0" | [1-9] [0-9]*
 STRING  ::= '"' ( character | escape )* '"'                   -- containing no "${"
           | '"""' newline ( indent text-line? newline )* indent '"""'   -- see lexical.md
 STRING_START ::= '"' ( character | escape )* "${"
+             | '"""' newline ... "${"                         -- a multi-line string's first piece
 STRING_MID   ::= "}" ( character | escape )* "${"
+             | "}" ... "${"                                   -- a multi-line string's later piece
 STRING_END   ::= "}" ( character | escape )* '"'
+             | "}" ... newline indent '"""'                   -- a multi-line string's last piece
 CHAR    ::= "'" ( character | escape ) "'"
 escape  ::= "\n" | "\t" | "\r" | "\0" | "\\" | "\"" | "\'" | "\$" | "\u{" hex hex? hex? hex? hex? hex? "}"
 OPERATOR ::= [!#$%&*+\-/<=>@^|~]+                            -- the longest run, never containing "--"

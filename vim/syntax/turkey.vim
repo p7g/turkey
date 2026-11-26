@@ -47,12 +47,12 @@ syn match turkeyDirectiveReason contained ".*$" contains=turkeyTodo
 " it, so the braces of a record or a block inside it nest.
 "
 " A multi-line string opens with `"""` at the end of a line and closes with a
-" `"""` that starts its own line. It holds no holes. It is defined after the
-" one-line string so that it wins where both match.
+" `"""` that starts its own line. A hole in it is a one-line string's hole. It
+" is defined after the one-line string so that it wins where both match.
 syn match turkeyEscapeError contained "\\."
 syn match turkeyEscape contained "\\\(u{\x\{1,6}}\|[ntr0\\"'$]\)"
 syn region turkeyString start=+"+ skip=+\\"+ end=+"+ oneline contains=turkeyEscape,turkeyEscapeError,turkeyHole
-syn region turkeyMultiString start=+"""\r\=$+ end=+^\s*\zs"""+ contains=turkeyEscape,turkeyEscapeError
+syn region turkeyMultiString start=+"""\r\=$+ end=+^\s*\zs"""+ contains=turkeyEscape,turkeyEscapeError,turkeyHole
 " Code in a hole: every group but those that only make sense elsewhere.
 syn cluster turkeyHoleCode contains=ALLBUT,turkeyTodo,turkeyDirectiveReason,turkeyEscape,turkeyEscapeError,turkeyHole
 syn region turkeyHole contained matchgroup=turkeyHoleDelimiter start=+\${+ end=+}+ oneline contains=@turkeyHoleCode

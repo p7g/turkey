@@ -479,6 +479,8 @@ standard output holds, and returns `x`, so it can wrap any expression.
   field whose type mentions a type an [existential
   constructor](types.md#existential-types) hides as `<hidden>`, unless its
   `Debug` follows from the classes the constructor carries.
+* A `SomeError` prints as `SomeError("...")` around its message chain,
+  outermost first, as `Error.describe` gives it.
 
 A container's `Show` shows its elements' `Debug`. The `Show` of `Array`,
 `Vec`, `FrozenArray`, `Map`, `Set`, `Deque`, `PriorityQueue`, `Option`, `Either` and the

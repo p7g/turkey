@@ -1,10 +1,16 @@
 export (
 	Diag(..),
 	Severity(..),
+	Note(..),
 	at,
 	whole,
 	warningAt,
+	coded,
+	noted,
 	render,
+	shown,
+	writeJSON,
+	writingJSON,
 	fail,
 	short,
 	compiling,
@@ -38,11 +44,15 @@ export (
 --- older way, and stays for the sites that cannot carry on: it prints what has
 --- been reported, renders its own diagnostic and exits.
 ---
---- One rendering, `file:line:col: stage: message`, and every diagnostic uses it.
+--- Two renderings, and every diagnostic uses the one the driver chose. The text
+--- one is `file:line:col: stage: message`, with a line of the same shape for
+--- each note; the JSON one is an object to a line (`shown`).
 
 import System.Env as Env
 import System.File as File
 import System.IO as IO
+import Turkey.JSON (JSON(..))
+import Turkey.JSON as JSON
 import Turkey.Prelude as Prelude
 import Turkey.Source (Span(..), generated, isGenerated, outermost, showSpan)
 
@@ -50,12 +60,21 @@ import Turkey.Source (Span(..), generated, isGenerated, outermost, showSpan)
 --- `Warning` is printed and stops nothing.
 type Severity = Error | Warning
 
+--- `code` names the check that found a lint finding, and is `None` for
+--- every other diagnostic. `notes` point at other places the message is
+--- about, such as the declaration a fix goes in.
 type Diag = Diag {
 	stage    : String
 	message  : String
 	span     : Option Span
 	severity : Severity
+	code     : Option String
+	notes    : Vec Note
 }
+
+--- A remark about another place than the diagnostic's own. `span` is `None`
+--- for a place in no file a reader can open.
+type Note = Note { message : String, span : Option Span }
 
 --- Both constructors shorten the message here rather than leaving it to the
 --- raising site, so that every diagnostic is shortened and not only the ones
@@ -70,18 +89,50 @@ fun at(stage : String, message : String, where : Span) -> Diag = Diag {
 	message  = short(message)
 	span     = placed(where)
 	severity = Error
+	code     = None
+	notes    = []
 }
 
 --- A diagnostic about a whole file rather than a place in it: a file that cannot
 --- be read has no line to point at.
-fun whole(stage : String, message : String) -> Diag =
-	Diag { stage = stage, message = short(message), span = None, severity = Error }
+fun whole(stage : String, message : String) -> Diag = Diag {
+	stage    = stage
+	message  = short(message)
+	span     = None
+	severity = Error
+	code     = None
+	notes    = []
+}
 
 fun warningAt(message : String, where : Span) -> Diag = Diag {
 	stage    = "warning"
 	message  = short(message)
 	span     = placed(where)
 	severity = Warning
+	code     = None
+	notes    = []
+}
+
+--- Returns `d` with `code` as its code.
+fun coded(d : Diag, code : String) -> Diag = Diag {
+	stage    = d.stage
+	message  = d.message
+	span     = d.span
+	severity = d.severity
+	code     = Some(code)
+	notes    = d.notes
+}
+
+--- Returns `d` with a note at `where` after its other notes. The note's
+--- message is shortened as the diagnostic's is, and a note at inlined code
+--- points at the outermost call, as the diagnostic does.
+fun noted(d : Diag, message : String, where : Span) -> Diag = Diag {
+	stage    = d.stage
+	message  = d.message
+	span     = d.span
+	severity = d.severity
+	code     = d.code
+	notes    = Vec.append(d.notes, [Note { message = short(message), span = placed(where) }])
 }
 
 -- Returns where a diagnostic at `where` points. A generated span points at no
@@ -93,10 +144,94 @@ fun placed(where : Span) -> Option Span {
 	if isGenerated(s) { None } else { Some(s) }
 }
 
-fun render(d : Diag, filename : String) -> String = match d.span {
-	None -> filename + ": " + d.stage + ": " + d.message
-	Some(where) ->
-		where.file + ":" + showSpan(where) + ": " + d.stage + ": " + d.message
+--- Returns `d` as text, `file:line:col: stage: message`, with ` [code]` after
+--- the message when `d` has a code, and a line `file:line:col: note: message`
+--- for each note. With no span, `filename` stands in for `file:line:col`. No
+--- newline follows the last line.
+fun render(d : Diag, filename : String) -> String {
+	let message = match d.code {
+		Some(code) -> d.message + " [" + code + "]"
+		None       -> d.message
+	}
+	let out = String.builder()
+	String.push(out, placeText(d.span, filename) + ": " + d.stage + ": " + message)
+	for n in d.notes {
+		String.push(out, "\n" + placeText(n.span, filename) + ": note: " + n.message)
+	}
+	String.build(out)
+}
+
+fun placeText(where : Option Span, filename : String) -> String = match where {
+	Some(s) -> s.file + ":" + showSpan(s)
+	None    -> filename
+}
+
+-- Whether `shown` writes JSON rather than text.
+var json = False
+
+--- Makes `shown`, and so every diagnostic printed from now on, JSON.
+fun writeJSON() -> Unit {
+	json = True
+}
+
+--- Returns whether `writeJSON` has been called.
+fun writingJSON() -> Bool = json
+
+--- Returns `d` as the driver prints it, ending in a newline: `render`'s text,
+--- or after `writeJSON`, one line holding one JSON object:
+---
+---     {"file":F,"line":L,"column":C,"endLine":L,"endColumn":C,
+---      "severity":"error"|"warning","stage":S,"code":S|null,"message":S,
+---      "notes":[{"file":F,"line":L,"column":C,"endLine":L,"endColumn":C,
+---                "message":S}]}
+---
+--- with its members in that order. Lines and columns are 1-based and count
+--- code points, and the range ends before `endLine:endColumn`. A diagnostic
+--- or note with no span has `filename` as its file and `null` for each
+--- position.
+fun shown(d : Diag, filename : String) -> String {
+	if !json { return render(d, filename) + "\n" }
+	let severity = match d.severity {
+		Error   -> "error"
+		Warning -> "warning"
+	}
+	let code = match d.code {
+		Some(name) -> JString(name)
+		None       -> JNull
+	}
+	let notes = Vec.map(
+		d.notes,
+		fun(n) = JObject(Vec.append(place(n.span, filename), [("message", JString(n.message))])),
+	)
+	let members = Vec.append(place(d.span, filename), [
+		("severity", JString(severity)),
+		("stage", JString(d.stage)),
+		("code", code),
+		("message", JString(d.message)),
+		("notes", JArray(notes)),
+	])
+	let out = String.builder()
+	JSON.compact(JObject(members), out)
+	String.push(out, "\n")
+	String.build(out)
+}
+
+-- The members of a JSON diagnostic or note that say where it is.
+fun place(where : Option Span, filename : String) -> Vec (String, JSON) = match where {
+	Some(s) -> [
+		("file", JString(s.file)),
+		("line", JInt(s.line)),
+		("column", JInt(s.col)),
+		("endLine", JInt(s.endLine)),
+		("endColumn", JInt(s.endCol)),
+	]
+	None -> [
+		("file", JString(filename)),
+		("line", JNull),
+		("column", JNull),
+		("endLine", JNull),
+		("endColumn", JNull),
+	]
 }
 
 -- The file the driver was asked to compile, for a diagnostic that has no span
@@ -298,7 +433,7 @@ fun printCollected() -> Unit {
 		Some(s) -> (s.file, (s.line, s.col))
 		None    -> ("", (0, 0))
 	})
-	for d in ordered { let _ = IO.writeText(IO.stderr(), render(d, entryFile) + "\n") }
+	for d in ordered { let _ = IO.writeText(IO.stderr(), shown(d, entryFile)) }
 	Vec.clear(collected)
 }
 
@@ -317,7 +452,7 @@ fun fail(d : Diag, filename : String) -> a {
 	if failNote != "" { let _ = IO.writeText(IO.stderr(), failNote) }
 	if !cascade {
 		let name = if filename == "" || filename == generated().file { entryFile } else { filename }
-		let _ = IO.writeText(IO.stderr(), render(d, name) + "\n")
+		let _ = IO.writeText(IO.stderr(), shown(d, name))
 	}
 	exit(failStatus)
 }

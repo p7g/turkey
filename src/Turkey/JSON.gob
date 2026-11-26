@@ -1,0 +1,115 @@
+export (JSON(..), pretty, compact, quote)
+
+--- A JSON value, and the two layouts the compiler writes it in.
+---
+--- Both escape every `<` in a string, so that a document can sit inside an
+--- HTML `<script>` element without a `</script>` in some string closing it.
+
+--- A JSON value. An object's members keep the order they are given in, and
+--- are written in that order.
+type JSON
+	= JNull
+	| JBool(Bool)
+	| JInt(Int)
+	| JString(String)
+	| JArray(Vec JSON)
+	| JObject(Vec (String, JSON))
+
+--- Writes `j` to `out` with two spaces of indentation per level, starting at
+--- `depth` levels, one element or member to a line, and an empty array or
+--- object on one line. Writes no newline after the last line.
+fun pretty(j : JSON, depth : Int, out : String.Builder) -> Unit = match j {
+	JArray(elements) -> {
+		if len(elements) == 0 { return String.push(out, "[]") }
+		String.push(out, "[")
+		for var i = 0; i < len(elements); i = i + 1 {
+			String.push(out, if i == 0 { "\n" } else { ",\n" })
+			indent(depth + 1, out)
+			pretty(elements[i], depth + 1, out)
+		}
+		String.push(out, "\n")
+		indent(depth, out)
+		String.push(out, "]")
+	}
+	JObject(members) -> {
+		if len(members) == 0 { return String.push(out, "{}") }
+		String.push(out, "{")
+		for var i = 0; i < len(members); i = i + 1 {
+			let (key, value) = members[i]
+			String.push(out, if i == 0 { "\n" } else { ",\n" })
+			indent(depth + 1, out)
+			quote(key, out)
+			String.push(out, ": ")
+			pretty(value, depth + 1, out)
+		}
+		String.push(out, "\n")
+		indent(depth, out)
+		String.push(out, "}")
+	}
+	_ -> scalar(j, out)
+}
+
+--- Writes `j` to `out` on one line, with no whitespace between tokens.
+fun compact(j : JSON, out : String.Builder) -> Unit = match j {
+	JArray(elements) -> {
+		String.push(out, "[")
+		for var i = 0; i < len(elements); i = i + 1 {
+			if i > 0 { String.push(out, ",") }
+			compact(elements[i], out)
+		}
+		String.push(out, "]")
+	}
+	JObject(members) -> {
+		String.push(out, "{")
+		for var i = 0; i < len(members); i = i + 1 {
+			let (key, value) = members[i]
+			if i > 0 { String.push(out, ",") }
+			quote(key, out)
+			String.push(out, ":")
+			compact(value, out)
+		}
+		String.push(out, "}")
+	}
+	_ -> scalar(j, out)
+}
+
+-- Writes a value that is neither an array nor an object.
+fun scalar(j : JSON, out : String.Builder) -> Unit = match j {
+	JNull      -> String.push(out, "null")
+	JBool(b)   -> String.push(out, if b { "true" } else { "false" })
+	JInt(n)    -> String.push(out, Int.toString(n))
+	JString(s) -> quote(s, out)
+	-- Unreachable from `pretty` and `compact`, which lay these out themselves.
+	JArray(_) | JObject(_) -> compact(j, out)
+}
+
+fun indent(depth : Int, out : String.Builder) -> Unit =
+	String.push(out, String.repeat("  ", depth))
+
+--- Writes `s` to `out` as a JSON string literal, which is also a JavaScript
+--- one. Escapes `"`, `\`, every control character and `<`, and nothing else.
+fun quote(s : String, out : String.Builder) -> Unit {
+	String.push(out, "\"")
+	for c in String.codePoints(s) {
+		match c {
+			'"'  -> String.push(out, "\\\"")
+			'\\' -> String.push(out, "\\\\")
+			'\n' -> String.push(out, "\\n")
+			'\t' -> String.push(out, "\\t")
+			'<'  -> String.push(out, "\\u003c")
+			_ -> if Char.toInt(c) < 32 {
+				String.push(
+					out,
+					"\\u00" + hexDigit(Char.toInt(c) / 16) + hexDigit(Char.toInt(c) % 16),
+				)
+			} else {
+				String.push(out, Char.toString(c))
+			}
+		}
+	}
+	String.push(out, "\"")
+}
+
+fun hexDigit(n : Int) -> String = hexDigits[n]
+
+let hexDigits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"]

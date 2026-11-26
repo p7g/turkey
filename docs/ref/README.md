@@ -12,8 +12,8 @@ Some things are deliberately left out:
   it is compiled, and nothing here depends on how a value is laid out in
   memory.
 * **The standard library**, except the parts the language itself relies on:
-  the types and classes behind literals, operators, `for` loops, indexing and
-  `?`. Those are described in [Built-in types and classes](builtins.md).
+  the types and classes behind literals, operators, `for` loops, indexing,
+  `?` and `!`. Those are described in [Built-in types and classes](builtins.md).
   Examples also use a few library functions, such as `print`, without further
   comment.
 
@@ -31,7 +31,8 @@ Some things are deliberately left out:
    patterns may appear in bindings.
 6. [Statements and control flow](statements.md): blocks, assignment, `if`,
    `match`, the loops, `break`, `continue`, and `return`.
-7. [The `?` operator and `do`](do-notation.md): monadic sequencing.
+7. [The `?` and `!` operators and `do`](do-notation.md): monadic sequencing,
+   and unwrapping or panicking.
 8. [Type classes](classes.md): classes, instances, superclasses, associated
    types, and equality constraints.
 9. [Type inference](inference.md): what the compiler infers, when it
@@ -374,8 +375,8 @@ from, and the one that chose differently.
   chapter.
 * The **Haskell 2010 Report** gives the meaning of each piece of syntactic
   sugar by translating it into a smaller core language. This reference
-  explains `for`, `if let`, `while let`, `let ... else`, array literals and
-  `?` the same way, except that it translates into ordinary Turkey rather than
+  explains `for`, `if let`, `while let`, `let ... else`, array literals, `?`
+  and `!` the same way, except that it translates into ordinary Turkey rather than
   a separate core language.
 * The **Rust Reference** puts a small syntax block in each section, and it
   tests its examples, including examples that are meant to be rejected. This

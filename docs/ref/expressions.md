@@ -58,7 +58,7 @@ no Prelude operator, and is for [declared operators](#declared-operators).
 
 | Group | Operators | Associativity | Binds tighter than |
 |---|---|---|---|
-| | `f(...)` `a[i]` `a.f` `a.0` `e?` | left | everything below: call, index, field, projection, [`?`](do-notation.md) |
+| | `f(...)` `a[i]` `a.f` `a.0` `e?` `e!` | left | everything below: call, index, field, projection, [`?`](do-notation.md), [`!`](do-notation.md#unwrapping-with-) |
 | | `-e` `!e` | prefix | every group: negation, logical not |
 | `Multiplication` | `*` `/` `%` | left | `Addition` |
 | `Addition` | `+` `-` | left | `Comparison` |

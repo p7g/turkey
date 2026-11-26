@@ -1,6 +1,7 @@
 export (program)
 
---- `?` and `do`, rewritten into `bind`, and the forms that mean a `match`.
+--- `?` and `do`, rewritten into `bind`, and the forms that mean a `match`,
+--- `e!` among them.
 ---
 --- Most sugar in this language is a node the later stages interpret:
 --- `a + b` carries the `add` it means, `for x in xs` carries its `iter` and
@@ -629,6 +630,13 @@ fun expr(d : D, e : Expr, k : Cont, tail : Bool, flow : Bool) -> Expr {
 					False,
 				),
 			),
+			False,
+			False,
+		)
+		EUnwrap(inner, fn) -> expr(
+			d,
+			inner,
+			KFn(fun(v) = apply(d, k, mkExpr(d, e.span, EUnwrap(v, fn)))),
 			False,
 			False,
 		)
@@ -1435,6 +1443,7 @@ fun walkExpr(d : D, e : Expr) -> Expr {
 		EUnary(op, operand, fn) -> {
 			e.kind = EUnary(op, walkExpr(d, operand), fn)
 		}
+		EUnwrap(inner, fn) -> { e.kind = EUnwrap(walkExpr(d, inner), fn) }
 		EBinary(op, left, right, fn) -> {
 			e.kind = EBinary(op, walkExpr(d, left), walkExpr(d, right), fn)
 		}
@@ -1578,6 +1587,7 @@ fun bareKind(e : Expr) -> ExprKind = match e.kind {
 		e.kind
 	}
 	EQuestion(inner, bindFn) -> EQuestion(bare(inner), bindFn)
+	EUnwrap(inner, unwrapFn) -> EUnwrap(bare(inner), unwrapFn)
 	EDo(body)                -> EDo(bare(body))
 	EParen(_)                -> unbared(e.span)
 	EInterp(pieces, holes)   -> EInterp(pieces, bareAll(holes))
@@ -1909,25 +1919,53 @@ fun armBinder(d : D, v : Pat, id : Int, name : String, inner : Map Int Int) -> I
 -- -- brackets -----------------------------------------------------------------------
 
 -- Turn bracket reads and writes into the resolved `Index` method calls they
--- mean. A separate walk over the whole program rather than part of the one
--- above, because it applies everywhere and not only where a `?` reaches.
+-- mean, and each `e!` into the `match` on its `tryUnwrap` call. A separate walk
+-- over the whole program rather than part of the one above, because it applies
+-- everywhere and not only where a `?` reaches.
 --
--- Both rewrites keep the node's own span, so each is done in place: `xs[i]`
--- becomes the `get` call at the same place, and `xs[i] = v` becomes a `set`
--- call statement at the statement's place. A missing reference stops the walk
+-- Each rewrite is done in place. `xs[i]` becomes the `get` call at the
+-- node's own span, and `xs[i] = v` becomes a `set` call statement at the
+-- statement's span. `e!` becomes a `match` whose call and panic are spanned
+-- at the `!` (see `unwrapping`). A missing reference stops the walk
 -- rather than being reported here: it means the module cannot see `Index`, and
 -- inference says so in terms the author will recognize.
 fun desugarIndexes(d : D, p : Program) -> Unit {
 	for decl in p.decls {
 		match decl {
-			DStmt(s)     -> indexStmt(d, s)
-			DClass(c)    -> for m in c.methods { indexFun(d, m) }
-			DInstance(i) -> for m in i.methods { indexFun(d, m) }
-			DType(_)     -> {}
-			DForeign(_)  -> {}
-			DInfix(_)    -> {}
+			DStmt(s) -> {
+				enter(d, s.id, s.span)
+				indexStmt(d, s)
+			}
+			DClass(c) -> for m in c.methods {
+				enter(d, m.id, m.span)
+				indexFun(d, m)
+			}
+			DInstance(i) -> for m in i.methods {
+				enter(d, m.id, m.span)
+				indexFun(d, m)
+			}
+			DType(_)    -> {}
+			DForeign(_) -> {}
+			DInfix(_)   -> {}
 		}
 	}
+}
+
+-- `e!`, as the `match` it means:
+--
+--     match tryUnwrap(e) { Right(%x) -> %x; Left(%why) -> error(%why) }
+--
+-- The call and the `error` are spanned at the `!`, which is the reference's
+-- span, so the panic's trace names the line and column of the `!`.
+fun unwrapping(d : D, inner : Expr, tryUnwrap : Expr) -> ExprKind {
+	let at = tryUnwrap.span
+	let x = fresh(d, "%x", at)
+	let why = fresh(d, "%why", at)
+	let panic = mkExpr(d, at, ECall(globalOf(d, P.error, at), [varOf(d, why, at)]))
+	EMatch(mkExpr(d, at, ECall(tryUnwrap, [inner])), [
+		armOf(d, P.eitherRight, Bound(x), at, varOf(d, x, at)),
+		armOf(d, P.eitherLeft, Bound(why), at, panic),
+	])
 }
 
 fun indexFun(d : D, f : FunDecl) -> Unit = if let Some(b) = f.body {
@@ -2009,10 +2047,14 @@ fun indexExpr(d : D, e : Expr) -> Unit = match e.kind {
 			indexExpr(d, a.body)
 		}
 	}
-	EReturn(value)                                    -> indexOpt(d, value)
-	EBreak(value)                                     -> indexOpt(d, value)
-	EBlock(stmts)                                     -> for s in stmts { indexStmt(d, s) }
-	EQuestion(inner, _)                               -> indexExpr(d, inner)
+	EReturn(value)      -> indexOpt(d, value)
+	EBreak(value)       -> indexOpt(d, value)
+	EBlock(stmts)       -> for s in stmts { indexStmt(d, s) }
+	EQuestion(inner, _) -> indexExpr(d, inner)
+	EUnwrap(inner, unwrapFn) -> if let Some(tryUnwrap) = unwrapFn {
+		indexExpr(d, inner)
+		e.kind = unwrapping(d, inner, tryUnwrap)
+	}
 	EDo(body)                                         -> indexExpr(d, body)
 	EIfLet(_, _, _) | EWhileLet(_, _) | EInterp(_, _) -> rewritten(e.span)
 	EParen(_)                                         -> unbared(e.span)

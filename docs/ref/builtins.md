@@ -2,7 +2,8 @@
 
 Several pieces of syntax are defined in terms of library types and classes:
 `if` needs a `Bool`, `+` calls `Add`, a `for` loop calls `Iterator`, `a[i]`
-calls `Index`, `a[i] = v` calls `SetIndex`, and `?` calls `Monad`. This
+calls `Index`, `a[i] = v` calls `SetIndex`, `?` calls `Monad`, and `e!` calls
+`Unwrap`. This
 chapter describes those types and classes, and the Prelude that makes them
 available. It does not document the rest of the library.
 
@@ -17,7 +18,7 @@ The Prelude provides these names unqualified:
 | Kind | Names |
 |---|---|
 | Types and their constructors | `Int`, `Float`, `Byte`, `Char`, `Unit`, `Bool`, `Option`, `Either`, `Ordering`, `SomeError`, and the types `String`, `Array`, `Vec`, `FrozenArray` and `Map` without their constructors |
-| Classes and their methods | `Eq`, `Ord`, `Add`, `Sub`, `Mul`, `Div`, `Mod`, `Neg`, `Zero`, `One`, `Show`, `Iterator`, `Index`, `SetIndex`, `Length`, `Functor`, `Applicative`, `Monad`, `Semigroup`, `Monoid`, `Foldable`, `Hash`, `Error`, `Typed`, `Object`, `Debug` |
+| Classes and their methods | `Eq`, `Ord`, `Add`, `Sub`, `Mul`, `Div`, `Mod`, `Neg`, `Zero`, `One`, `Show`, `Iterator`, `Index`, `SetIndex`, `Length`, `Functor`, `Applicative`, `Monad`, `Unwrap`, `Semigroup`, `Monoid`, `Foldable`, `Hash`, `Error`, `Typed`, `Object`, `Debug` |
 | Functions | `print`, `write`, `dbg`, `error`, `fail`, `throw`, `const`, `pipe`, `fmap`, `min`, `max`, `hash` |
 | Operators | `+` `-` `*` `/` `%`, `==` `!=` `<` `<=` `>` `>=`, `&` `\|` `^` `<<` `>>`, `<>`, `\|>` `\|>>` `<&>` `<$>` ([Operators](expressions.md#operators)) |
 
@@ -67,7 +68,7 @@ type Bool : Ord = False | True
 ```
 
 An ordinary data type. `if`, `while`, the test of a C-style `for`, `&&`,
-`||` and `!` all require this type. `==` and the other comparisons return it.
+`||` and prefix `!` all require this type. `==` and the other comparisons return it.
 Its `Eq`, `Ord` and `Hash` are derived ([Derived instances](classes.md#derived-instances)),
 so `False < True`.
 
@@ -1021,6 +1022,47 @@ fun main() {
 Some("10")
 [Some(2), None]
 Some(Some(4))
+```
+
+## `Unwrap`
+
+```text
+class Unwrap f {
+    fun tryUnwrap(f a) -> Either String a
+}
+```
+
+The class behind [`e!`](do-notation.md#unwrapping-with-). `tryUnwrap(e)` is
+`Right(x)` when `e` holds a value `x`, and otherwise `Left` with the text the
+panic at a `!` reports. It never panics itself: the `!` does, where it is
+written.
+
+| Instance | `Right` when | `Left` |
+|---|---|---|
+| `Unwrap Option` | `Some(x)` | `"unwrapped None"` |
+| `Unwrap (Either e)`, for `Error e` | `Right(x)` | the `message` of the `Left`'s error |
+
+`SomeError` is an `Error` too, whose `message` is the whole chain as
+`Error.describe` writes it, so `!` works on `Either SomeError a`:
+
+<!-- run -->
+```kotlin
+type NotFound = NotFound { key : String }
+
+instance Error NotFound { fun message(e) = "no entry for '" + e.key + "'" }
+
+fun find(key : String) -> Either SomeError Int =
+    if key == "width" { Right(80) } else { Left(fail(NotFound { key })) }
+
+fun main() {
+    print(find("width")!)
+    print(tryUnwrap(find("height")))
+}
+```
+
+```text
+80
+Left("no entry for 'height'")
 ```
 
 ## `Semigroup` and `Monoid`

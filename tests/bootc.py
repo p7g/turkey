@@ -243,6 +243,45 @@ def executable(entry: Path, output: Path, *flags: str, cwd: Path = REPO_ROOT,
     return compiled
 
 
+def write_compiler(compiler: Path, output: Path, *flags: str) -> None:
+    """Writes the compiler's own source, `src/Main.gob`, at `output` with
+    `compiler build` and the build flags `flags`."""
+    result = subprocess.run(
+        toolchain.command(compiler, "build", *flags, "-o", str(output), str(BOOT_MAIN)),
+        cwd=REPO_ROOT, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr[:4000]
+
+
+@functools.lru_cache(maxsize=None)
+def _compiler_key() -> str:
+    """Stage2 and today's `src/`, as a cache key for what stage2 writes for
+    the compiler's own source."""
+    # Keyed on the source as well as on stage2: under `$TURKEY_BOOT`,
+    # `build_key` covers the binary and `lib/` alone, and what stage2 writes
+    # is today's `src/` too.
+    h = hashlib.sha256(build_key().encode())
+    for path in sorted((REPO_ROOT / "src").rglob("*.gob")):
+        h.update(str(path.relative_to(REPO_ROOT)).encode() + b"\0")
+        h.update(path.read_bytes())
+    return h.hexdigest()[:16]
+
+
+def written_compiler(name: str, *flags: str) -> Path:
+    """Returns what stage2 writes for the compiler's own source with the build
+    flags `flags`, cached on disk as `name`. Concurrent callers may each build
+    it, and every one of them returns a complete file."""
+    output = CACHE / f"{name}-{_compiler_key()}"
+    if not output.exists():
+        CACHE.mkdir(parents=True, exist_ok=True)
+        staging = CACHE / f"{name}-{_compiler_key()}-{os.getpid()}"
+        try:
+            write_compiler(binary(), staging, *flags)
+            os.replace(staging, output)
+        finally:
+            staging.unlink(missing_ok=True)
+    return output
+
+
 def replace_built(command: list[str], output: Path) -> None:
     """Run a build whose `-o` is a staging path, then move it to `output`."""
     result = subprocess.run(command, capture_output=True, text=True)

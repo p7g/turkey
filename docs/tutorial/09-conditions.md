@@ -1,6 +1,6 @@
 # Conditions that bind
 
-A `match` with one interesting arm says more as a condition. `if let` runs
+A `match` with one interesting arm reads better as a condition. `if let` runs
 its block when a pattern matches, with the pattern's names bound inside it.
 Its head can list several conditions, separated by commas: patterns and
 `Bool` tests, tried left to right, each seeing the names bound before it.

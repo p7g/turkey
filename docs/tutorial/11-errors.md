@@ -1,8 +1,8 @@
 # Errors as values: `throw` and `?`
 
 A function that can fail returns an `Either`. `e?` takes the value out of a
-`Right` and goes on, or makes the whole block's result the `Left` it found.
-So a chain of steps that can each fail reads as a straight line.
+`Right` and goes on, or makes the whole block's result the `Left` it found,
+so a chain of steps that can each fail reads as a straight line.
 
 `?` never converts an error, so every `Left` in one block has the same type.
 When failures come from different places, that type is `SomeError`, which
@@ -51,8 +51,8 @@ you: `percent` ends with `Right(n)`, not `n`.
 
 `Error.context(err, e)` wraps an error in another without losing it, and
 `Error.describe` reads the whole chain, outermost first. `Either.mapLeft`
-applies it to the error of a call that failed, and leaves a `Right` as it
-is:
+applies `Error.context` to the error of a call that failed, and leaves a
+`Right` as it is:
 
 <!-- run -->
 ```kotlin

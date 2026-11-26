@@ -6,14 +6,15 @@ own works as a `Map` key with no code. `Point` below has no instance written
 and is both.
 
 `Ord` is derived only when the declaration asks for it, with `: Ord` after
-the type's name: the order follows the order the constructors are written
-in, and reordering them shouldn't quietly reorder every sort. A record
-compares its fields from first to last.
+the type's name. The order follows the order the constructors are written
+in, so a type has to ask: otherwise reordering its constructors would
+reorder every sort without warning. A record compares its fields from first
+to last.
 
-`Debug` is derived for every type. It prints a value as Turkey would build
-it, and that is what `print` shows for each element of a collection. `dbg(x)`
-writes `debug(x)` to standard error and returns `x`, so it can wrap any
-expression.
+`Debug` is derived, without asking, for every type whose fields have it. It
+prints a value as Turkey would build it, and that is what `print` shows for
+each element of a collection. `dbg(x)` writes `debug(x)` to standard error
+and returns `x`, so it can wrap any expression.
 
 <!-- run -->
 ```kotlin
@@ -51,7 +52,7 @@ Some("origin")
 Point { x = 3, y = 4 }
 ```
 
-A type whose fields don't all have a class has no instance of it, and the
+A type has no instance of a class unless all its fields have one, and the
 error follows the fields to the one that lacks it:
 
 <!-- error: 'Job' has no 'Eq': field 'run' has type 'fun() -> Int', which has no 'Eq' -->

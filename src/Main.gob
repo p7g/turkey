@@ -39,6 +39,7 @@ import Time.Stopwatch as Stopwatch
 import Turkey.Diag as Diag
 import Turkey.Format as Format
 import Turkey.Format (Outcome(..))
+import Turkey.Highlight as Highlight
 import Turkey.Directives as Directives
 import Turkey.Source as Source
 import Turkey.Source (Source(..))
@@ -309,15 +310,16 @@ type Sink = Sink { to : Destination, format : Format, name : String }
 fun main() {
 	let p = Args.parser(Env.args())
 	let building = match Args.next(p) {
-		Right(Some(Value("check")))  -> False
-		Right(Some(Value("build")))  -> True
-		Right(Some(Value("doc")))    -> return doc(p)
-		Right(Some(Value("format"))) -> return format(p)
+		Right(Some(Value("check")))     -> False
+		Right(Some(Value("build")))     -> True
+		Right(Some(Value("doc")))       -> return doc(p)
+		Right(Some(Value("format")))    -> return format(p)
+		Right(Some(Value("highlight"))) -> return highlight(p)
 		Right(Some(Value(other))) -> die(
 			"unknown command '"
 				+ other
 				+ "'; the commands are 'check', "
-				+ "'build', 'doc' and 'format'",
+				+ "'build', 'doc', 'format' and 'highlight'",
 		)
 		_ -> usage()
 	}
@@ -728,6 +730,45 @@ fun formatInput(name : String, checking : Bool) -> Unit {
 		}
 	}
 }
+
+-- `turkey highlight FILE` writes FILE as an HTML fragment that reads as FILE
+-- does, every character escaped and every token and comment in a span whose
+-- class names its group (`Turkey.Highlight`). `turkey highlight -` reads
+-- standard input instead. It neither parses nor checks the text, so only a
+-- file it cannot read or that is not UTF-8 fails, with status 2. The page that
+-- shows the fragment supplies the colours, as the doc site's style sheet does.
+fun highlight(p : Args.Parser) -> Unit {
+	let paths = []
+	loop {
+		match Args.next(p) {
+			Left(message)            -> die(message)
+			Right(None)              -> break
+			Right(Some(Value(path))) -> Vec.push(paths, path)
+			Right(Some(arg))         -> die(Args.unexpected(arg))
+		}
+	}
+	if len(paths) != 1 { die(highlightSynopsis) }
+	let text = if paths[0] == "-" {
+		let bytes = match IO.readAll(IO.stdin()) {
+			Right(b) -> b
+			Left(e)  -> die("cannot read standard input: " + message(e))
+		}
+		match String.fromBytes(bytes) {
+			Some(t) -> t
+			None    -> die("standard input is not valid UTF-8")
+		}
+	} else {
+		readOrDie(paths[0]).text
+	}
+	if let Left(e) = IO.writeText(IO.stdout(), Highlight.html(text)) {
+		die("cannot write standard output: " + message(e))
+	}
+	if let Left(e) = IO.flush(IO.stdout()) {
+		die("cannot write standard output: " + message(e))
+	}
+}
+
+let highlightSynopsis = "usage: turkey highlight FILE\n       turkey highlight -"
 
 -- `turkey doc [--html DIR] FILE...`: checks the modules the files hold, as one
 -- program, and writes what each exports: as one JSON document on standard
@@ -3277,6 +3318,8 @@ fun usage() -> a =
 			+ "       turkey doc [--html DIR] FILE...\n"
 			+ "       turkey format [--check] FILE...\n"
 			+ "       turkey format [--check] [--stdin-name NAME] -\n"
+			+ "       turkey highlight FILE\n"
+			+ "       turkey highlight -\n"
 			+ "       turkey build [OPTIONS] [-o PATH] [-S] [-g] [--debug=lines|full]\n"
 			+ "                    FILE...\n"
 			+ "options: --target TARGET  --dump STAGE,...  --timings  --gc-verify"

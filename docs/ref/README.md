@@ -354,10 +354,16 @@ must be preceded by an HTML comment that says how to check it:
 | `<!-- panic: TEXT -->` | Must compile and then panic with a message containing `TEXT`. An optional `text` fence gives the output printed before the panic. |
 | `<!-- stderr -->` | The next `text` fence is the exact standard error of the `run` or `panic` example before it: the compile's warnings, then the panic and its trace. |
 | `<!-- module: Name.gob -->` | Another source file for the next example, written beside it. The example itself is `Main.gob`. |
+| `<!-- skip: wasm32-wasi: REASON -->` | On the line before the directive of a `run` or `panic` example, in the tour only: the example is not run for that target, and `REASON` says what it needs that the target lacks. |
 
 Every example is compiled and run by `turkey`, the way a reader who copies one
 would. A `kotlin` fence with no directive fails the test. Grammar goes in `ebnf`
 fences and shell commands in `sh` fences; the test ignores both.
+
+The tour in `docs/tutorial/` is checked by the same directives. Its `run` and
+`panic` examples also run under `sh scripts/test.sh --target wasm32-wasi`,
+against the same output, since the tour runs them in a browser; the
+reference's run only on the host, so a `skip` in the reference is an error.
 
 **What goes in.** Only what the compiler accepts today. The reference does not
 mention planned features, reserved syntax, or open proposals; those belong in

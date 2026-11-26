@@ -1,0 +1,775 @@
+-- An entry point in `src/`, beside `MarkdownCases.gob`: writes the tour, the
+-- lessons of `docs/tutorial/`, as static pages.
+--
+--   TourSite ROOT OUT
+--
+-- reads ROOT/docs/tutorial/NN-slug.md, every file but `README.md`, in the
+-- order of their names, and writes into OUT:
+--
+-- * `index.html`, the contents, and `NN-slug.html` for each lesson;
+-- * `programs/NN-slug.gob`, each lesson's program that runs in the browser,
+--   and `examples.json`, which lists them for the playground's picker as
+--   [{"name": SLUG, "title": TITLE, "file": "programs/SLUG.gob"}].
+--
+-- The pages take their scripts and style sheets from `../playground/`, so OUT
+-- is a directory beside the playground's. Each lesson's first `run` example
+-- is its program: it goes in the page's editor, with its recorded output
+-- under it. A program the browser cannot run, one with `module` files or a
+-- `skip: wasm32-wasi` directive, is shown as its other examples are, with Run
+-- left out and the reason said. Every other example is highlighted here, so
+-- that a page reads without JavaScript.
+--
+-- The build fails, after saying why, when a lesson cannot be read as the test
+-- harness reads it, when an example other than an `error` one is not as
+-- `turkey format` writes it, and when a link leads nowhere: to a heading
+-- `docs/ref/` does not have, by GitHub's rule for a heading's anchor, to a
+-- lesson that does not exist, or to a library module's page for a module
+-- that `lib/` does not have. A link to the reference is written as a link to
+-- the chapter on GitHub, since the site does not publish the reference.
+--
+-- `tests/test_tour_site.py` runs it on fixtures and on the real tour.
+
+import System.Env as Env
+import System.File as File
+import System.IO as IO
+import Turkey.Diag as Diag
+import Turkey.Format as Format
+import Turkey.Format (Outcome(..))
+import Turkey.Highlight as Highlight
+import Turkey.Markdown as Markdown
+import Turkey.Markdown (Hooks(..), escape)
+import Turkey.Source (Source(..))
+
+-- Where a link to `../ref/CHAPTER.md` goes.
+let referenceURL = "https://github.com/p7g/turkey/blob/main/docs/ref/"
+
+-- The published library documentation, whose module pages a lesson links to
+-- as `LIBRARY/NAME.html`. The page links them as `../NAME.html`, which is
+-- the same page on the published site and on any copy of it.
+let libraryURL = "https://p7g.github.io/turkey/"
+
+-- How the test harness checks an example, as its directive says.
+type Mode = Run | Check | Fails(String) | Panic(String)
+
+-- An example: how it is checked, its source, its recorded output and
+-- standard error, the module files before it (as indices into the lesson's
+-- blocks), and why the browser cannot run it, if a `skip` says so.
+type Example = Example {
+	mode    : Mode
+	source  : String
+	stdout  : Option String
+	stderr  : Option String
+	modules : Array Int
+	skip    : Option String
+}
+
+-- A fence that a directive marks: a module file, by its name and source, or
+-- an example, by its index among the lesson's examples. Its info string is
+-- rewritten to `tour N`, N being its index among the blocks, so that the
+-- renderer's code-block hook can find it.
+type Block = ModuleFile(String, String) | Shown(Int)
+
+type Lesson = Lesson {
+	slug     : String
+	title    : String
+	body     : String
+	blocks   : Vec Block
+	examples : Vec Example
+	-- The index of the first `run` example, which is the program.
+	program : Option Int
+}
+
+-- What a link may lead to: each reference chapter's anchors, by file name;
+-- the lessons, by slug; and the repository, where library modules are
+-- looked for.
+type Targets = Targets {
+	anchors : Map String (Vec String)
+	slugs   : Vec String
+	root    : String
+}
+
+fun main() {
+	let args = Env.args()
+	if len(args) != 2 {
+		die("usage: TourSite ROOT OUT")
+	}
+	let root = args[0]
+	let out = args[1]
+	let problems = []
+	let tutorial = root + "/docs/tutorial"
+	let lessons = []
+	for name in listed(tutorial, ".md") {
+		if name == "README.md" { continue }
+		let path = "docs/tutorial/" + name
+		if let Some(lesson) = parse(
+			path,
+			String.stripSuffix(name, ".md")!,
+			readOrDie(root + "/" + path),
+			problems,
+		) {
+			Vec.push(lessons, lesson)
+		}
+	}
+	if len(lessons) == 0 { Vec.push(problems, "docs/tutorial: there are no lessons") }
+	let targets = Targets {
+		anchors = referenceAnchors(root)
+		slugs   = Vec.map(lessons, _.slug)
+		root    = root
+	}
+	let files = []
+	for (k, lesson) in Iter.enumerate(lessons) {
+		Vec.push(files, (lesson.slug + ".html", page(targets, lessons, k, problems)))
+		if let Some(p) = live(lesson) {
+			Vec.push(files, ("programs/" + lesson.slug + ".gob", lesson.examples[p].source))
+		}
+	}
+	Vec.push(files, ("index.html", contents(lessons)))
+	Vec.push(files, ("examples.json", examplesJSON(lessons)))
+	if len(problems) > 0 {
+		for p in problems { printError(p) }
+		Env.exit(1)
+	}
+	for (name, text) in files {
+		let path = out + "/" + name
+		let written = do {
+			if let Some((directory, _)) = String.rsplitOnce(path, "/") {
+				File.createDirAll(directory)?
+			}
+			File.writeText(path, text)
+		}
+		if let Left(e) = written {
+			die("cannot write '" + path + "': " + Error.describe(e))
+		}
+	}
+}
+
+-- -- reading a lesson ------------------------------------------------------------------
+
+-- Returns the lesson in `text`, the file `path`, or `None` after pushing
+-- what is wrong with it onto `problems`. The test harness checks that the
+-- directives are well formed; this reads them the same way, and reports what
+-- it cannot read rather than guessing.
+fun parse(path : String, slug : String, text : String, problems : Vec String) -> Option Lesson {
+	let lines = String.lines(text)
+	let title = match Vec.at(lines, 0) {
+		Some(first) -> String.stripPrefix(first, "# ")
+		None        -> None
+	}
+	let Some(title) = title else {
+		Vec.push(problems, path + ":1: a lesson starts with a '# Title' line")
+		return None
+	}
+	let body = []
+	let blocks = []
+	let examples = []
+	var modules = []
+	var skip = None
+	var i = 1
+	while i < len(lines) {
+		let line = String.trim(lines[i])
+		let Some((name, arg)) = directive(line) else {
+			Vec.push(body, lines[i])
+			i = i + 1
+			continue
+		}
+		if name == "skip" {
+			skip = wasmSkip(arg)
+			i = i + 1
+			continue
+		}
+		-- Any other comment is prose that GitHub does not show, and the page
+		-- leaves it out too.
+		if !Iter.any(["run", "check", "error", "panic", "module", "stderr"], _ == name) {
+			i = i + 1
+			continue
+		}
+		let Some((fenceLine, source, next)) = fence(lines, i + 1) else {
+			Vec.push(problems, path + ":" + show(i + 1) + ": a directive must precede a code fence")
+			return None
+		}
+		i = next
+		if name == "stderr" {
+			if let Some(e) = Vec.pop(examples) {
+				Vec.push(examples, withStderr(e, source))
+			}
+			continue
+		}
+		if name == "module" {
+			formatted(path, fenceLine, source, problems)
+			Vec.push(modules, len(blocks))
+			Vec.push(blocks, ModuleFile(arg, source))
+		} else {
+			let mode = match name {
+				"run"   -> Run
+				"check" -> Check
+				"error" -> Fails(arg)
+				_       -> Panic(arg)
+			}
+			-- An example the compiler rejects may not parse, and is left as
+			-- it is written.
+			if !isFails(mode) { formatted(path, fenceLine, source, problems) }
+			var stdout = None
+			let quotes = match mode {
+				Run      -> True
+				Panic(_) -> nextIsText(lines, i)
+				_        -> False
+			}
+			if quotes {
+				if let Some((_, text, after)) = fence(lines, i) {
+					stdout = Some(text)
+					i = after
+				}
+			}
+			Vec.push(blocks, Shown(len(examples)))
+			Vec.push(
+				examples,
+				Example {
+					mode
+					source
+					stdout
+					stderr  = None
+					modules = Vec.toArray(modules)
+					skip
+				},
+			)
+			modules = []
+			skip = None
+		}
+		Vec.push(body, "```tour " + show(len(blocks) - 1))
+		Vec.push(body, "```")
+	}
+	let program = Iter.find(Int.range(0, len(examples)), fun(k) = match examples[k].mode {
+		Run -> True
+		_   -> False
+	})
+	if Option.isNone(program) {
+		Vec.push(problems, path + ": a lesson needs a 'run' example, its program")
+		return None
+	}
+	Some(Lesson { slug, title, body = String.unlines(body), blocks, examples, program })
+}
+
+fun withStderr(e : Example, stderr : String) -> Example = Example {
+	mode    = e.mode
+	source  = e.source
+	stdout  = e.stdout
+	stderr  = Some(stderr)
+	modules = e.modules
+	skip    = e.skip
+}
+
+-- The reason a `skip` directive's value, `TARGET: REASON`, gives, if its
+-- target is `wasm32-wasi`, read as the test harness reads it: split at the
+-- first `:`, and each side trimmed.
+fun wasmSkip(arg : String) -> Option String {
+	let (target, reason) = String.splitOnce(arg, ":")?
+	if String.trim(target) == "wasm32-wasi" { Some(String.trim(reason)) } else { None }
+}
+
+fun isFails(mode : Mode) -> Bool = match mode {
+	Fails(_) -> True
+	_        -> False
+}
+
+-- Pushes a problem onto `problems` unless `source`, the fence on `line` of
+-- `path`, is as `turkey format` writes it. A `source` that does not parse
+-- ends the program with the parse error.
+fun formatted(path : String, line : Int, source : String, problems : Vec String) -> Unit {
+	Diag.compiling(path)
+	match Format.format(Source { name = path, text = source }, 2) {
+		Formatted(text) -> if text != source {
+			Vec.push(
+				problems,
+				path + ":" + show(line) + ": the example is not as 'turkey format' writes it",
+			)
+		}
+		Refused(why) -> Vec.push(
+			problems,
+			path + ":" + show(line) + ": the formatter refuses the example: " + why,
+		)
+	}
+}
+
+-- The name and argument of the HTML comment that `line`, trimmed, is, if it
+-- is one: `<!-- NAME -->` or `<!-- NAME: ARGUMENT -->`.
+fun directive(line : String) -> Option (String, String) {
+	let opened = String.stripPrefix(line, "<!--")?
+	let inner = String.trim(String.stripSuffix(opened, "-->")?)
+	Some(
+		match String.splitOnce(inner, ":") {
+			Some((name, arg)) -> (String.trim(name), String.trim(arg))
+			None              -> (inner, "")
+		},
+	)
+}
+
+-- The fence that opens at index `from`, or after the blank lines there: the
+-- line it opens on, counted from 1, its body, and the index of the line
+-- after it.
+fun fence(lines : Vec String, from : Int) -> Option (Int, String, Int) {
+	let i = nonBlank(lines, from)
+	if i >= len(lines) || !String.startsWith(String.trim(lines[i]), "```") { return None }
+	var j = i + 1
+	while j < len(lines) && String.trimEnd(lines[j]) != "```" { j = j + 1 }
+	if j >= len(lines) { return None }
+	Some((i + 1, String.unlines(Vec.slice(lines, i + 1, j)), j + 1))
+}
+
+fun nextIsText(lines : Vec String, from : Int) -> Bool {
+	let i = nonBlank(lines, from)
+	i < len(lines) && String.trimEnd(lines[i]) == "```text"
+}
+
+fun nonBlank(lines : Vec String, from : Int) -> Int {
+	var i = from
+	while i < len(lines) && String.isEmpty(String.trim(lines[i])) { i = i + 1 }
+	i
+}
+
+-- The index of the lesson's program, if the browser can run it: it has no
+-- module files and no `skip`.
+fun live(lesson : Lesson) -> Option Int {
+	let p = lesson.program?
+	let e = lesson.examples[p]
+	if len(e.modules) == 0 && Option.isNone(e.skip) { Some(p) } else { None }
+}
+
+-- -- the reference's anchors ----------------------------------------------------------
+
+-- Each chapter of `docs/ref/`, by file name, with the anchors GitHub gives its
+-- headings.
+fun referenceAnchors(root : String) -> Map String (Vec String) {
+	let out = Map.new()
+	for name in listed(root + "/docs/ref", ".md") {
+		out[name] = anchors(readOrDie(root + "/docs/ref/" + name))
+	}
+	out
+}
+
+-- The anchors of the ATX headings in `text`, outside its code fences. A
+-- heading's anchor is its slug, followed by `-1`, `-2` and so on for each
+-- earlier heading with the same slug.
+fun anchors(text : String) -> Vec String {
+	let out = []
+	let seen = Map.new()
+	var fenced = False
+	for line in String.lines(text) {
+		if String.startsWith(line, "```") {
+			fenced = !fenced
+			continue
+		}
+		if fenced { continue }
+		let Some(heading) = headingText(line) else { continue }
+		let base = slug(heading)
+		let n = Map.getOr(seen, base, 0)
+		seen[base] = n + 1
+		Vec.push(out, if n == 0 { base } else { base + "-" + show(n) })
+	}
+	out
+}
+
+-- The text of the ATX heading `line` is, if it is one: one to six `#`, then a
+-- space.
+fun headingText(line : String) -> Option String {
+	var rest = line
+	var level = 0
+	while level < 6 {
+		let Some(shorter) = String.stripPrefix(rest, "#") else { break }
+		rest = shorter
+		level = level + 1
+	}
+	if level == 0 { return None }
+	let text = String.stripPrefix(rest, " ")?
+	Some(String.trim(text))
+}
+
+-- GitHub's anchor for a heading: lowercased, every space a `-`, and every
+-- other character dropped but letters, digits, `-` and `_`. A character
+-- outside ASCII is kept, since the reference's headings have none and GitHub
+-- keeps letters of every script.
+fun slug(heading : String) -> String {
+	let out = String.builder()
+	for c in String.codePoints(heading) {
+		if Char.isAsciiUpper(c) {
+			String.push(out, Char.toString(Char.fromInt(Char.toInt(c) + 32)!))
+		} else if Char.isAsciiAlphanumeric(c) || c == '-' || c == '_' || !Char.isAscii(c) {
+			String.push(out, Char.toString(c))
+		} else if c == ' ' {
+			String.push(out, "-")
+		}
+	}
+	String.build(out)
+}
+
+-- -- links -------------------------------------------------------------------------
+
+-- Returns `html` with each link's target rewritten for the site, pushing a
+-- problem, which names `where`, for each that leads nowhere. A target is
+-- read as the renderer escaped it, and what it is rewritten to keeps that
+-- text after a prefix with nothing to escape, so it is written out as it is.
+fun relinked(targets : Targets, html : String, where : String, problems : Vec String) -> String {
+	let out = String.builder()
+	var rest = html
+	loop {
+		let Some((before, after)) = String.splitOnce(rest, "<a href=\"") else { break }
+		let Some((url, tail)) = String.splitOnce(after, "\"") else { break }
+		String.push(out, before + "<a href=\"")
+		match target(targets, url) {
+			Right(t) -> String.push(out, t)
+			Left(why) -> {
+				Vec.push(problems, where + ": the link to '" + url + "' leads nowhere: " + why)
+				String.push(out, url)
+			}
+		}
+		String.push(out, "\"")
+		rest = tail
+	}
+	String.push(out, rest)
+	String.build(out)
+}
+
+-- Returns what a link to `url` in a lesson leads to on the site, or why it
+-- leads nowhere.
+fun target(targets : Targets, url : String) -> Either String String {
+	if let Some(rest) = String.stripPrefix(url, "../ref/") {
+		let (file, anchor) = match String.splitOnce(rest, "#") {
+			Some((f, a)) -> (f, Some(a))
+			None         -> (rest, None)
+		}
+		let Some(known) = Map.get(targets.anchors, file) else {
+			return Left("there is no docs/ref/" + file)
+		}
+		if let Some(a) = anchor, !Iter.any(known, _ == a) {
+			return Left("docs/ref/" + file + " has no heading whose anchor is '" + a + "'")
+		}
+		return Right(referenceURL + rest)
+	}
+	if let Some(page) = String.stripPrefix(url, libraryURL) {
+		let Some(name) = String.stripSuffix(page, ".html") else {
+			return Left("a library page is NAME.html")
+		}
+		let path = targets.root + "/lib/" + String.replace(name, ".", "/") + ".gob"
+		if let Left(_) = File.metadata(path) { return Left("lib/ has no module " + name) }
+		return Right("../" + page)
+	}
+	if String.contains(url, "://") || String.startsWith(url, "mailto:") { return Right(url) }
+	if let Some(slug) = String.stripSuffix(url, ".md"), Iter.any(targets.slugs, _ == slug) {
+		return Right(slug + ".html")
+	}
+	Left("a lesson links a heading of docs/ref, another lesson, or a library module's page")
+}
+
+-- -- pages -------------------------------------------------------------------------
+
+let siteTitle = "A tour of Turkey"
+
+-- The page of `lessons[k]`, pushing a problem for each link in it that leads
+-- nowhere.
+fun page(targets : Targets, lessons : Vec Lesson, k : Int, problems : Vec String) -> String {
+	let lesson = lessons[k]
+	let hooks = Hooks {
+		codeBlock = fun(info, body) = codeBlock(lesson, info, body)
+		reference = Markdown.defaults().reference
+	}
+	let static = Option.isNone(live(lesson))
+	let pager = String.builder()
+	String.push(pager, "<nav class=\"pager\" aria-label=\"Lessons\">\n")
+	if k > 0 {
+		let p = lessons[k - 1]
+		String.push(
+			pager,
+			"<a rel=\"prev\" href=\"" + p.slug + ".html\">Back: " + titleHTML(p) + "</a>\n",
+		)
+	}
+	if k + 1 < len(lessons) {
+		let n = lessons[k + 1]
+		String.push(
+			pager,
+			"<a rel=\"next\" href=\"" + n.slug + ".html\">Next: " + titleHTML(n) + "</a>\n",
+		)
+	}
+	String.push(pager, "</nav>\n")
+	let body = "<article class=\"prose\">\n<h1>"
+		+ titleHTML(lesson)
+		+ "</h1>\n"
+		+ relinked(
+			targets,
+			Markdown.render(hooks, lesson.body),
+			"docs/tutorial/" + lesson.slug + ".md",
+			problems,
+		)
+		+ String.build(pager)
+		+ "</article>\n"
+		+ workspace(lesson)
+	let attributes = " data-lesson=\""
+		+ lesson.slug
+		+ "\""
+		+ (if static { " data-static=\"\"" } else { "" })
+	frame(
+		plainTitle(lesson) + " - " + siteTitle,
+		header(lessons, Some(k)),
+		"<main class=\"lesson\"" + attributes + ">\n" + body + "</main>\n",
+	)
+}
+
+-- The contents page.
+fun contents(lessons : Vec Lesson) -> String {
+	let out = String.builder()
+	String.push(out, "<main class=\"contents-page\">\n<h1>" + siteTitle + "</h1>\n")
+	String.push(
+		out,
+		"<p>"
+			+ show(len(lessons))
+			+ " short lessons, each with a program you can edit and run. The compiler runs in your browser, "
+			+ "and nothing is sent to a server. The <a href=\""
+			+ referenceURL
+			+ "README.md\">language reference</a> states the rules, and the <a href=\"../playground/\">"
+			+ "playground</a> runs any program.</p>\n<ol class=\"lessons\">\n",
+	)
+	for lesson in lessons {
+		String.push(
+			out,
+			"<li><a href=\"" + lesson.slug + ".html\">" + titleHTML(lesson) + "</a></li>\n",
+		)
+	}
+	String.push(out, "</ol>\n</main>\n")
+	frame(siteTitle, header(lessons, None), String.build(out))
+}
+
+-- The bar at the top of every page: the tour's name, the lessons, with
+-- `current` marked, and the playground.
+fun header(lessons : Vec Lesson, current : Option Int) -> String {
+	let out = String.builder()
+	String.push(
+		out,
+		"<header class=\"top\">\n<a class=\"home\" href=\"index.html\">" + siteTitle + "</a>\n",
+	)
+	let label = match current {
+		Some(k) -> "Lesson " + show(k + 1) + " of " + show(len(lessons))
+		None    -> "Lessons"
+	}
+	String.push(out, "<details class=\"toc\">\n<summary>" + label + "</summary>\n<ol>\n")
+	for (k, lesson) in Iter.enumerate(lessons) {
+		let marked = if current == Some(k) { " aria-current=\"page\"" } else { "" }
+		String.push(
+			out,
+			"<li><a href=\""
+				+ lesson.slug
+				+ ".html\""
+				+ marked
+				+ ">"
+				+ titleHTML(lesson)
+				+ "</a></li>\n",
+		)
+	}
+	String.push(out, "</ol>\n</details>\n<a href=\"../playground/\">Playground</a>\n</header>\n")
+	String.build(out)
+}
+
+fun frame(title : String, header : String, main : String) -> String =
+	"<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+		+ "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>"
+		+ escape(title)
+		+ "</title>\n<link rel=\"stylesheet\" href=\"../playground/style.css\">\n"
+		+ "<link rel=\"stylesheet\" href=\"../playground/tour.css\">\n</head>\n<body class=\"tour\">\n"
+		+ header
+		+ main
+		+ "<script type=\"module\" src=\"../playground/lesson.js\"></script>\n</body>\n</html>\n"
+
+-- The title as inline HTML, its code spans rendered.
+fun titleHTML(lesson : Lesson) -> String = Markdown.summary(Markdown.defaults(), lesson.title)
+
+-- The title as text: without the backticks of its code spans.
+fun plainTitle(lesson : Lesson) -> String = String.replace(lesson.title, "`", "")
+
+-- The program, in an editor with the buttons around it, or, for one the
+-- browser cannot run, highlighted with the reason.
+fun workspace(lesson : Lesson) -> String {
+	let e = lesson.examples[lesson.program!]
+	let output = Option.unwrapOr(e.stdout, "")
+	if let Some(p) = live(lesson) {
+		let source = lesson.examples[p].source
+		let rows = show(Iter.minimum([len(String.lines(source)) + 1, 30])!)
+		return "<section class=\"workspace\" aria-label=\"The program\">\n"
+			+ "<div class=\"bar\">\n"
+			+ "<button id=\"run\" type=\"button\" disabled>Run</button>\n"
+			+ "<button id=\"stop\" type=\"button\" disabled>Stop</button>\n"
+			+ "<button id=\"format\" type=\"button\" disabled>Format</button>\n"
+			+ "<button id=\"reset\" type=\"button\" disabled>Reset</button>\n"
+			+ "<button id=\"share\" type=\"button\" disabled>Share</button>\n"
+			+ "<span id=\"state\" role=\"status\" aria-live=\"polite\"></span>\n"
+			+ "</div>\n<pre id=\"format-error\" class=\"error\" hidden></pre>\n"
+			+ "<div class=\"editor\">\n<pre class=\"turkey\" aria-hidden=\"true\"><code id=\"highlighted\">"
+			+ Highlight.html(source)
+			+ "</code></pre>\n<textarea id=\"source\" rows=\""
+			+ rows
+			+ "\" spellcheck=\"false\" aria-label=\"Turkey source\" aria-describedby=\"keys\" "
+			+ "autocapitalize=\"off\" autocomplete=\"off\" autocorrect=\"off\" wrap=\"off\">\n"
+			+ escape(source)
+			+ "</textarea>\n</div>\n"
+			+ "<p id=\"keys\">Tab inserts a tab; press Escape and then Tab to move on from the editor.</p>\n"
+			+ "<p id=\"note\" role=\"status\" aria-live=\"polite\"></p>\n"
+			+ "<div id=\"output\" aria-live=\"polite\" aria-label=\"Output\">"
+			+ "<pre class=\"stdout\">"
+			+ escape(output)
+			+ "</pre>"
+			+ Option.fold(
+				e.stderr,
+				"",
+				fun(text) = "<pre class=\"stderr\">" + escape(text) + "</pre>",
+			)
+			+ "<pre class=\"status\">Recorded when this page was made. Run runs it in your browser.</pre>"
+			+ "</div>\n</section>\n"
+	}
+	let reason = match e.skip {
+		Some(why) -> "This program does not run in the browser: " + escape(why) + "."
+		None -> "This program has more than one file, and the browser compiles one, so it does not run here. "
+			+ "The output is what <code>turkey build Main.gob</code> gives."
+	}
+	let files = String.builder()
+	for m in e.modules {
+		if let ModuleFile(name, source) = lesson.blocks[m] {
+			String.push(files, file(name, source))
+		}
+	}
+	let main = if len(e.modules) > 0 { file("Main.gob", e.source) } else { code(e.source) }
+	"<section class=\"workspace static\" aria-label=\"The program\">\n<p class=\"reason\">"
+		+ reason
+		+ "</p>\n"
+		+ String.build(files)
+		+ main
+		+ "<div class=\"label\">Output</div>\n<pre class=\"output\">"
+		+ escape(output)
+		+ "</pre>\n"
+		+ Option.fold(
+			e.stderr,
+			"",
+			fun(text) = "<div class=\"label\">Standard error</div>\n<pre class=\"output\">"
+				+ escape(text)
+				+ "</pre>\n",
+		)
+		+ "</section>\n"
+}
+
+-- The HTML of the fence `tour N`, which is the block `N` of the lesson, or of
+-- an ordinary fence. The program and its module files are in the workspace,
+-- so they are left out here.
+fun codeBlock(lesson : Lesson, info : String, body : String) -> String {
+	let Some(n) = Option.fold(String.stripPrefix(info, "tour "), None, Int.parse) else {
+		return "<pre class=\"plain\"><code>" + escape(body) + "</code></pre>\n"
+	}
+	let program = lesson.examples[lesson.program!]
+	match lesson.blocks[n] {
+		ModuleFile(name, source) -> if Iter.any(program.modules, _ == n) {
+			""
+		} else {
+			file(name, source)
+		}
+		Shown(k) -> if Some(k) == lesson.program { "" } else { example(lesson, k) }
+	}
+}
+
+-- An example other than the program, with what its directive says of it,
+-- and, for one the browser can run by itself, a button that loads it into
+-- the editor.
+fun example(lesson : Lesson, k : Int) -> String {
+	let e = lesson.examples[k]
+	let out = String.builder()
+	String.push(out, "<div class=\"example\">\n" + code(e.source))
+	if let Some(text) = e.stdout {
+		if !String.isEmpty(text) {
+			String.push(
+				out,
+				"<div class=\"label\">Output</div>\n<pre class=\"output\">"
+					+ escape(text)
+					+ "</pre>\n",
+			)
+		}
+	}
+	match e.mode {
+		Fails(text) -> String.push(
+			out,
+			"<p class=\"verdict\">The compiler rejects it: <code>" + escape(text) + "</code></p>\n",
+		)
+		Panic(text) -> String.push(
+			out,
+			"<p class=\"verdict\">It panics: <code>" + escape(text) + "</code></p>\n",
+		)
+		Run | Check -> {}
+	}
+	if let Some(text) = e.stderr {
+		String.push(
+			out,
+			"<div class=\"label\">Standard error</div>\n<pre class=\"output\">"
+				+ escape(text)
+				+ "</pre>\n",
+		)
+	}
+	let tryable = match e.mode {
+		Check -> False
+		_     -> len(e.modules) == 0 && Option.isNone(e.skip)
+	}
+	if tryable && Option.isSome(live(lesson)) {
+		String.push(out, "<button class=\"try\" type=\"button\" disabled>Try it</button>\n")
+	}
+	String.push(out, "</div>\n")
+	String.build(out)
+}
+
+fun file(name : String, source : String) -> String =
+	"<div class=\"example\">\n<div class=\"label\">"
+		+ escape(name)
+		+ "</div>\n"
+		+ code(source)
+		+ "</div>\n"
+
+fun code(source : String) -> String =
+	"<pre class=\"turkey shown\"><code>" + Highlight.html(source) + "</code></pre>\n"
+
+-- -- the playground's picker -----------------------------------------------------------
+
+fun examplesJSON(lessons : Vec Lesson) -> String {
+	let entries = []
+	for lesson in lessons {
+		if Option.isSome(live(lesson)) {
+			Vec.push(
+				entries,
+				"  {\"name\": "
+					+ json(lesson.slug)
+					+ ", \"title\": "
+					+ json(plainTitle(lesson))
+					+ ", \"file\": "
+					+ json("programs/" + lesson.slug + ".gob")
+					+ "}",
+			)
+		}
+	}
+	"[\n" + String.join(entries, ",\n") + "\n]\n"
+}
+
+-- `s` as a JSON string. A title is one line of text, so only `"` and `\`
+-- need escaping.
+fun json(s : String) -> String =
+	"\"" + String.replace(String.replace(s, "\\", "\\\\"), "\"", "\\\"") + "\""
+
+-- -- files ---------------------------------------------------------------------------
+
+-- The names in `directory` that end in `suffix`, sorted.
+fun listed(directory : String, suffix : String) -> Array String = match File.listPath(directory) {
+	Right(names) -> Array.sort(Array.filter(names, String.endsWith(_, suffix)))
+	Left(e)      -> die("cannot list '" + directory + "': " + Error.describe(e))
+}
+
+fun readOrDie(path : String) -> String = match File.readText(path) {
+	Right(text) -> text
+	Left(e)     -> die("cannot read '" + path + "': " + Error.describe(e))
+}
+
+fun printError(message : String) -> Unit {
+	let _ = IO.writeText(IO.stderr(), "TourSite: " + message + "\n")
+}
+
+fun die(message : String) -> a {
+	printError(message)
+	Env.exit(2)
+}

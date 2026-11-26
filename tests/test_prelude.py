@@ -291,7 +291,7 @@ instance Iterator (Bag a) {
 def test_the_methods_are_ordinary_and_callable_by_name():
     src = "fun head(xs) { let cur = iter(xs)\n next(xs, cur) }"
     assert scheme(src, "head") == \
-        "[Iterator a] fun(a) -> Iter.Step (Iterator.Item a) (Iterator.Cursor a)"
+        "[Iterator a] fun(a) -> Step (Iterator.Item a) (Iterator.Cursor a)"
 
 
 # -- min, max, Option.or, Either.left and Either.right --------------------------

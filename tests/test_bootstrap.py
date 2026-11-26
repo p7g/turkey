@@ -129,13 +129,13 @@ def test_the_wasm_compiler_writes_what_the_native_one_does(tmp_path):
     A cross-target fixed point: the native and the wasm compiler are the same
     source, so a difference is a miscompile by the wasm backend or a bug in
     the WASI port. The targets run one after another rather than as separate
-    tests, since each run holds about 2.6 GiB of linear memory and a CI runner
+    tests, since each run holds about 2.4 GiB of linear memory and a CI runner
     has 16 GB.
 
     wasm32 has a 4 GiB ceiling, so its heap collects at a smaller threshold
     scale than native and caps the threshold near the ceiling. The compile
-    for arm64-darwin fails under `-W max-memory-size` of 2688 MiB and passes
-    at 2720 MiB, which leaves 1.34 GiB of headroom.
+    for arm64-darwin fails under `-W max-memory-size` of 2432 MiB and passes
+    at 2464 MiB, which leaves 1.59 GiB of headroom.
 
     wasmtime's default engine stack, 512 KiB, is what it runs with: GC roots
     are in the shadow stack in linear memory, and the self-compile's deepest

@@ -110,7 +110,10 @@ def test_arithmetic(stress):
     ]
 
 
-# One operation on two operands, both from the command line.
+# One operation on two operands, both from the command line. Each arm reads
+# `a` and `b` for the last time, which is what makes these tests check that a
+# result never shares a local with its operands: a checked `+`, `-` or `*`
+# writes its result before its overflow test reads the operands again.
 OPERATION = """\
 import System.Env as Env
 

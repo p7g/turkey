@@ -17,8 +17,16 @@ import { loadCompiler, compile } from "./host.js";
 // module while it downloads, and Chrome keeps the compiled code beside the
 // cached response, so a repeat visit skips both the transfer and most of the
 // compile.
+//
+// `assetQuery` is empty when the page is served from a checkout. The deploy
+// (`scripts/playground-assemble.sh`) sets it to `?v=<commit>`, so that the two
+// files a deploy replaces are fetched under URLs no earlier deploy used, and a
+// cache holding one deploy's `turkey.wasm` cannot be paired with another's
+// `lib.tar.gz`.
+const assetQuery = "";
+
 async function fetchOk(url) {
-  const response = await fetch(url);
+  const response = await fetch(url + assetQuery);
   if (!response.ok) {
     throw new Error(`${url}: ${response.status} ${response.statusText}`);
   }

@@ -1149,10 +1149,10 @@ fun loopExpr(d : D, e : Expr, k : Cont) -> Expr {
 	let span = e.span
 	let name = fresh(d, "%loop", span)
 	let call = mkExpr(d, span, ECall(varOf(d, name, span), []))
-	-- A `for` over a `Step` passes the next cursor to the next turn, which
-	-- is what lets each branch of a multi-shot `?` resume from its own.
+	-- A `for` passes the next cursor to the next turn, which is what lets
+	-- each branch of a multi-shot `?` resume from its own.
 	let after = match e.kind {
-		EForIn(_, _, _, _, _) -> if P.steps() { Some(temp(d, "%after", span)) } else { None }
+		EForIn(_, _, _, _, _) -> Some(temp(d, "%after", span))
 		_                     -> None
 	}
 	let recur = match after {
@@ -1202,7 +1202,10 @@ fun loopExpr(d : D, e : Expr, k : Cont) -> Expr {
 		-- Only a `break` ever ends it.
 		ELoop(_) -> wrap(d, [loopFun(d, name, [], roundAgain, span)], call, span)
 		EForIn(pat, iterable, _, iterFn, nextFn) ->
-			forIn(d, pat, iterable, iterFn, nextFn, name, call, after, roundAgain, span)
+			match after {
+				Some(t) -> forIn(d, pat, iterable, iterFn, nextFn, name, t, roundAgain, span)
+				None    -> bug("a 'for' with no cursor to pass on", span)
+			}
 		EWhile(cond, _) -> {
 			let inner = expr(
 				d,
@@ -1282,8 +1285,7 @@ fun forIn(
 	iterFn : Option Expr,
 	nextFn : Option Expr,
 	name : Temp,
-	call : Expr,
-	after : Option Temp,
+	after : Temp,
 	roundAgain : Expr,
 	span : Span,
 ) -> Expr {
@@ -1313,75 +1315,36 @@ fun forIn(
 			)
 			let start = mkExpr(d, span, ECall(iter, [varOf(d, seqName, span)]))
 			let bindSeq = mkStmt(d, span, SLet(bindTemp(d, seqName, span), xs))
-			match after {
-				-- The cursor is the loop function's parameter, and each turn
-				-- passes the one `next` answered.
-				Some(t) -> {
-					let body = mkExpr(
-						d,
-						span,
-						EMatch(advance, [
-							armOf(d, P.stepDone, Nothing, span, fallOf(d, mkExpr(d, span, EUnit))),
-							Arm {
-								span = span
-								patterns = [
-									mkPat(
-										d,
-										span,
-										PCon(P.stepYield, [
-											bindTemp(d, item, span),
-											bindTemp(d, t, span),
-										]),
-									),
-								]
-								guards = []
-								body   = turn
-							},
-						]),
-					)
-					wrap(
-						d,
-						[bindSeq, loopFun(d, name, [bindTemp(d, curName, span)], body, span)],
-						mkExpr(d, span, ECall(varOf(d, name, span), [start])),
-						span,
-					)
-				}
-				-- The cursor is one binding the loop function captures, which
-				-- `next` advances.
-				None -> {
-					let body = mkExpr(
-						d,
-						span,
-						EMatch(advance, [
-							armOf(
+			-- The cursor is the loop function's parameter, and each turn passes
+			-- the one `next` answered.
+			let body = mkExpr(
+				d,
+				span,
+				EMatch(advance, [
+					armOf(d, P.stepDone, Nothing, span, fallOf(d, mkExpr(d, span, EUnit))),
+					Arm {
+						span = span
+						patterns = [
+							mkPat(
 								d,
-								P.optionNone,
-								Nothing,
 								span,
-								fallOf(d, mkExpr(d, span, EUnit)),
+								PCon(P.stepYield, [
+									bindTemp(d, item, span),
+									bindTemp(d, after, span),
+								]),
 							),
-							Arm {
-								span = span
-								patterns = [
-									mkPat(d, span, PCon(P.optionSome, [bindTemp(d, item, span)])),
-								]
-								guards = []
-								body   = turn
-							},
-						]),
-					)
-					wrap(
-						d,
-						[
-							bindSeq,
-							mkStmt(d, span, SLet(bindTemp(d, curName, span), start)),
-							loopFun(d, name, [], body, span),
-						],
-						call,
-						span,
-					)
-				}
-			}
+						]
+						guards = []
+						body   = turn
+					},
+				]),
+			)
+			wrap(
+				d,
+				[bindSeq, loopFun(d, name, [bindTemp(d, curName, span)], body, span)],
+				mkExpr(d, span, ECall(varOf(d, name, span), [start])),
+				span,
+			)
 		}),
 		False,
 		False,

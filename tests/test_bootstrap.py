@@ -112,13 +112,9 @@ def test_stage3_agrees_with_stage2_over_the_corpus():
     """
     programs = bootc.corpus()
     stage2 = bootc.boot_each("select", programs, _split_asm)
-    result = subprocess.run(
-        toolchain.command(_stage3(), *bootc.argv("select"), *[str(p) for p in programs]),
-        cwd=REPO_ROOT, capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr[:4000]
-    stage3 = bootc.split_before(result.stdout, "; === ")
-    for path in programs:
-        assert _sha(stage2[path]) == _sha(stage3[path.name]), path.name
+    stage3 = bootc.boot_split(bootc.argv("select"), programs, _split_asm, _stage3())
+    for path, text in zip(programs, stage3):
+        assert _sha(stage2[path]) == _sha(text), path.name
 
 
 @pytest.mark.bootstrap

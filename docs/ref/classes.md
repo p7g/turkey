@@ -440,11 +440,11 @@ derived `Hash` either, and writes its own if it needs one:
 type Angle = Angle(Int)
 
 instance Eq Angle {
-    fun eq(Angle(a), Angle(b)) = Int.mod(a, 360) == Int.mod(b, 360)
+    fun eq(Angle(a), Angle(b)) = a % 360 == b % 360
 }
 
 instance Hash Angle {
-    fun hashInto(Angle(a), h) = hashInto(Int.mod(a, 360), h)
+    fun hashInto(Angle(a), h) = hashInto(a % 360, h)
 }
 
 fun main() {

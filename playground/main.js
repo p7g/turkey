@@ -4,7 +4,7 @@
 // share links, and fills the picker of example programs.
 
 import { startSession } from "./session.js";
-import { filesProblem } from "./files.js";
+import { ENTRY, filesProblem } from "./files.js";
 import { fragmentFor, filesFromFragment } from "./share.js";
 
 const $ = (id) => document.getElementById(id);
@@ -23,8 +23,9 @@ const HELLO = `fun main() {
 const LONG_LINK = 8000;
 
 // `localStorage` holds the files as JSON, `[name, text]` pairs with the entry
-// first, under FILES. A page that held one file kept its text under SOURCE,
-// which is read when FILES is missing, and removed once FILES is written.
+// first, under FILES. SOURCE may hold the text of `main.gob` alone, the only
+// file, as a plain string; it is read when FILES is missing, and removed
+// once FILES is written.
 const FILES = "turkey-playground-files";
 const SOURCE = "turkey-playground-source";
 
@@ -38,9 +39,9 @@ function savedFiles() {
         return pairs;
       }
     }
-    return [["main.gob", localStorage.getItem(SOURCE) ?? HELLO]];
+    return [[ENTRY, localStorage.getItem(SOURCE) ?? HELLO]];
   } catch {
-    return [["main.gob", HELLO]];
+    return [[ENTRY, HELLO]];
   }
 }
 
@@ -60,7 +61,7 @@ const { files, show } = startSession(
     timeLimit: () => (timeoutInput.value.trim() === "" ? NaN : Number(timeoutInput.value)),
   },
 );
-files.replace(savedFiles());
+files.replace(savedFiles(), { quiet: true });
 
 // Whether the address bar's fragment holds the files: true after a link
 // loads or Share makes one, false from the next change. The first change
@@ -120,10 +121,9 @@ async function loadLink() {
     return;
   }
   if (pairs !== null) {
-    // The files the link replaces are no edit of the link's, so the change
-    // keeps the fragment.
-    linked = false;
-    files.replace(pairs);
+    // Quietly, so that what the link holds is neither saved nor taken for
+    // an edit that drops the fragment, until the reader's first edit.
+    files.replace(pairs, { quiet: true });
     linked = true;
   }
 }
@@ -161,7 +161,7 @@ async function loadExamples() {
     examples = Object.fromEntries(
       entries.map((e) => [
         e.name,
-        [["main.gob", url(e.file)], ...(e.modules ?? []).map((m) => [m.name, url(m.file)])],
+        [[ENTRY, url(e.file)], ...(e.modules ?? []).map((m) => [m.name, url(m.file)])],
       ]),
     );
     picker.disabled = false;

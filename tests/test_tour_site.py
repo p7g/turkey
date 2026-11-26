@@ -91,6 +91,15 @@ def test_a_program_of_several_files_gets_an_editor_for_each(tmp_path):
     assert '<pre class="stdout">hi\n</pre>' in second
 
 
+def test_a_module_file_the_page_would_refuse_fails_the_build(tmp_path):
+    """The page takes a module file's name to be its module path, as the
+    playground's tabs and share links do."""
+    result = _broken(tmp_path, "02-second.md", "module: Greeting.gob", "module: greeting.gob")
+    assert result.code == 1
+    assert ("docs/tutorial/02-second.md: the program's module file 'greeting.gob' is not named "
+            "as the page requires") in result.stderr
+
+
 def test_a_program_the_browser_cannot_run_is_shown_with_the_reason(tmp_path):
     out = _built(FIXTURE, tmp_path / "out")
     third = (out / "03-third.html").read_text()

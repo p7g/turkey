@@ -48,12 +48,12 @@ function start() {
   const shareButton = $("share");
   // The textareas' own texts are the lesson's program, whatever `value` holds.
   const original = [...filesElement.querySelectorAll(":scope > .editor")].map((panel) => [
-    panel.dataset.file || "main.gob",
+    panel.dataset.file,
     panel.querySelector("textarea").defaultValue,
   ]);
-  // A program of one file is hashed by its text alone, and what is stored
-  // for it may be that file's text alone, as it was before lessons had
-  // several files, so edits kept then come back.
+  // A program of one file is hashed by its text alone. What is stored is
+  // `{"files": PAIRS}` as JSON, or, for a program of one file, may be the
+  // text of `main.gob` alone, as a plain string.
   const key = `turkey-tour:${lesson.dataset.lesson}:${fnv1a(
     original.length === 1 ? original[0][1] : JSON.stringify(original),
   )}`;
@@ -93,7 +93,7 @@ function start() {
   const { files } = session;
   const saved = stored();
   if (saved !== null && !same(saved, original)) {
-    files.replace(saved);
+    files.replace(saved, { quiet: true });
     note.textContent = "Your edits to this lesson are back. Reset brings back its program.";
     session.load();
   }

@@ -49,10 +49,6 @@ const program = [
 const several = await fragmentFor(program);
 assert.match(several, /^#files=[A-Za-z0-9_-]*$/);
 assert.deepEqual(await filesFromFragment(several), program);
-// So does a program of one file that is not `main.gob`.
-const renamed = await fragmentFor([["Main.gob", "fun main() {}\n"]]);
-assert.match(renamed, /^#files=/);
-assert.deepEqual(await filesFromFragment(renamed), [["Main.gob", "fun main() {}\n"]]);
 // `files` wins over `code`, whichever comes first.
 const hello = await fragmentFor("fun main() {}\n");
 assert.deepEqual(await filesFromFragment(hello + "&" + several.slice(1)), program);
@@ -77,7 +73,16 @@ for (const [value, why] of [
   ['[["main.gob", ""], ["../Evil.gob", ""]]', /not a module's file name/],
   ['[["main.gob", ""], ["lib/Prelude.gob", ""]]', /not a module's file name/],
   ['[["main.gob", ""], ["Geometry.gob", ""], ["Geometry.gob", ""]]', /already a file named 'Geometry.gob'/],
-  ['[["Dir/main.gob", ""]]', /not a file name such as main.gob/],
+  ['[["Dir/main.gob", ""]]', /the entry is main.gob, not 'Dir\/main.gob'/],
+  ['[["Main.gob", ""]]', /the entry is main.gob/],
+  ['[["Geometry.gob", ""], ["main.gob", ""]]', /the entry is main.gob/],
+  ['[["main.gob", ""], ["Main.gob", ""], ["main.gob", ""]]', /not a module's file name/],
+  [JSON.stringify([["main.gob", ""], ["X".repeat(125) + ".gob", ""]]), /'X{40}\.\.\.' is longer than 128/],
+  // A link of many files is refused before an editor is made for any.
+  [JSON.stringify([["main.gob", ""], ...Array.from({ length: 64 }, (_, i) => [`M${i}.gob`, ""])]),
+   /at most 64 files/],
+  [JSON.stringify([["main.gob", ""], ...Array.from({ length: 50_000 }, (_, i) => [`M${i}.gob`, ""])]),
+   /at most 64 files/],
 ]) {
   await assert.rejects(filesFromFragment(await filesLink(value)), why, value);
 }
@@ -92,6 +97,11 @@ for (const name of ["geometry.gob", "Geometry", "Geometry.go", "/Geometry.gob", 
 }
 assert.match(nameProblem("Geometry.gob", ["main.gob", "Geometry.gob"]), /already a file/);
 assert.equal(nameProblem("main.gob", [], { entry: true }), null);
+assert.match(nameProblem("main.gob"), /not a module's file name/);
+assert.equal(nameProblem("X".repeat(124) + ".gob"), null);
+// A link of the most files a program has opens.
+const most = [["main.gob", ""], ...Array.from({ length: 63 }, (_, i) => [`M${i}.gob`, ""])];
+assert.deepEqual(await filesFromFragment(await fragmentFor(most)), most);
 
 // A link restores the exact text: tabs, CRLF, an empty text, characters
 // outside the BMP, and text that is HTML.

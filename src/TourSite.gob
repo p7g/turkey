@@ -44,6 +44,17 @@ import Turkey.Markdown as Markdown
 import Turkey.Markdown (Hooks(..), escape)
 import Turkey.Source (Source(..))
 
+-- The name of a lesson's program on its page. The test harness writes the
+-- program as `Main.gob`, beside its `module` files, as the reference's
+-- `module:` directive says; the browser's entry is `main.gob`, the one name
+-- `playground/files.js` allows the entry, and the name a `#code=` share link
+-- implies. Nothing imports the entry, so the two compile the same program.
+-- They differ only where a file is named: a diagnostic, or a panic's trace,
+-- which a recorded `stderr` gives as `Main.gob` and the browser as
+-- `main.gob`. The page names the program `main.gob` throughout, so its label
+-- matches the tab and what Run reports.
+let entryName = "main.gob"
+
 -- Where a link to `../ref/CHAPTER.md` goes.
 let referenceURL = "https://github.com/p7g/turkey/blob/main/docs/ref/"
 
@@ -249,11 +260,51 @@ fun parse(path : String, slug : String, text : String, problems : Vec String) ->
 		Run -> True
 		_   -> False
 	})
-	if Option.isNone(program) {
+	let Some(p) = program else {
 		Vec.push(problems, path + ": a lesson needs a 'run' example, its program")
 		return None
 	}
-	Some(Lesson { slug, title, body = String.unlines(body), blocks, examples, program })
+	let lesson = Lesson { slug, title, body = String.unlines(body), blocks, examples, program }
+	for (name, _) in moduleFiles(lesson, examples[p]) {
+		if !isModuleFileName(name) {
+			Vec.push(
+				problems,
+				path
+					+ ": the program's module file '"
+					+ name
+					+ "' is not named as the page requires: its module's path, each part a capital "
+					+ "letter then letters, digits, '_' and \"'\", with '.gob' after the last, "
+					+ "and at most "
+					+ show(maxNameLength)
+					+ " characters",
+			)
+			return None
+		}
+	}
+	Some(lesson)
+}
+
+-- The longest module file name the page accepts.
+let maxNameLength = 128
+
+-- Whether `name` is a module file name the page's editor accepts, by the rule
+-- `playground/files.js` checks a file name it is given by: the module's path,
+-- each part a capital letter, then letters, digits, `_` and `'`, with `.gob`
+-- after the last, and at most `maxNameLength` characters. A lesson whose
+-- program has another would put a file on the page that its share links and
+-- storage refuse.
+fun isModuleFileName(name : String) -> Bool {
+	if String.byteLength(name) > maxNameLength { return False }
+	let Some(path) = String.stripSuffix(name, ".gob") else { return False }
+	Iter.all(
+		String.split(path, "/"),
+		fun(part) = !String.isEmpty(part)
+			&& Iter.all(Iter.enumerate(String.codePoints(part)), fun((i, c)) = if i == 0 {
+				Char.isAsciiUpper(c)
+			} else {
+				Char.isAsciiAlphanumeric(c) || c == '_' || c == '\''
+			}),
+	)
 }
 
 fun withStderr(e : Example, stderr : String) -> Example = Example {
@@ -608,7 +659,7 @@ fun workspace(lesson : Lesson) -> String {
 	let modules = moduleFiles(lesson, e)
 	let Some(why) = e.skip else {
 		let editors = String.builder()
-		String.push(editors, editor("main.gob", e.source, True))
+		String.push(editors, editor(entryName, e.source, True))
 		for (name, source) in modules { String.push(editors, editor(name, source, False)) }
 		return "<section class=\"workspace\" aria-label=\"The program\">\n"
 			+ "<div class=\"bar\">\n"
@@ -638,7 +689,7 @@ fun workspace(lesson : Lesson) -> String {
 	}
 	let files = String.builder()
 	for (name, source) in modules { String.push(files, file(name, source)) }
-	let main = if len(modules) > 0 { file("Main.gob", e.source) } else { code(e.source) }
+	let main = if len(modules) > 0 { file(entryName, e.source) } else { code(e.source) }
 	"<section class=\"workspace static\" aria-label=\"The program\">\n<p class=\"reason\">"
 		+ "This program does not run in the browser: "
 		+ escape(why)

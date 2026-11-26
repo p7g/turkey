@@ -9,41 +9,62 @@
 
 import { attachEditor, replaceText } from "./editor.js";
 
+/** The entry's file name. It is never renamed, and nothing imports it. */
+export const ENTRY = "main.gob";
+
+/** The most files a program has, the entry included. */
+export const MAX_FILES = 64;
+
+/** The longest file name, in UTF-16 code units. */
+export const MAX_NAME = 128;
+
 // A module's file name: its path, each part a module name's part (a capital
 // letter, then letters, digits, `_` and `'`), with `.gob` after the last.
+// `src/TourSite.gob` checks a lesson's module files by the same rule, so a
+// lesson never has a file this page would refuse.
 const MODULE_NAME = /^[A-Z][A-Za-z0-9_']*(\/[A-Z][A-Za-z0-9_']*)*\.gob$/;
 
-// The entry's file name: one `.gob` file beside the modules. It is never
-// imported, so it need not be a module name.
-const ENTRY_NAME = /^[A-Za-z_][A-Za-z0-9_']*\.gob$/;
+// Returns `name` as a message quotes it: cut short past 40 characters, since
+// a message lands in a status line that a screen reader reads out whole.
+function quoted(name) {
+  return `'${name.length > 40 ? name.slice(0, 40) + "..." : name}'`;
+}
 
 /**
  * Returns why `name` cannot be a file of a program whose other files are
- * `others`, or null if it can. The entry, `entry` true, is a `.gob` file
- * beside the others, such as `main.gob`; every other file is a module, named
- * by its path, such as `Geometry.gob` or `Shapes/Circle.gob`. No two files
- * have the same name.
+ * `others`, or null if it can. The entry, `entry` true, is `ENTRY`; every
+ * other file is a module, named by its path, such as `Geometry.gob` or
+ * `Shapes/Circle.gob`, and no longer than `MAX_NAME`. No two files have the
+ * same name.
  */
 export function nameProblem(name, others = [], { entry = false } = {}) {
-  if (entry ? !ENTRY_NAME.test(name) : !MODULE_NAME.test(name)) {
-    return entry
-      ? `'${name}' is not a file name such as main.gob`
-      : `'${name}' is not a module's file name, such as Geometry.gob or Shapes/Circle.gob`;
+  if (entry) {
+    return name === ENTRY ? null : `the entry is ${ENTRY}, not ${quoted(name)}`;
+  }
+  if (name.length > MAX_NAME) {
+    return `${quoted(name)} is longer than ${MAX_NAME} characters`;
+  }
+  if (!MODULE_NAME.test(name)) {
+    return `${quoted(name)} is not a module's file name, such as Geometry.gob or Shapes/Circle.gob`;
   }
   if (others.includes(name)) {
-    return `there is already a file named '${name}'`;
+    return `there is already a file named ${quoted(name)}`;
   }
   return null;
 }
 
 /**
  * Returns the problem with `pairs`, `[name, source]` pairs with the entry
- * first, as a program's files, or null if there is none: no files, a pair
- * that is not two strings, or a name `nameProblem` refuses.
+ * first, as a program's files, or null if there is none: no files, more
+ * than `MAX_FILES`, a pair that is not two strings, or a name `nameProblem`
+ * refuses.
  */
 export function filesProblem(pairs) {
   if (!Array.isArray(pairs) || pairs.length === 0) {
     return "a program has one or more files";
+  }
+  if (pairs.length > MAX_FILES) {
+    return `a program has at most ${MAX_FILES} files`;
   }
   const seen = [];
   for (const [i, pair] of pairs.entries()) {
@@ -62,9 +83,9 @@ export function filesProblem(pairs) {
 /**
  * Starts the files in `container`, which holds the editors, each a `.editor`
  * element with a `<pre><code>` overlay and a `<textarea>`, as `attachEditor`
- * takes them, and the file's name in its `data-file` attribute (`main.gob`
- * if it has none). The first is the entry. Puts the tabs before the first
- * editor, and shows the entry.
+ * takes them, and the file's name in its `data-file` attribute. The first is
+ * the entry, `ENTRY`. Puts the tabs before the first editor, and shows the
+ * entry.
  *
  * With `editable`, the tabs can add, rename and remove files other than the
  * entry; without it, they only switch between files, and are hidden while
@@ -74,10 +95,11 @@ export function filesProblem(pairs) {
  *
  * Returns the file set: `all()` returns the files as `[name, text]` pairs,
  * the entry first; `active()` returns the file shown; `byId(id)` returns a
- * file by its `id`, or null once it is removed; `replace(pairs, { undoable
- * })` makes the files `pairs` and shows the entry; `onChange(callback)`
- * calls `callback()` after every edit, and after a file is added, renamed or
- * removed. A file is `{ id, name, textarea, editor }`, `editor` being what
+ * file by its `id`, or null once it is removed; `replace(pairs, { undoable,
+ * quiet })` makes the files `pairs`, which `filesProblem` accepts, and shows
+ * the entry; `onChange(callback)` calls `callback()` after every edit, after
+ * a file is added, renamed or removed, and after a `replace` that is not
+ * `quiet`. A file is `{ id, name, textarea, editor }`, `editor` being what
  * `attachEditor` returned for it.
  */
 export function attachFiles(container, { editable = false, say = () => {}, requestHighlight = () => {} } = {}) {
@@ -102,7 +124,16 @@ export function attachFiles(container, { editable = false, say = () => {}, reque
   container.insertBefore(tabs, template);
 
   const listeners = [];
-  const changed = () => listeners.forEach((listener) => listener());
+  // Counts the changes, so that an Undo offered for a removal can tell
+  // whether the files have changed since.
+  let version = 0;
+  let quieted = false; // whether a quiet `replace` is under way
+  const changed = () => {
+    version++;
+    if (!quieted) {
+      listeners.forEach((listener) => listener());
+    }
+  };
 
   let nextId = 0;
   const files = [];
@@ -173,15 +204,21 @@ export function attachFiles(container, { editable = false, say = () => {}, reque
     file.editor.changed();
   }
 
-  // The tabs keep their order, so the arrow keys move along them.
+  // The tabs keep their order, so the arrow keys move along them, and Home
+  // and End go to the first and the last.
   list.addEventListener("keydown", (event) => {
     const at = files.findIndex((f) => f.tab === event.target);
-    const step = { ArrowLeft: -1, ArrowRight: 1 }[event.key];
-    if (at < 0 || step === undefined) {
+    const to = {
+      ArrowLeft: (at - 1 + files.length) % files.length,
+      ArrowRight: (at + 1) % files.length,
+      Home: 0,
+      End: files.length - 1,
+    }[event.key];
+    if (at < 0 || to === undefined) {
       return;
     }
     event.preventDefault();
-    const next = files[(at + step + files.length) % files.length];
+    const next = files[to];
     show(next);
     next.tab.focus();
   });
@@ -192,6 +229,10 @@ export function attachFiles(container, { editable = false, say = () => {}, reque
   }
 
   function add() {
+    if (files.length >= MAX_FILES) {
+      say(`A program has at most ${MAX_FILES} files.`);
+      return;
+    }
     const names = files.map((f) => f.name);
     let n = 1;
     while (names.includes(n === 1 ? "Module.gob" : `Module${n}.gob`)) {
@@ -266,7 +307,8 @@ export function attachFiles(container, { editable = false, say = () => {}, reque
     input.setSelectionRange(0, file.name.length - ".gob".length);
   }
 
-  // Removes `file`, and offers to bring it back until the next change.
+  // Removes `file`, and offers to bring it back until the next change to
+  // the files, after which it might come back into another program.
   function remove(file) {
     const at = files.indexOf(file);
     if (at <= 0) {
@@ -277,9 +319,10 @@ export function attachFiles(container, { editable = false, say = () => {}, reque
     layout();
     show(files[at - 1]);
     changed();
+    const removedAt = version;
     const undo = button("Undo", () => {
-      if (files.some((f) => f.name === file.name)) {
-        say(`There is a file named ${file.name} again, so it stays removed.`);
+      if (version !== removedAt) {
+        say(`The files have changed since, so ${file.name} stays removed.`);
         return;
       }
       container.insertBefore(file.panel, files[Math.min(at, files.length) - 1].panel.nextSibling);
@@ -296,11 +339,22 @@ export function attachFiles(container, { editable = false, say = () => {}, reque
   // each file whose name stays. With `undoable`, the entry's new text is one
   // edit that undo reverts; a file that is not shown cannot be edited that
   // way, so the others' texts are set outright.
-  function replace(pairs, { undoable = false } = {}) {
+  //
+  // With `quiet`, no `onChange` callback is called: files that a link or
+  // the page's storage brings back are not the reader's edit, and are saved
+  // only once the reader edits them.
+  function replace(pairs, { undoable = false, quiet = false } = {}) {
+    quieted = quiet;
+    try {
+      replaceAll(pairs, undoable);
+    } finally {
+      quieted = false;
+    }
+  }
+
+  function replaceAll(pairs, undoable) {
     const [entry, ...modules] = files;
     show(entry);
-    entry.name = pairs[0][0];
-    label(entry);
     setText(entry, pairs[0][1], undoable);
     entry.textarea.setSelectionRange(0, 0);
     entry.textarea.scrollTop = 0;
@@ -337,8 +391,8 @@ export function attachFiles(container, { editable = false, say = () => {}, reque
     }
   }
 
-  for (const panel of panels) {
-    adopt(panel, panel.dataset.file || "main.gob");
+  for (const [i, panel] of panels.entries()) {
+    adopt(panel, i === 0 ? ENTRY : panel.dataset.file);
   }
   layout();
   show(files[0]);

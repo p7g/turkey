@@ -14,8 +14,7 @@ import { attachFiles } from "./files.js";
 /**
  * Starts a session over `elements`, an object holding the page's `files`,
  * the element holding the program's editors as `attachFiles` takes it, the
- * `run`,
- * `stop` and `format` buttons, the `output` pane, the `formatError`
+ * `run`, `stop` and `format` buttons, the `output` pane, the `formatError`
  * element beside the editor, and the `state` and `note` status elements.
  *
  * Without `lazy`, the compiler loads at once and Run waits for it. With

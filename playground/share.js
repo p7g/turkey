@@ -13,20 +13,20 @@
 //
 // No DOM, so node loads it.
 
-import { filesProblem } from "./files.js";
+import { ENTRY, filesProblem } from "./files.js";
 
 /** The most bytes of UTF-8 a link holds, either way. */
 export const MAX_SOURCE_BYTES = 1 << 20;
 
 /**
  * Returns the fragment, starting with `#`, that holds `files`, `[name,
- * text]` pairs with the entry first, or a string, which is one file,
- * `main.gob`. Throws if what the link holds is longer than
+ * text]` pairs with the entry, `ENTRY`, first, or a string, which is the
+ * entry alone. Throws if what the link holds is longer than
  * `MAX_SOURCE_BYTES` in UTF-8.
  */
 export async function fragmentFor(files) {
-  const pairs = typeof files === "string" ? [["main.gob", files]] : files;
-  const single = pairs.length === 1 && pairs[0][0] === "main.gob";
+  const pairs = typeof files === "string" ? [[ENTRY, files]] : files;
+  const single = pairs.length === 1;
   const bytes = new TextEncoder().encode(single ? pairs[0][1] : JSON.stringify(pairs));
   if (bytes.length > MAX_SOURCE_BYTES) {
     throw new Error(`the source is over ${MAX_SOURCE_BYTES >> 10} KiB, too long for a link`);
@@ -57,7 +57,7 @@ export async function filesFromFragment(fragment) {
     throw new Error("the link's source is not UTF-8");
   }
   if (key === "code") {
-    return [["main.gob", text]];
+    return [[ENTRY, text]];
   }
   let pairs;
   try {

@@ -135,6 +135,26 @@ def test_a_program_reads_its_standard_input(inputs, tmp_path):
     assert result["ran"]["stdout"] == "read quack\nread honk\n"
 
 
+def test_streamed_writes_concatenate_to_the_output(inputs, tmp_path):
+    """`onWrite` sees every write as it happens, so what it is given adds up
+    to the `stdout` and `stderr` that `run` returns."""
+    source = ("fun main() {\n"
+              "\tfor i in Int.range(0, 50) {\n"
+              "\t\tprint(\"line ${i} \u00e9\")\n"
+              "\t}\n"
+              "\tlet xs = [1]\n"
+              "\tprint(xs[3])\n"
+              "}\n")
+    result = _host(inputs, tmp_path, source)
+    assert result["compiled"]["status"] == 0, result["compiled"]["diagnostics"]
+    ran, streamed = result["ran"], result["streamed"]
+    assert ran["stdout"].startswith("line 0 \u00e9\nline 1 \u00e9\n")
+    assert ran["stderr"].startswith("panic: array index out of bounds")
+    assert streamed["stdout"] == ran["stdout"]
+    assert streamed["stderr"] == ran["stderr"]
+    assert streamed["calls"] > 2
+
+
 def test_a_type_error_comes_back_as_diagnostics(inputs, tmp_path):
     result = _host(inputs, tmp_path, 'fun main() {\n\tprint(1 + "a")\n}\n')
     assert result["compiled"]["status"] == 1

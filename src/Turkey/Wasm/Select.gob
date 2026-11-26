@@ -1178,8 +1178,102 @@ fun checked(s : Sel, i : Low, d : Value, o : BinOp, a : Value, b : Value) -> Uni
 			op(s, W.IntBin(W.W64, W.RemS))
 			set(s, d)
 		}
+		-- The floored forms are the truncated ones adjusted by `floorMask`,
+		-- with the checks of the truncated forms. In two's complement the
+		-- floored quotient by `1 << k` is an arithmetic shift by `k` and the
+		-- floored remainder is the low `k` bits, and neither can panic.
+		FloorDiv -> {
+			let k = known(s, b)
+			if let Some(n) = k, let Some(by) = powerOfTwo(n) {
+				get(s, a)
+				op(s, W.ConstI64(by))
+				op(s, W.IntBin(W.W64, W.ShrS))
+				set(s, d)
+				return
+			}
+			if k == None || k == Some(0) { nonzero(s, b, "division by zero") }
+			if k == None || k == Some(-1) {
+				get(s, a)
+				op(s, W.ConstI64(Int.minValue()))
+				op(s, W.IntRel(W.W64, W.Eq))
+				get(s, b)
+				op(s, W.ConstI64(-1))
+				op(s, W.IntRel(W.W64, W.Eq))
+				op(s, W.IntBin(W.W32, W.And))
+				guard(s, "integer overflow in /")
+			}
+			let quotient = temp(s, W.I64)
+			let rest = temp(s, W.I64)
+			get(s, a)
+			get(s, b)
+			op(s, W.IntBin(W.W64, W.DivS))
+			op(s, W.LocalSet(quotient))
+			get(s, a)
+			op(s, W.LocalGet(quotient))
+			get(s, b)
+			op(s, W.IntBin(W.W64, W.Mul))
+			op(s, W.IntBin(W.W64, W.Sub))
+			op(s, W.LocalSet(rest))
+			op(s, W.LocalGet(quotient))
+			floorMask(s, rest, b)
+			op(s, W.IntBin(W.W64, W.Add))
+			set(s, d)
+		}
+		Mod -> {
+			let k = known(s, b)
+			if let Some(n) = k, let Some(_) = powerOfTwo(n) {
+				get(s, a)
+				op(s, W.ConstI64(n - 1))
+				op(s, W.IntBin(W.W64, W.And))
+				set(s, d)
+				return
+			}
+			if k == None || k == Some(0) { nonzero(s, b, "remainder by zero") }
+			let rest = temp(s, W.I64)
+			get(s, a)
+			get(s, b)
+			op(s, W.IntBin(W.W64, W.RemS))
+			op(s, W.LocalSet(rest))
+			op(s, W.LocalGet(rest))
+			get(s, b)
+			floorMask(s, rest, b)
+			op(s, W.IntBin(W.W64, W.And))
+			op(s, W.IntBin(W.W64, W.Add))
+			set(s, d)
+		}
 		_ -> stop(s, "the binary operation " + show(o))
 	}
+}
+
+-- Pushes -1 where the truncated remainder in the local `rest` of a division
+-- by `b` is nonzero and of the other sign than `b`, and 0 elsewhere. Those are
+-- exactly the divisions where the floored quotient is one less than the
+-- truncated one and the floored remainder is `rest + b`.
+--
+-- `rest | -rest` has its sign bit set exactly when `rest` is nonzero, the
+-- most negative integer included, and `rest ^ b` exactly when the signs
+-- differ, so an arithmetic shift of their `and` spreads the answer to every
+-- bit.
+fun floorMask(s : Sel, rest : Int, b : Value) -> Unit {
+	op(s, W.LocalGet(rest))
+	op(s, W.ConstI64(0))
+	op(s, W.LocalGet(rest))
+	op(s, W.IntBin(W.W64, W.Sub))
+	op(s, W.IntBin(W.W64, W.Or))
+	op(s, W.LocalGet(rest))
+	get(s, b)
+	op(s, W.IntBin(W.W64, W.Xor))
+	op(s, W.IntBin(W.W64, W.And))
+	op(s, W.ConstI64(63))
+	op(s, W.IntBin(W.W64, W.ShrS))
+}
+
+-- The `k >= 1` with `n == 1 << k`, if there is one.
+fun powerOfTwo(n : Int) -> Option Int {
+	if n < 2 || n & (n - 1) != 0 { return None }
+	var k = 1
+	while 1 << k != n { k = k + 1 }
+	Some(k)
 }
 
 fun nonzero(s : Sel, b : Value, message : String) -> Unit {

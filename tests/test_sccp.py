@@ -30,6 +30,10 @@ fun main() {
     if limit > 100 { print("never") }
     print(scale(limit) / 4)
     print(limit % 5)
+    print(-limit / 4)
+    print(-limit % 5)
+    print(Int.quot(-limit, 4))
+    print(Int.rem(-limit, 5))
     print(-limit)
     print(Int.minValue() % -1)
     print(Int.shl(1, 62))
@@ -38,12 +42,12 @@ fun main() {
 
 
 def test_constants_fold_and_agree_with_running_them():
-    assert lang.output(FOLDED) == "94\n2\n-42\n0\n4611686018427387904\n"
+    assert lang.output(FOLDED) == "94\n2\n-11\n3\n-10\n-2\n-42\n0\n4611686018427387904\n"
 
 
 def test_folded_arithmetic_and_the_dead_branch_are_gone():
     body = _main(FOLDED)
-    for op in ("add", "mul", "div", "rem", "neg", "gt", "branch"):
+    for op in ("add", "mul", "div", "rem", "div.floor", "mod", "neg", "gt", "branch"):
         assert not re.search(rf"= {op} |^\s*{op} ", body, re.M), (op, body)
     assert '"never"' not in body
 
@@ -69,17 +73,19 @@ def test_a_trapping_operation_is_kept_rather_than_folded():
 
 @pytest.mark.parametrize("divisor", ["3", "-3", "1", "-1"])
 def test_division_by_a_known_divisor_agrees(divisor):
+    # A floored `q * b` can fall below `Int.minValue()` when `a` is within `b`
+    # of it, so the identity is checked modulo 2^64.
     src = f"""
     fun main() {{
         for a in [-7, 7, -8, 8, 0, Int.maxValue(), Int.minValue() + 1] {{
             let q = a / {divisor}
             let r = a % {divisor}
-            if a != q * {divisor} + r {{ print("broken") }}
+            if a != Int.addWrapping(Int.mulWrapping(q, {divisor}), r) {{ print("broken") }}
         }}
         print(Int.minValue() % {divisor})
     }}
     """
-    want = {"3": "-2", "-3": "-2", "1": "0", "-1": "0"}[divisor]
+    want = {"3": "1", "-3": "-2", "1": "0", "-1": "0"}[divisor]
     assert lang.output(src) == want + "\n"
 
 

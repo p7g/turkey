@@ -114,10 +114,11 @@ def test_an_unannotated_numeric_function_carries_both_predicates():
         "[OneOf a {Int, Float}, Add a] fun(a) -> a"
 
 
-def test_int_division_still_truncates_toward_zero(capsys):
-    # Carried by `instance Div Int`, whose primitive truncates.
+def test_int_division_floors(capsys):
+    # Carried by `instance Div Int` and `instance Mod Int`, whose primitives
+    # round toward negative infinity.
     src = "fun main() { print(Int.toString(-7 / 2) + \" \" + Int.toString(-7 % 2)) }"
-    assert output(src, capsys) == ["-3 -1"]
+    assert output(src, capsys) == ["-4 1"]
 
 
 def test_division_by_zero_still_panics():

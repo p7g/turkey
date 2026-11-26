@@ -14,6 +14,14 @@
 # Workers fetch by those names. Paths are relative to the directory the script
 # is run from.
 #
+# The page's picker of example programs is built from the recorded programs
+# tests/programs/playground_NAME/Main.gob, so the suite and the page run the
+# same source. OUT/examples/NAME.gob is each one's source, title line kept,
+# without its `--%` suite directives and the blank line before them, so line
+# numbers match the goldens. OUT/examples/index.json lists them
+# as [{"name": NAME, "title": TITLE, "file": "examples/NAME.gob"}], `hello`
+# first and the rest sorted by name.
+#
 # A VERSION makes the compile Worker fetch the two inputs as
 # `turkey.wasm?v=VERSION` and `lib.tar.gz?v=VERSION`, which a host that caches
 # by URL (GitHub Pages) needs, so that a visitor never pairs one deploy's
@@ -46,6 +54,33 @@ mkdir -p "$out"
 cp -R "$root/playground/." "$out/"
 cp "$wasm" "$out/turkey.wasm"
 cp "$libtar" "$out/lib.tar.gz"
+
+examples=$root/tests/programs
+mkdir -p "$out/examples"
+names=$(cd "$examples" && for d in playground_*/; do d=${d%/}; echo "${d#playground_}"; done |
+    awk '$0 == "hello" { print "0 " $0; next } { print "1 " $0 }' |
+    LC_ALL=C sort | cut -d' ' -f2)
+printf '[' > "$out/examples/index.json"
+sep=
+for name in $names; do
+    src=$examples/playground_$name/Main.gob
+    title=$(sed -n '1s/^-- //p' "$src")
+    case $title in
+        "" | *\\* | *\"*)
+            echo "playground-assemble.sh: $src must start with a '-- TITLE' line, without quote or backslash" >&2
+            exit 1
+            ;;
+    esac
+    # Drop the directives, and the blank lines left before them.
+    sed -e '/^--%/d' "$src" |
+        awk '{ lines[NR] = $0 } END { n = NR; while (n > 0 && lines[n] == "") n--; for (i = 1; i <= n; i++) print lines[i] }' \
+        > "$out/examples/$name.gob"
+    printf '%s\n  {"name": "%s", "title": "%s", "file": "examples/%s.gob"}' "$sep" "$name" "$title" "$name" \
+        >> "$out/examples/index.json"
+    sep=,
+done
+printf '\n]\n' >> "$out/examples/index.json"
+
 if [ -n "$version" ]; then
     worker="$out/compile-worker.js"
     sed "s/^const assetQuery = \"\";\$/const assetQuery = \"?v=$version\";/" \

@@ -1,13 +1,13 @@
 export (
+	Colour(..),
+	Spill(..),
+	Pool(..),
 	Pressure(..),
+	inFile,
 	pressureOf,
 	effectivePressure,
 	AcrossCalls(..),
 	acrossCalls,
-	availableGp,
-	availableFp,
-	calleeSavedGp,
-	calleeSavedFp,
 	Colouring(..),
 	colour,
 	verifyColouring,
@@ -21,7 +21,8 @@ export (
 	hintsTaken,
 )
 
---- Register allocation for arm64.
+--- Register allocation, for any target that describes itself through two
+--- classes.
 ---
 --- The design is spill, then colour, then coalesce -- the SSA decomposition
 --- rather than linear scan or IRC. What makes it worth the three phases is one
@@ -33,109 +34,208 @@ export (
 --- maximum number of values live at once.
 ---
 --- That last sentence is why this file begins with a measurement instead of a
---- spiller. If maximum pressure never exceeds the registers arm64 has, then the
---- corpus needs no spilling at all, and the first working allocator is the
+--- spiller. If maximum pressure never exceeds the registers a target has, then
+--- the corpus needs no spilling at all, and the first working allocator is the
 --- colourer alone. Spilling is the largest and least certain part of this pass
 --- and the only part whose heuristic affects code quality, so knowing whether
 --- the corpus needs it is worth more than starting it.
 ---
 --- The precondition the theorem needs is one this project already checks on
 --- every function: `Ssa.verify` enforces that a definition dominates its uses.
+---
+--- A target is two instances over its instruction type. `Colour` is what the
+--- colouring walk and its checker need: the register files and their pools,
+--- what each instruction clobbers, and which physical registers it reads and
+--- writes. `Spill` is what spilling needs on top: slots, and the instructions
+--- that store to and reload from them. `colour` needs only the first, so a
+--- target whose files are unbounded never needs the second. `allocate` needs
+--- both.
 
 import Data.BitSet as BitSet
 import Data.BitSet (BitSet)
 import Data.Map as Map
 import Data.Set as Set
-import Turkey.Arm64 as A
--- The bank constructors unqualified because patterns cannot be qualified,
--- which is the same reason `Turkey.Select` imports them this way.
-import Turkey.Arm64 (Bank(..), Reg(..))
 import Turkey.Position as Position
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Func, BlockId, Value, Term(..))
 
---- How many registers are live at once, at the worst point in a function, in
---- each file. The two are counted apart because they are allocated apart:
---- AAPCS64 numbers them separately and a double can never occupy an `x`.
-type Pressure = Pressure { gp : Int, fp : Int }
-
---- What is actually assignable, which is not the same as what exists.
+--- What the colouring walk needs to know about a target's instructions.
 ---
---- The general file has 31 numbered registers. `x31` is `sp` or `xzr`
---- depending on the instruction and is never allocatable; `x29` is the frame
---- pointer and `x30` the link register, both of which the prologue owns; and
---- `x18` is reserved by the platform on Darwin, `x16`/`x17` are this
---- backend's scratch registers, and `x28` holds the running worker
---- (`A.worker`). That leaves x0-x15 and x19-x27.
-let availableGp = 25
---- The vector file has 32, and `d31` is the scratch register that breaks a
---- cycle of doubles in a parallel copy, as `x16` does for the general file.
---- Breaking one through `x16` instead puts two cross-file `fmov`s on what is
---- usually a loop's critical path, and a 32nd live double is rarer than a
---- cycle.
-let availableFp = 31
+--- Registers are numbered within their file, from 0. A value lives in one
+--- file, chosen by its representation, and the files are allocated apart.
+---
+--- Methods that would mention only a file take the function as well, because
+--- an associated type does not determine the instruction type it came from.
+class Colour i : Ssa.Inst i {
+	--- The register files.
+	type File i
+	--- Every file, in a fixed order. A file's position here is its
+	--- `fileIndex`.
+	fun files(Func i) -> Array (File i)
+	--- The position of a file in `files`.
+	fun fileIndex(Func i, File i) -> Int
+	--- The file value `id` of the function is allocated in.
+	fun fileOf(Func i, Int) -> File i
+	--- The file's name, for a message.
+	fun fileName(Func i, File i) -> String
+	--- The name of register `n` of the file, for a message.
+	fun registerName(Func i, File i, Int) -> String
+	--- The registers of the file the allocator may hand out, in the order it
+	--- hands them out. A bounded file's register numbers are below 64.
+	fun pool(Func i, File i) -> Pool
+	--- The registers of the file the instruction destroys, as a mask with bit
+	--- `n` for register `n`: the physical ones it writes, and those a call lets
+	--- its callee use.
+	fun clobbers(i, File i) -> Int
+	--- The registers of the file the instruction lets a callee destroy, as a
+	--- mask, and 0 for an instruction that is not a call.
+	fun callClobbers(i, File i) -> Int
+	--- Calls the function with the file and number of each physical register
+	--- the instruction writes.
+	fun eachPhysicalWrite(i, fun(File i, Int) -> Unit) -> Unit
+	--- Calls the function with the file and number of each physical register
+	--- the instruction reads, leaving out the ones that are never live: a
+	--- register that nothing in a function writes, say.
+	fun eachPhysicalRead(i, fun(File i, Int) -> Unit) -> Unit
+	--- A move between a value and a physical register of the same file, as
+	--- the value and the register it would like.
+	fun moveHint(i) -> Option (Int, Int)
+	--- The operands the instruction still reads after it writes its
+	--- destination, as a mask with bit `k` for the `k`th value `Ssa.uses`
+	--- lists; bit 63 stands for every operand from the 63rd on. Such an
+	--- operand may not share the destination's register even where it dies
+	--- there.
+	fun readAfterWrite(i) -> Int
+	--- The operand whose register the destination would like when that
+	--- operand dies here, as an index into `Ssa.uses`. Only a preference.
+	fun reusedOperand(inst : i) -> Option Int = None
+	--- Whether the instruction calls out of the function, at least on some
+	--- path: a point where the collector may run.
+	fun isCall(i) -> Bool
+}
 
---- What survives a call, which is a much smaller set than what exists. A value
---- live across a `bl` and held in a caller-saved register is destroyed by the
---- callee, so it needs one of these or a spill slot -- and there are nine,
---- `x28` being the worker's.
-let calleeSavedGp = 9
-let calleeSavedFp = 8
+--- The registers a file hands out.
+type Pool
+	--- These registers, in this order.
+	= Bounded(Array Int)
+	--- As many as are wanted, numbered from 0.
+	| Unbounded
+
+--- What spilling needs to know about a target's instructions, beyond what
+--- colouring does.
+class Spill i : Colour i {
+	--- A frame slot a value can be stored in.
+	type Slot i
+	--- Slot `n` of the root array `Turkey.Roots` assigns.
+	fun rootSlot(Func i, Int) -> Slot i
+	--- Spill slot `n`, one of the allocator's own.
+	fun spillSlot(Func i, Int) -> Slot i
+	--- Whether the slot is one of the root array's.
+	fun isRootSlot(Func i, Slot i) -> Bool
+	--- The slot's name. Two slots are the same slot exactly when their names
+	--- are equal.
+	fun slotName(Func i, Slot i) -> String
+	--- The source position of an instruction, packed (`Turkey.Position`).
+	fun positionOf(i) -> Int
+	--- `spillStore(id, slot, at)` is an instruction at position `at` storing
+	--- value `id` into the slot.
+	fun spillStore(Int, Slot i, Int) -> i
+	--- `spillLoad(t, slot, at)` is an instruction at position `at` defining
+	--- value `t` by loading the slot.
+	fun spillLoad(Int, Slot i, Int) -> i
+	--- The value a store to a slot writes, and the slot.
+	fun slotStore(i) -> Option (Int, Slot i)
+	--- The value a load from a slot defines, and the slot.
+	fun slotLoad(i) -> Option (Int, Slot i)
+	--- Whether the instruction can be repeated wherever its value is wanted,
+	--- in place of keeping that value in a register or a slot.
+	fun rematerializable(i) -> Bool
+	--- `remade(def, id, t, at)` is the definition `def` of value `id`,
+	--- defining value `t` instead, at position `at`.
+	fun remade(i, Int, Int, Int) -> i
+	--- Whether the instruction is the map of a safepoint, which follows the
+	--- call it describes.
+	fun isSafepointMap(i) -> Bool
+	--- Whether the instruction is a loop's poll, at which the collector may
+	--- run.
+	fun isPoll(i) -> Bool
+	--- Whether instruction `n` of the block, if it reads the flags, still
+	--- reads the ones its setter left. Spill code is the only thing spilling
+	--- puts between two instructions.
+	fun flagsIntact(Ssa.Block i, Int) -> Bool
+}
+
+--- How many registers are live at once, at the worst point in a function, in
+--- each file, by `fileIndex`. The files are counted apart because they are
+--- allocated apart.
+type Pressure = Pressure(Array Int)
+
+--- The count for one file.
+fun inFile[Colour i](f : Func i, Pressure(counts) : Pressure, file : File i) -> Int =
+	counts[fileIndex(f, file)]
 
 --- The maximum number of values simultaneously live, per file.
 ---
 --- Only *virtual* registers are counted. The physical registers selection pins
---- around a call -- the arguments in `x0`-`x7`, the result out of `x0` -- are
---- not `Ssa.Value`s and so are not in any live set. They are a real constraint
---- on the colourer and they are not pressure in this sense: their live ranges
---- are the two instructions either side of the `bl`, and what this number is
---- for is deciding whether a spiller is needed.
-fun pressureOf(f : Func A.Inst) -> Pressure {
+--- around a call -- on arm64, the arguments in `x0`-`x7` and the result out of
+--- `x0` -- are not `Ssa.Value`s and so are not in any live set. They are a
+--- real constraint on the colourer and they are not pressure in this sense:
+--- their live ranges are the two instructions either side of the call, and
+--- what this number is for is deciding whether a spiller is needed.
+fun pressureOf[Colour i](f : Func i) -> Pressure =
+	peakPressure(f, Ssa.liveness(f), BitSet.new(len(f.reps)))
+
+-- The most values live at once in each file, leaving out the values in
+-- `skip`.
+fun peakPressure[Colour i](f : Func i, liveOut : Array BitSet, skip : BitSet) -> Pressure {
 	-- Measured at two kinds of program point: after each instruction of a
 	-- block, which is where a definition has just added to the pressure, and
 	-- at each block's live-out, which is where a value crossing an edge does.
 	-- Those are the peaks; a point inside an instruction cannot exceed both of
 	-- its neighbours.
-	var gp = 0
-	var fp = 0
-	let liveOut = Ssa.liveness(f)
+	let peak = Array.filled(len(files(f)), 0)
+	let count = Array.filled(len(peak), 0)
 	for var b = 0; b < len(f.blocks); b = b + 1 {
 		let at = Ssa.BlockId(b)
-		let (og, of_) = countOf(f, BitSet.elements(liveOut[b]))
-		if og > gp { gp = og }
-		if of_ > fp { fp = of_ }
-		for live in Ssa.liveAfter(f, at, liveOut[b]) {
-			let (ig, if_) = countOf(f, live)
-			if ig > gp { gp = ig }
-			if if_ > fp { fp = if_ }
-		}
+		raise(f, peak, count, BitSet.elements(liveOut[b]), skip)
+		for live in Ssa.liveAfter(f, at, liveOut[b]) { raise(f, peak, count, live, skip) }
 	}
-	Pressure { gp = gp, fp = fp }
+	Pressure(peak)
 }
 
--- A live set split by register file. `Ssa.liveness` answers value ids, and
--- `f.reps` is what says which file each belongs in -- the same table the low
--- IR used, because selection copies it rather than deriving a second one.
-fun countOf(f : Func A.Inst, live : Array Int) -> (Int, Int) {
-	var gp = 0
-	var fp = 0
+-- Raises each file's entry in `peak` to the number of values in `live` of
+-- that file, leaving out the values in `skip`. `count` is scratch.
+--
+-- `Ssa.liveness` answers value ids, and `f.reps` is what says which file each
+-- belongs in -- the same table the low IR used, because selection copies it
+-- rather than deriving a second one.
+fun raise[Colour i](
+	f : Func i,
+	peak : Array Int,
+	count : Array Int,
+	live : Array Int,
+	skip : BitSet,
+) -> Unit {
+	for var k = 0; k < len(count); k = k + 1 { count[k] = 0 }
 	for id in live {
-		match A.bankOf(f.reps[id]) {
-			Gp -> { gp = gp + 1 }
-			Fp -> { fp = fp + 1 }
+		if !BitSet.contains(skip, id) {
+			let k = fileIndex(f, fileOf(f, id))
+			count[k] = count[k] + 1
 		}
 	}
-	(gp, fp)
+	for var k = 0; k < len(count); k = k + 1 {
+		if count[k] > peak[k] { peak[k] = count[k] }
+	}
 }
 
 --- How many values are live *across* a call, which is the second number the
 --- colourer's feasibility turns on and a tighter one than total pressure.
 ---
 --- A call clobbers every caller-saved register, so a value live across one can
---- be held only in a callee-saved register -- of which the general file has ten
---- and the vector file eight -- or in memory. Total pressure can fit
---- comfortably in 28 registers and this can still not fit in 10. An allocation
---- is not counted: it clobbers nothing allocatable (`A.callClobbers`).
+--- be held only in a callee-saved register or in memory. Total pressure can
+--- fit comfortably in the pool and this can still not fit in the callee-saved
+--- registers. A call that clobbers nothing the allocator hands out, such as an
+--- arm64 allocation, is not counted (`callClobbers`).
 ---
 --- Traced and untraced are counted apart because they are not equally
 --- expensive to spill. A traced value live across a safepoint is *already*
@@ -145,51 +245,55 @@ fun countOf(f : Func A.Inst, live : Array Int) -> (Int, Int) {
 --- is needed, and the traced count says how much cheaper the spilling is than
 --- it looks.
 type AcrossCalls = AcrossCalls {
-	untracedGp : Int
-	tracedGp   : Int
-	untracedFp : Int
-	tracedFp   : Int
-	calls      : Int
+	untraced : Pressure
+	traced   : Pressure
+	calls    : Int
 }
 
-fun acrossCalls(f : Func A.Inst) -> AcrossCalls {
-	var ug = 0
-	var tg = 0
-	var uf = 0
-	var tf = 0
+fun acrossCalls[Colour i](f : Func i) -> AcrossCalls {
+	let count = len(files(f))
+	let untraced = Array.filled(count, 0)
+	let traced = Array.filled(count, 0)
+	let thisUntraced = Array.filled(count, 0)
+	let thisTraced = Array.filled(count, 0)
 	var calls = 0
 	let liveOut = Ssa.liveness(f)
 	for var b = 0; b < len(f.blocks); b = b + 1 {
 		let block = f.blocks[b]
 		let after = Ssa.liveAfter(f, Ssa.BlockId(b), liveOut[b])
 		for var n = 0; n < len(block.insts); n = n + 1 {
-			if clobbersOnCall(block.insts[n]) {
+			if clobbersOnCall(f, block.insts[n]) {
 				calls = calls + 1
-				var thisUg = 0
-				var thisTg = 0
-				var thisUf = 0
-				var thisTf = 0
+				for var k = 0; k < count; k = k + 1 {
+					thisUntraced[k] = 0
+					thisTraced[k] = 0
+				}
 				for id in after[n] {
-					let rep = f.reps[id]
-					match A.bankOf(rep) {
-						Gp -> if rep.traced { thisTg = thisTg + 1 } else { thisUg = thisUg + 1 }
-						Fp -> if rep.traced { thisTf = thisTf + 1 } else { thisUf = thisUf + 1 }
+					let k = fileIndex(f, fileOf(f, id))
+					if f.reps[id].traced {
+						thisTraced[k] = thisTraced[k] + 1
+					} else {
+						thisUntraced[k] = thisUntraced[k] + 1
 					}
 				}
-				if thisUg > ug { ug = thisUg }
-				if thisTg > tg { tg = thisTg }
-				if thisUf > uf { uf = thisUf }
-				if thisTf > tf { tf = thisTf }
+				for var k = 0; k < count; k = k + 1 {
+					if thisUntraced[k] > untraced[k] { untraced[k] = thisUntraced[k] }
+					if thisTraced[k] > traced[k] { traced[k] = thisTraced[k] }
+				}
 			}
 		}
 	}
-	AcrossCalls { untracedGp = ug, tracedGp = tg, untracedFp = uf, tracedFp = tf, calls = calls }
+	AcrossCalls { untraced = Pressure(untraced), traced = Pressure(traced), calls = calls }
 }
 
 -- Whether an instruction is a call that destroys some register the
 -- allocator hands out.
-fun clobbersOnCall(i : A.Inst) -> Bool =
-	A.callClobbers(i.op, Gp) != 0 || A.callClobbers(i.op, Fp) != 0
+fun clobbersOnCall[Colour i](f : Func i, inst : i) -> Bool {
+	for file in files(f) {
+		if callClobbers(inst, file) != 0 { return True }
+	}
+	False
+}
 
 --- Pressure once the root array is counted as the spill slot it already is.
 ---
@@ -203,7 +307,7 @@ fun clobbersOnCall(i : A.Inst) -> Bool =
 --- spilling for some other reason, because every value not in that set is
 --- counted in full. Read it as "is the colourer plausible", not as a
 --- register count.
-fun effectivePressure(f : Func A.Inst) -> Pressure {
+fun effectivePressure[Colour i](f : Func i) -> Pressure {
 	-- `Turkey.Roots` gives a stack slot to every traced value live across a
 	-- safepoint, and the emitter *already* stores it there before the call --
 	-- that store is what rooting is. So such a value need not hold a register
@@ -223,41 +327,14 @@ fun effectivePressure(f : Func A.Inst) -> Pressure {
 		let block = f.blocks[b]
 		let after = Ssa.liveAfter(f, Ssa.BlockId(b), liveOut[b])
 		for var n = 0; n < len(block.insts); n = n + 1 {
-			if A.isCall(block.insts[n]) {
+			if isCall(block.insts[n]) {
 				for id in after[n] {
 					if f.reps[id].traced { BitSet.add(rooted, id) }
 				}
 			}
 		}
 	}
-	var gp = 0
-	var fp = 0
-	for var b = 0; b < len(f.blocks); b = b + 1 {
-		let at = Ssa.BlockId(b)
-		let (og, of_) = countExcept(f, BitSet.elements(liveOut[b]), rooted)
-		if og > gp { gp = og }
-		if of_ > fp { fp = of_ }
-		for live in Ssa.liveAfter(f, at, liveOut[b]) {
-			let (ig, if_) = countExcept(f, live, rooted)
-			if ig > gp { gp = ig }
-			if if_ > fp { fp = if_ }
-		}
-	}
-	Pressure { gp = gp, fp = fp }
-}
-
-fun countExcept(f : Func A.Inst, live : Array Int, skip : BitSet) -> (Int, Int) {
-	var gp = 0
-	var fp = 0
-	for id in live {
-		if !BitSet.contains(skip, id) {
-			match A.bankOf(f.reps[id]) {
-				Gp -> { gp = gp + 1 }
-				Fp -> { fp = fp + 1 }
-			}
-		}
-	}
-	(gp, fp)
+	peakPressure(f, liveOut, rooted)
 }
 
 -- -- the colourer ------------------------------------------------------------
@@ -271,7 +348,7 @@ fun countExcept(f : Func A.Inst, live : Array Int, skip : BitSet) -> (Int, Int) 
 --- once allocation stopped editing the code, and a pass that does not mutate
 --- its input is a pass whose input can still be printed, verified and re-run.
 type Colouring = Colouring {
-	--- Value id -> register number within that value's own bank. `-1` for a
+	--- Value id -> register number within that value's own file. `-1` for a
 	--- value that was never assigned one, which after a successful run means
 	--- only that it is dead.
 	of_ : Array Int
@@ -282,19 +359,22 @@ type Colouring = Colouring {
 }
 
 --- Colour one function by walking its blocks in a dominance-compatible order.
-fun colour(f : Func A.Inst) -> Colouring {
-	let w = walk(f, newSpills(), Map.new(), False)
+fun colour[Colour i](f : Func i) -> Colouring {
+	let w = walk(f, newSpills(), Map.new(), None)
 	Colouring { of_ = w.of_, stopped = w.stopped }
 }
 
 -- One colouring walk, which either stops at the first value it cannot place
--- (`evict` false, the colourer as it was) or keeps going and names the values
--- that must go to memory for the next attempt to succeed (`evict` true, what
--- `allocate` runs).
-type Walk = Walk {
-	f         : Func A.Inst
-	spills    : Spills
-	evict     : Bool
+-- (`evict` is `None`, what `colour` runs) or keeps going and names the values
+-- that must go to memory for the next attempt to succeed (`evict` holds the
+-- spill costs to weigh them by, what `allocate` runs).
+--
+-- The slot type is a parameter, not `Slot i`, because a constructor field
+-- cannot name an associated type declared in this module.
+type Walk i s = Walk {
+	f         : Func i
+	spills    : Spills i s
+	evict     : Option (fun(Func i, Map Int Int) -> Array Int)
 	forbidden : Array Int
 	hints     : Array Int
 	-- `affinities`: the block parameters each value is passed to, and the
@@ -316,7 +396,12 @@ type Walk = Walk {
 	var cost : Array Int
 }
 
-fun walk(f : Func A.Inst, spills : Spills, roots : Map Int Int, evict : Bool) -> Walk {
+fun walk[Colour i](
+	f : Func i,
+	spills : Spills i s,
+	roots : Map Int Int,
+	evict : Option (fun(Func i, Map Int Int) -> Array Int),
+) -> Walk i s {
 	-- Reverse postorder is dominance-compatible, so a definition is always
 	-- coloured before any use, and the theorem does the rest: at the point a
 	-- value is defined, everything it can interfere with is live there, so a
@@ -325,16 +410,17 @@ fun walk(f : Func A.Inst, spills : Spills, roots : Map Int Int, evict : Bool) ->
 	--
 	-- Two things the theorem does not cover, and both are real here:
 	--
-	-- * **Physical registers.** Selection pins arguments into `x0`-`x7` and
-	--   reads the result out of `x0`, and a `mov x0, %5` destroys whatever the
-	--   allocator put in `x0`. So a value's forbidden set collects every
-	--   physical register written at a point where that value is live, and a
-	--   call forbids all of the caller-saved ones at once.
-	-- * **The flag pair.** Nothing that sets flags may come between a
-	--   flag-setting instruction and the `cset` that reads it. Colouring
-	--   inserts nothing; spilling inserts `ldr` and `str`, which leave the
-	--   flags alone -- and `verifyAllocation` checks that every `cset` still
-	--   reaches its setter.
+	-- * **Physical registers.** Selection pins arguments into fixed registers
+	--   and reads the result out of one -- on arm64, `x0`-`x7` and `x0` -- and
+	--   a `mov x0, %5` destroys whatever the allocator put in `x0`. So a
+	--   value's forbidden set collects every physical register written at a
+	--   point where that value is live, and a call forbids all of the
+	--   caller-saved ones at once.
+	-- * **The flags.** Nothing that sets flags may come between a
+	--   flag-setting instruction and the one that reads them. Colouring
+	--   inserts nothing; spilling inserts only spill code -- on arm64 `ldr`
+	--   and `str`, which leave the flags alone -- and `verifyAllocation` asks
+	--   `flagsIntact` of every instruction.
 	let (liveIn, liveOut) = Ssa.livenessInOut(f)
 	let forbidden = forbiddenSets(f, liveOut)
 	let of_ = Array.filled(len(f.reps), -1)
@@ -369,7 +455,7 @@ fun walk(f : Func A.Inst, spills : Spills, roots : Map Int Int, evict : Bool) ->
 	-- unassigned value simply does not appear in the checks. It was found by
 	-- the hint hit rate reading exactly 0 of 3714, which is not a bad hint
 	-- rate but an absent one.
-	let entryTaken = newTaken()
+	let entryTaken = newTaken(f)
 	for p in f.params {
 		let id = Ssa.valueId(p)
 		place(w, entryTaken, id, entry, 0)
@@ -382,7 +468,7 @@ fun walk(f : Func A.Inst, spills : Spills, roots : Map Int Int, evict : Bool) ->
 		-- A block's parameters are defined at its entry and are all live at
 		-- once, so each avoids the values entering the block and the
 		-- parameters already placed.
-		let taken = newTaken()
+		let taken = newTaken(f)
 		for id in BitSet.elements(liveIn[b]) {
 			if w.of_[id] >= 0 { hold(taken, key(f, id, w.of_[id]), id) }
 		}
@@ -399,12 +485,21 @@ fun walk(f : Func A.Inst, spills : Spills, roots : Map Int Int, evict : Bool) ->
 		let ends = endings(f, block, liveOut[b], scratch)
 		for var n = 0; n < len(block.insts); n = n + 1 {
 			-- An instruction that writes its destination before its last read
-			-- of an operand (an inline array allocation) places it while the
-			-- operands that die here still hold their registers.
+			-- of some operands (on arm64, an inline array allocation) places
+			-- it while those operands still hold their registers. Only the
+			-- operands it reads solely before writing are released first; the
+			-- rest of what ends here, a dead definition included, is released
+			-- after, which is never wrong and only sometimes wasteful.
 			let i = block.insts[n]
-			if A.writesBeforeReading(i.op) {
+			let late = readAfterWrite(i)
+			if late != 0 {
+				for id in ends[n] {
+					if readOnlyBeforeWriting(i, late, id) { releaseValue(w, taken, id) }
+				}
 				Ssa.eachDef(i, fun(d) = place(w, taken, Ssa.valueId(d), block, n + 1))
-				for id in ends[n] { releaseValue(w, taken, id) }
+				for id in ends[n] {
+					if !readOnlyBeforeWriting(i, late, id) { releaseValue(w, taken, id) }
+				}
 				continue
 			}
 			for id in ends[n] { releaseValue(w, taken, id) }
@@ -424,9 +519,9 @@ fun walk(f : Func A.Inst, spills : Spills, roots : Map Int Int, evict : Bool) ->
 -- Most instructions end nothing, and those share one empty array, so a block
 -- costs a handful of small arrays rather than a live set per instruction.
 -- `live` is scratch, overwritten here.
-fun endings(
-	f : Func A.Inst,
-	block : Ssa.Block A.Inst,
+fun endings[Ssa.Inst i](
+	f : Func i,
+	block : Ssa.Block i,
 	out : BitSet,
 	live : BitSet,
 ) -> Array (Vec Int) {
@@ -461,7 +556,7 @@ fun endings(
 }
 
 -- A value that was evicted, or never placed, holds nothing to release.
-fun releaseValue(w : Walk, taken : Taken, id : Int) -> Unit {
+fun releaseValue[Colour i](w : Walk i s, taken : Taken, id : Int) -> Unit {
 	let n = w.of_[id]
 	if n >= 0 {
 		let k = key(w.f, id, n)
@@ -469,28 +564,40 @@ fun releaseValue(w : Walk, taken : Taken, id : Int) -> Unit {
 	}
 }
 
--- A taken-register key. The two files are allocated apart, so `x3` and `d3`
--- must not collide; the bank is part of the key rather than every table being
--- split in two, which would double every loop above. Register numbers are
--- below 32, so the vector file starts there.
+-- Whether `id` is an operand of `inst` that no operand in the mask `late`
+-- reads: one the instruction is done with before it writes its destination.
+fun readOnlyBeforeWriting[Ssa.Inst i](inst : i, late : Int, id : Int) -> Bool {
+	let operands = Ssa.uses(inst)
+	var read = False
+	for var k = 0; k < len(operands); k = k + 1 {
+		if Ssa.valueId(operands[k]) == id {
+			if readsLate(late, k) { return False }
+			read = True
+		}
+	}
+	read
+}
+
+-- Whether operand `k` is in a `readAfterWrite` mask.
+fun readsLate(late : Int, k : Int) -> Bool = forbids(late, if k < 63 { k } else { 63 })
+
+-- A taken-register key. The files are allocated apart, so register 3 of one
+-- and register 3 of another must not collide; the file is part of the key
+-- rather than every table being split per file, which would multiply every
+-- loop above. A bounded file's register numbers are below 64, so file `k`'s
+-- keys start at `64 * k`.
 --
 -- A wrapper rather than a bare `Int` because the tables it keys hold value
 -- ids, which are `Int`s too, and swapping the two must not compile. It erases
 -- to the number, so it costs nothing.
 type RegKey = RegKey(Int)
 
-fun key(f : Func A.Inst, id : Int, n : Int) -> RegKey = keyIn(A.bankOf(f.reps[id]), n)
+fun key[Colour i](f : Func i, id : Int, n : Int) -> RegKey = keyIn(f, fileOf(f, id), n)
 
-fun keyIn(bank : Bank, n : Int) -> RegKey = match bank {
-	Gp -> RegKey(n)
-	Fp -> RegKey(32 + n)
-}
+fun keyIn[Colour i](f : Func i, file : File i, n : Int) -> RegKey =
+	RegKey(keysPerFile * fileIndex(f, file) + n)
 
--- A key as the register's name, for a message.
-fun keyName(k : RegKey) -> String {
-	let RegKey(n) = k
-	if n < 32 { "x" + Int.toString(n) } else { "d" + Int.toString(n - 32) }
-}
+let keysPerFile = 64
 
 -- The registers held at one program point: for each key, the value holding
 -- that register, or `-1`. `place` has to know whom it would evict, so a mask
@@ -499,7 +606,8 @@ fun keyName(k : RegKey) -> String {
 -- than building one per instruction.
 type Taken = Taken(Array Int)
 
-fun newTaken() -> Taken = Taken(Array.filled(64, -1))
+fun newTaken[Colour i](f : Func i) -> Taken =
+	Taken(Array.filled(keysPerFile * len(files(f)), -1))
 
 fun holderOf(Taken(held) : Taken, RegKey(k) : RegKey) -> Int = held[k]
 
@@ -513,23 +621,22 @@ fun release(Taken(held) : Taken, RegKey(k) : RegKey) -> Unit {
 	held[k] = -1
 }
 
-fun poolOf(bank : Bank) -> Array Int = match bank {
-	Gp -> gpPool
-	Fp -> fpPool
+-- The registers a file hands out, in order. The walk keeps one entry per
+-- register in `Taken` and one bit per register in a forbidden mask, so it
+-- colours bounded files only.
+fun poolOf[Colour i](f : Func i, file : File i) -> Array Int = match pool(f, file) {
+	Bounded(registers) -> registers
+	Unbounded          -> error("Regalloc: the " + fileName(f, file) + " file is unbounded")
 }
 
-fun fileName(bank : Bank) -> String = match bank {
-	Gp -> "general"
-	Fp -> "vector"
-}
-
--- Give one value the lowest register its bank allows that nothing live holds
+-- Give one value the lowest register its file allows that nothing live holds
 -- and nothing forbids -- or, when there is none and `evict` is set, decide
 -- what goes to memory instead.
 --
 -- `taken` says which value holds each register, because eviction has to know
--- whom it is evicting. `from` is the index in `block` from which
--- a holder's next use is measured.
+-- whom it is evicting. `from` is the index in `block` from which a holder's
+-- next use is measured: one past the instruction that defines `id`, or 0 for
+-- a parameter.
 --
 -- Two different failures, and they need different answers. That is the one
 -- thing about spilling this pass got wrong on paper before it got it right:
@@ -547,23 +654,35 @@ fun fileName(bank : Bank) -> String = match bank {
 --   definition and its store. Something *else* has to leave, and the holder
 --   whose next use is furthest away is Belady's answer and the one that frees
 --   the register for longest.
-fun place(w : Walk, taken : Taken, id : Int, block : Ssa.Block A.Inst, from : Int) -> Unit {
+fun place[Colour i](
+	w : Walk i s,
+	taken : Taken,
+	id : Int,
+	block : Ssa.Block i,
+	from : Int,
+) -> Unit {
 	if w.of_[id] >= 0 { return }
 	let spills = w.spills
-	let bank = A.bankOf(w.f.reps[id])
-	let why = "a value with no free register in the " + fileName(bank) + " file"
+	let file = fileOf(w.f, id)
+	let why = "a value with no free register in the " + fileName(w.f, file) + " file"
 	var placing = True
 	while placing {
-		match freeRegister(taken, w.forbidden[id], bank, preference(w, taken, id, bank)) {
+		match freeRegister(
+			w.f,
+			taken,
+			w.forbidden[id],
+			file,
+			preference(w, taken, id, file, block, from),
+		) {
 			Some(n) -> {
 				w.of_[id] = n
-				hold(taken, keyIn(bank, n), id)
+				hold(taken, keyIn(w.f, file, n), id)
 				placing = False
 			}
-			None -> if !w.evict {
+			None -> if Option.isNone(w.evict) {
 				stopOnce(w, why)
 				placing = False
-			} else if anyUnheld(taken, bank) {
+			} else if anyUnheld(w.f, taken, file) {
 				if Set.contains(spills.shared, id) {
 					Set.add(w.evicted, id)
 					placing = False
@@ -571,14 +690,14 @@ fun place(w : Walk, taken : Taken, id : Int, block : Ssa.Block A.Inst, from : In
 					stopOnce(
 						w,
 						"a reload or store with no free register in the "
-							+ fileName(bank)
+							+ fileName(w.f, file)
 							+ " file",
 					)
 					placing = False
 				} else {
-					match cheaperHolder(w, taken, id, bank) {
+					match cheaperHolder(w, taken, id, file) {
 						Some(v) -> {
-							release(taken, keyIn(bank, w.of_[v]))
+							release(taken, keyIn(w.f, file, w.of_[v]))
 							w.of_[v] = -1
 							Set.add(w.evicted, v)
 						}
@@ -589,9 +708,9 @@ fun place(w : Walk, taken : Taken, id : Int, block : Ssa.Block A.Inst, from : In
 					}
 				}
 			} else {
-				match victim(w, taken, bank, block, from) {
+				match victim(w, taken, file, block, from) {
 					Some(v) -> {
-						release(taken, keyIn(bank, w.of_[v]))
+						release(taken, keyIn(w.f, file, w.of_[v]))
 						w.of_[v] = -1
 						Set.add(w.evicted, v)
 						Set.add(w.crowded, v)
@@ -606,7 +725,7 @@ fun place(w : Walk, taken : Taken, id : Int, block : Ssa.Block A.Inst, from : In
 	}
 }
 
-fun stopOnce(w : Walk, why : String) -> Unit = if let None = w.stopped { w.stopped = Some(why) }
+fun stopOnce(w : Walk i s, why : String) -> Unit = if let None = w.stopped { w.stopped = Some(why) }
 
 -- The hint first, then the pool in order. A hint is only ever a preference:
 -- taking it makes a move redundant and missing it makes the move real, and
@@ -614,10 +733,16 @@ fun stopOnce(w : Walk, why : String) -> Unit = if let None = w.stopped { w.stopp
 -- *hinted* to their argument registers rather than pinned to them -- a pin
 -- can contradict (a parameter in `x0` that is live across a call has had `x0`
 -- destroyed), and a preference cannot.
-fun freeRegister(taken : Taken, forbidden : Int, bank : Bank, hint : Int) -> Option Int {
-	if usable(taken, forbidden, bank, hint) { return Some(hint) }
-	for n in poolOf(bank) {
-		if !isHeld(taken, keyIn(bank, n)) && !forbids(forbidden, n) {
+fun freeRegister[Colour i](
+	f : Func i,
+	taken : Taken,
+	forbidden : Int,
+	file : File i,
+	hint : Int,
+) -> Option Int {
+	if usable(f, taken, forbidden, file, hint) { return Some(hint) }
+	for n in poolOf(f, file) {
+		if !isHeld(taken, keyIn(f, file, n)) && !forbids(forbidden, n) {
 			return Some(n)
 		}
 	}
@@ -625,19 +750,23 @@ fun freeRegister(taken : Taken, forbidden : Int, bank : Bank, hint : Int) -> Opt
 }
 
 -- Whether register `n` can be handed out here. Only a register the pool would
--- hand out: a move from `x29`, which is how `Prim.frameAddress` reads the
--- frame, must not colour its destination into the frame register itself.
-fun usable(taken : Taken, forbidden : Int, bank : Bank, n : Int) -> Bool =
+-- hand out: on arm64, a move from `x29`, which is how `Prim.frameAddress`
+-- reads the frame, must not colour its destination into the frame register
+-- itself.
+fun usable[Colour i](f : Func i, taken : Taken, forbidden : Int, file : File i, n : Int) -> Bool =
 	n >= 0
-		&& Array.contains(poolOf(bank), n)
-		&& !isHeld(taken, keyIn(bank, n))
+		&& Array.contains(poolOf(f, file), n)
+		&& !isHeld(taken, keyIn(f, file, n))
 		&& !forbids(forbidden, n)
 
 -- The register `id` would best take, or `-1` for none in particular: the first
 -- of these it may have here, each of which makes one copy redundant.
 --
 -- 1. Its move hint, to or from a fixed register.
--- 2. The register of a block parameter it is passed to. A loop header's
+-- 2. For a definition, the register of the operand its instruction would
+--    reuse (`reusedOperand`), when that operand dies there and is in the
+--    same file.
+-- 3. The register of a block parameter it is passed to. A loop header's
 --    parameters are coloured before anything in the loop, so a value a latch
 --    passes back finds the header's register already chosen, and taking it
 --    empties that slot of the back edge's parallel copy. A parameter not yet
@@ -646,7 +775,7 @@ fun usable(taken : Taken, forbidden : Int, bank : Bank, n : Int) -> Bool =
 --    poll, passes its parameters straight on to the header's, and without the
 --    search each latch would copy into that block's registers and the block
 --    copy them again into the header's.
--- 3. For a block parameter, the register of a value passed to it. That serves
+-- 4. For a block parameter, the register of a value passed to it. That serves
 --    a forward merge, whose arguments are all coloured before it.
 --
 -- Sinks come before sources because a sink already coloured is almost always
@@ -655,16 +784,29 @@ fun usable(taken : Taken, forbidden : Int, bank : Bank, n : Int) -> Bool =
 -- This is a preference and never a constraint, and the walk colours in
 -- dominance order, where any free register keeps the rest colourable, so no
 -- choice made here can make the colouring fail.
-fun preference(w : Walk, taken : Taken, id : Int, bank : Bank) -> Int {
+fun preference[Colour i](
+	w : Walk i s,
+	taken : Taken,
+	id : Int,
+	file : File i,
+	block : Ssa.Block i,
+	from : Int,
+) -> Int {
 	let forbidden = w.forbidden[id]
 	let hint = w.hints[id]
-	if usable(taken, forbidden, bank, hint) { return hint }
+	if usable(w.f, taken, forbidden, file, hint) { return hint }
+	if from > 0 {
+		let reused = reusedRegister(w, block.insts[from - 1], file)
+		-- An operand that is still live holds its register, so `usable` also
+		-- says whether the operand dies here.
+		if usable(w.f, taken, forbidden, file, reused) { return reused }
+	}
 	let seen = [id]
 	for var n = 0; n < len(seen) && n < sinkSearch; n = n + 1 {
 		for s in w.sinks[seen[n]] {
 			let r = w.of_[s]
 			if r >= 0 {
-				if usable(taken, forbidden, bank, r) { return r }
+				if usable(w.f, taken, forbidden, file, r) { return r }
 			} else if !Vec.contains(seen, s) {
 				Vec.push(seen, s)
 			}
@@ -672,10 +814,23 @@ fun preference(w : Walk, taken : Taken, id : Int, bank : Bank) -> Int {
 	}
 	for s in w.sources[id] {
 		let r = w.of_[s]
-		if usable(taken, forbidden, bank, r) { return r }
+		if usable(w.f, taken, forbidden, file, r) { return r }
 	}
 	-1
 }
+
+-- The register of the operand `inst` would reuse for its destination, if it
+-- names one in `file`, or `-1`.
+fun reusedRegister[Colour i](w : Walk i s, inst : i, file : File i) -> Int =
+	match reusedOperand(inst) {
+		None -> -1
+		Some(k) -> {
+			let operands = Ssa.uses(inst)
+			if k >= len(operands) { return -1 }
+			let a = Ssa.valueId(operands[k])
+			if fileIndex(w.f, fileOf(w.f, a)) == fileIndex(w.f, file) { w.of_[a] } else { -1 }
+		}
+	}
 
 -- How many values `preference` searches through for a coloured sink. A chain
 -- of parameters that only pass a value along is short -- a latch's value,
@@ -687,7 +842,7 @@ let sinkSearch = 8
 -- for each block parameter the values passed to it (its sources). A value
 -- passed to its own parameter, as a loop passes an unchanged variable back,
 -- is neither: that slot of the copy is empty whatever is chosen.
-fun affinities(f : Func A.Inst) -> (Array (Vec Int), Array (Vec Int)) {
+fun affinities(f : Func i) -> (Array (Vec Int), Array (Vec Int)) {
 	let sinks : Array (Vec Int) = Array.init(len(f.reps), fun(_) = [])
 	let sources : Array (Vec Int) = Array.init(len(f.reps), fun(_) = [])
 	for block in f.blocks {
@@ -706,9 +861,9 @@ fun affinities(f : Func A.Inst) -> (Array (Vec Int), Array (Vec Int)) {
 	(sinks, sources)
 }
 
-fun anyUnheld(taken : Taken, bank : Bank) -> Bool {
-	for n in poolOf(bank) {
-		if !isHeld(taken, keyIn(bank, n)) { return True }
+fun anyUnheld[Colour i](f : Func i, taken : Taken, file : File i) -> Bool {
+	for n in poolOf(f, file) {
+		if !isHeld(taken, keyIn(f, file, n)) { return True }
 	}
 	False
 }
@@ -717,18 +872,18 @@ fun anyUnheld(taken : Taken, bank : Bank) -> Bool {
 -- once (those live for one instruction and spilling them again would loop),
 -- and used furthest from `from`. Ties go to the lower value id, so that two
 -- runs agree.
-fun victim(
-	w : Walk,
+fun victim[Colour i](
+	w : Walk i s,
 	taken : Taken,
-	bank : Bank,
-	block : Ssa.Block A.Inst,
+	file : File i,
+	block : Ssa.Block i,
 	from : Int,
 ) -> Option Int {
 	let spills = w.spills
 	var best = -1
 	var bestDistance = -1
-	for n in poolOf(bank) {
-		let holder = holderOf(taken, keyIn(bank, n))
+	for n in poolOf(w.f, file) {
+		let holder = holderOf(taken, keyIn(w.f, file, n))
 		if holder >= 0 {
 			let movable = (!Map.contains(spills.reloadOf, holder)
 				|| Set.contains(spills.shared, holder))
@@ -754,12 +909,14 @@ fun victim(
 -- registers. In a loop that is the wrong way round: the invariants defined
 -- before it take them, and the loop's own variables, defined at its header,
 -- go to memory and are reloaded at every use in the body.
-fun cheaperHolder(w : Walk, taken : Taken, id : Int, bank : Bank) -> Option Int {
-	if len(w.cost) == 0 { w.cost = spillCosts(w.f, w.roots) }
+fun cheaperHolder[Colour i](w : Walk i s, taken : Taken, id : Int, file : File i) -> Option Int {
+	if len(w.cost) == 0 {
+		if let Some(costs) = w.evict { w.cost = costs(w.f, w.roots) }
+	}
 	let spills = w.spills
 	var best = -1
-	for n in poolOf(bank) {
-		let holder = holderOf(taken, keyIn(bank, n))
+	for n in poolOf(w.f, file) {
+		let holder = holderOf(taken, keyIn(w.f, file, n))
 		let movable = holder >= 0
 			&& !forbids(w.forbidden[id], n)
 			&& !Map.contains(spills.reloadOf, holder)
@@ -793,28 +950,28 @@ fun cheaperHolder(w : Walk, taken : Taken, id : Int, bank : Bank) -> Option Int 
 -- A value `spill` would rematerialize pays no store, and each read costs a
 -- quarter of a load: one instruction that waits on nothing. So it is the
 -- holder `cheaperHolder` sends to memory first.
-fun spillCosts(f : Func A.Inst, roots : Map Int Int) -> Array Int {
+fun spillCosts[Spill i](f : Func i, roots : Map Int Int) -> Array Int {
 	let weight = loopWeights(f)
-	let remade = rematerializable(f, roots)
+	let remat = rematerializations(f, roots)
 	let cost = Array.filled(len(f.reps), 0)
 	for var b = 0; b < len(f.blocks); b = b + 1 {
 		let block = f.blocks[b]
 		let w = weight[b]
 		let charge = fun(v : Value) {
 			let id = Ssa.valueId(v)
-			let each = if Map.contains(remade, id) { w } else { memoryCost * w }
+			let each = if Map.contains(remat, id) { w } else { memoryCost * w }
 			cost[id] = cost[id] + each
 		}
 		let stored = fun(v : Value) {
 			let id = Ssa.valueId(v)
-			if !Map.contains(roots, id) && !Map.contains(remade, id) {
+			if !Map.contains(roots, id) && !Map.contains(remat, id) {
 				cost[id] = cost[id] + memoryCost * w
 			}
 		}
 		for p in block.params { stored(p) }
 		for i in block.insts {
-			let rootStore = match A.slotStore(i.op) {
-				Some((_, m)) -> A.isRootSlot(m)
+			let rootStore = match slotStore(i) {
+				Some((_, m)) -> isRootSlot(f, m)
 				None         -> False
 			}
 			if !rootStore { Ssa.eachUse(i, charge) }
@@ -835,7 +992,7 @@ let memoryCost = 4
 -- block that dominates its source -- with every block that reaches the source
 -- without passing the header. An irreducible cycle has no back edge, so its
 -- blocks are weighted as if it were not a loop.
-fun loopWeights(f : Func A.Inst) -> Array Int {
+fun loopWeights(f : Func i) -> Array Int {
 	let count = len(f.blocks)
 	let idom = Ssa.dominators(f)
 	let preds = Ssa.predecessors(f)
@@ -865,7 +1022,7 @@ let loopWeight = [1, 10, 100, 1000, 10000]
 -- How far ahead a value is next read, counting from instruction `from`: its
 -- index if an instruction reads it, one past the last if the terminator does,
 -- and two past if the block never does (it is live out, or dead).
-fun nextUse(block : Ssa.Block A.Inst, id : Int, from : Int) -> Int {
+fun nextUse[Ssa.Inst i](block : Ssa.Block i, id : Int, from : Int) -> Int {
 	for var n = from; n < len(block.insts); n = n + 1 {
 		if Ssa.anyUse(block.insts[n], fun(u) = Ssa.valueId(u) == id) { return n }
 	}
@@ -875,31 +1032,9 @@ fun nextUse(block : Ssa.Block A.Inst, id : Int, from : Int) -> Int {
 	len(block.insts) + 1
 }
 
--- The allocatable registers, in the order they are handed out.
---
--- Caller-saved first in the general file, because most values are not live
--- across a call and a callee-saved register costs a save and a restore in the
--- prologue. `x18` is reserved on Darwin, `x29` and `x30` are the frame and
--- link registers, and `x31` is `sp` or `xzr`; none of the four is here.
---
--- `x16` and `x17` are not here either: they are the scratch registers, for a
--- frame or a slot offset too large for one instruction and for the cycle in a
--- parallel copy -- QBE, Go and Cranelift all reserve one or both for the same
--- jobs.
-let gpPool = [
-	0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-]
--- The vector file's callee-saved half is `d8`-`d15`, so the caller-saved ones
--- go first here too -- from both ends, since `v0`-`v7` and `v16`-`v31` are the
--- caller-saved halves.
-let fpPool = [
-	0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 8, 9, 10,
-	11, 12, 13, 14, 15,
-]
-
 -- For each value, the register numbers it may not take, as a mask: bit `n`
--- for register `n`. Every register number in either file is below 32, so one
--- word holds the set, and the value's bank says which file it is of.
+-- for register `n`. A bounded file's register numbers are below 64, so one
+-- word holds the set, and the value's file says which file it is of.
 --
 -- One sweep: at every instruction, whatever physical registers it writes are
 -- denied to every value live *across* it, and a call writes all of the
@@ -910,29 +1045,30 @@ let fpPool = [
 -- clobber nothing and sit where no physical register is live, and they cost
 -- only the update of that set: the live values are listed only where there is
 -- something to deny them.
-fun forbiddenSets(f : Func A.Inst, liveOut : Array BitSet) -> Array Int {
+fun forbiddenSets[Colour i](f : Func i, liveOut : Array BitSet) -> Array Int {
 	let out = Array.filled(len(f.reps), 0)
 	let live = BitSet.new(len(f.reps))
+	let all = files(f)
+	let clobbered = Array.filled(len(all), 0)
 	for var b = 0; b < len(f.blocks); b = b + 1 {
 		let block = f.blocks[b]
-		let (physical, _) = physicalLive(block)
+		let (physical, _) = physicalLive(f, block)
 		BitSet.copyFrom(live, liveOut[b])
 		for v in Ssa.termUses(block.term) { BitSet.add(live, Ssa.valueId(v)) }
 		for var n = len(block.insts) - 1; n >= 0; n = n - 1 {
 			-- `live` is what is live after instruction `n`.
 			let i = block.insts[n]
-			let clobberedGp = clobbersOf(i, Gp)
-			let clobberedFp = clobbersOf(i, Fp)
+			var clobbering = False
+			for var k = 0; k < len(all); k = k + 1 {
+				clobbered[k] = clobbers(i, all[k])
+				if clobbered[k] != 0 { clobbering = True }
+			}
 			let held = physical[n]
-			let holding = len(held.gp) > 0 || len(held.fp) > 0
-			if clobberedGp != 0 || clobberedFp != 0 || holding {
+			let holding = anyHeld(held)
+			if clobbering || holding {
 				let after = BitSet.elements(live)
 				for id in after {
-					let clobbered = match A.bankOf(f.reps[id]) {
-						Gp -> clobberedGp
-						Fp -> clobberedFp
-					}
-					out[id] = out[id] | clobbered
+					out[id] = out[id] | clobbered[fileIndex(f, fileOf(f, id))]
 				}
 				-- And the other half: a physical register that is *live*
 				-- here -- written by an earlier instruction, read by a later
@@ -952,12 +1088,8 @@ fun forbiddenSets(f : Func A.Inst, liveOut : Array BitSet) -> Array Int {
 	out
 }
 
-fun forbidHeld(out : Array Int, f : Func A.Inst, held : PhysicalLive, id : Int) -> Unit {
-	let taken = match A.bankOf(f.reps[id]) {
-		Gp -> held.gp
-		Fp -> held.fp
-	}
-	for r in taken { out[id] = forbid(out[id], r) }
+fun forbidHeld[Colour i](out : Array Int, f : Func i, held : PhysicalLive, id : Int) -> Unit {
+	for r in held.byFile[fileIndex(f, fileOf(f, id))] { out[id] = forbid(out[id], r) }
 }
 
 fun forbids(mask : Int, n : Int) -> Bool = mask >> n & 1 != 0
@@ -968,78 +1100,71 @@ fun forbid(mask : Int, n : Int) -> Int = mask | 1 << n
 -- not they are used. A dead definition still writes a register. Without
 -- repeats: a definition may be live after, and an instruction defines one or
 -- two values, so a scan finds it.
-fun touched(i : A.Inst, after : Array Int) -> Vec Int {
+fun touched[Colour i](inst : i, after : Array Int) -> Vec Int {
 	let out = Vec.fromArray(after)
-	Ssa.eachDef(i, fun(d) {
+	Ssa.eachDef(inst, fun(d) {
 		let id = Ssa.valueId(d)
 		if !Vec.contains(out, id) { Vec.push(out, id) }
 	})
 	-- And an operand read after the destination is written, which holds its
 	-- register at the same time as the destination does.
-	if A.writesBeforeReading(i.op) {
-		Ssa.eachUse(i, fun(u) {
-			let id = Ssa.valueId(u)
-			if !Vec.contains(out, id) { Vec.push(out, id) }
-		})
+	let late = readAfterWrite(inst)
+	if late != 0 {
+		let operands = Ssa.uses(inst)
+		for var k = 0; k < len(operands); k = k + 1 {
+			let id = Ssa.valueId(operands[k])
+			if readsLate(late, k) && !Vec.contains(out, id) { Vec.push(out, id) }
+		}
 	}
 	out
 }
 
--- Physical registers live at a program point, per file. Arrays of distinct
--- register numbers, for the reason `Ssa.liveAfter` answers arrays.
-type PhysicalLive = PhysicalLive { gp : Array Int, fp : Array Int }
+-- Physical registers live at a program point, per file by `fileIndex`.
+-- Arrays of distinct register numbers, for the reason `Ssa.liveAfter` answers
+-- arrays.
+type PhysicalLive = PhysicalLive { byFile : Array (Array Int) }
+
+fun anyHeld(held : PhysicalLive) -> Bool {
+	for registers in held.byFile {
+		if len(registers) > 0 { return True }
+	}
+	False
+}
 
 -- The physical registers live *after* each instruction of a block, and the
 -- ones live on entry to it.
 --
 -- One backward walk: a register a later instruction reads is live until the
 -- instruction that writes it. Selection only ever writes a physical register
--- and reads it back within one block -- arguments into `x0`-`x7` before a
--- call, the results out of `x0` up after it -- so nothing should be live on entry,
--- and `verifyColouring` says so if it is. `x31` is not a register anything can
--- hold: it is `xzr` or `sp`. Nor is `x29`, which the prologue sets and nothing
--- else writes, so reading it -- `Prim.frameAddress` does -- is always good;
--- nor `x28`, the worker, which nothing in a function writes at all.
-fun physicalLive(block : Ssa.Block A.Inst) -> (Array PhysicalLive, PhysicalLive) {
+-- and reads it back within one block -- on arm64, arguments into `x0`-`x7`
+-- before a call and the results out of `x0` up after it -- so nothing should
+-- be live on entry, and `verifyColouring` says so if it is. A register that
+-- is never live (`eachPhysicalRead`) is not counted.
+fun physicalLive[Colour i](f : Func i, block : Ssa.Block i) -> (Array PhysicalLive, PhysicalLive) {
+	let count = len(files(f))
 	-- Nothing is live at almost every point, so those share one value.
-	let nothing = PhysicalLive { gp = [], fp = [] }
-	let sets = Array.filled(len(block.insts), nothing)
-	let gp = BitSet.new(32)
-	let fp = BitSet.new(32)
+	let nothing = noneLive(count)
+	let sets = Array.init(len(block.insts), fun(_) = nothing)
+	let live = Array.init(count, fun(_) = BitSet.new(keysPerFile))
 	for var n = len(block.insts) - 1; n >= 0; n = n - 1 {
-		if !BitSet.isEmpty(gp) || !BitSet.isEmpty(fp) {
-			sets[n] = PhysicalLive { gp = BitSet.elements(gp), fp = BitSet.elements(fp) }
-		}
-		let op = block.insts[n].op
-		A.eachDest(op, fun(r) = match r {
-			Physical(Gp, k) -> { let _ = BitSet.remove(gp, k) }
-			Physical(Fp, k) -> { let _ = BitSet.remove(fp, k) }
-			Virtual(_)      -> {}
+		if anyLive(live) { sets[n] = PhysicalLive { byFile = Array.map(live, BitSet.elements) } }
+		let i = block.insts[n]
+		eachPhysicalWrite(i, fun(file, k) {
+			let _ = BitSet.remove(live[fileIndex(f, file)], k)
 		})
-		A.eachSrc(op, fun(r) = match r {
-			Physical(Gp, k) -> if k != 31 && k != 29 && k != 28 { BitSet.add(gp, k) }
-			Physical(Fp, k) -> BitSet.add(fp, k)
-			Virtual(_)      -> {}
-		})
+		eachPhysicalRead(i, fun(file, k) = BitSet.add(live[fileIndex(f, file)], k))
 	}
-	(sets, PhysicalLive { gp = BitSet.elements(gp), fp = BitSet.elements(fp) })
+	(sets, PhysicalLive { byFile = Array.map(live, BitSet.elements) })
 }
 
-fun sameBank(a : Bank, b : Bank) -> Bool = match (a, b) {
-	(Gp, Gp) -> True
-	(Fp, Fp) -> True
-	_        -> False
-}
+fun noneLive(count : Int) -> PhysicalLive = PhysicalLive { byFile = Array.init(count, fun(_) = []) }
 
--- The physical registers of `bank` an instruction destroys, as a mask: the
--- ones it names as a destination, plus -- if it is a call -- the ones its
--- convention lets the callee use. Asked of every instruction, so it builds
--- nothing.
-fun clobbersOf(i : A.Inst, bank : Bank) -> Int =
-	A.foldDest(i.op, A.callClobbers(i.op, bank), fun(mask, r) = match r {
-		Physical(b, n) -> if sameBank(b, bank) { forbid(mask, n) } else { mask }
-		Virtual(_)     -> mask
-	})
+fun anyLive(live : Array BitSet) -> Bool {
+	for registers in live {
+		if !BitSet.isEmpty(registers) { return True }
+	}
+	False
+}
 
 --- Whether a colouring is actually a colouring.
 ---
@@ -1047,14 +1172,15 @@ fun clobbersOf(i : A.Inst, bank : Bank) -> Int =
 ---
 --- * **Two values live at one point sharing a register.** The colouring is
 ---   worthless if this happens, and nothing later can tell -- the printer will
----   print it, `as` will assemble it, and the program will compute a wrong
----   number.
+---   print it, the assembler will assemble it, and the program will compute a
+---   wrong number.
 --- * **A value holding a register that is clobbered while it is live.** The
----   classic form is a value in `x0` across a call, which the callee destroys.
+---   classic form is a value in a caller-saved register across a call, which
+---   the callee destroys.
 ---
 --- Both are quadratic in the live set at worst and the live sets are small,
 --- which is what makes checking every program point affordable.
-fun verifyColouring(f : Func A.Inst, c : Colouring) -> Vec String {
+fun verifyColouring[Colour i](f : Func i, c : Colouring) -> Vec String {
 	-- `Ssa.verify` checks the graph and knows nothing about registers, so this
 	-- is the allocator's half of the same idea: the pass that can silently
 	-- produce code which assembles, links, runs and computes the wrong answer
@@ -1069,17 +1195,17 @@ fun verifyColouring(f : Func A.Inst, c : Colouring) -> Vec String {
 	-- That the corpus *has* unreachable blocks is a separate matter and not a
 	-- happy one: they are the panic blocks a guard creates, which means the
 	-- branch to them went missing.
+	let none = noneLive(len(files(f)))
 	for at in Ssa.reversePostorder(f) {
 		let b = Ssa.blockId(at)
 		let block = f.blocks[b]
 		let after = Ssa.liveAfter(f, at, liveOut[b])
-		let (physical, entering) = physicalLive(block)
+		let (physical, entering) = physicalLive(f, block)
 		-- The entry block is the exception, and the only one: it reads the
 		-- argument registers the caller wrote.
-		if (len(entering.gp) > 0 || len(entering.fp) > 0) && b != Ssa.blockId(f.entry) {
+		if anyHeld(entering) && b != Ssa.blockId(f.entry) {
 			Vec.push(out, "a physical register is live on entry to block b" + Int.toString(b))
 		}
-		let none = PhysicalLive { gp = [], fp = [] }
 		for var n = 0; n < len(block.insts); n = n + 1 {
 			checkPoint(
 				out,
@@ -1098,9 +1224,9 @@ fun verifyColouring(f : Func A.Inst, c : Colouring) -> Vec String {
 
 -- One program point: the values live there and the ones just defined, which
 -- is every value holding a register at that moment.
-fun checkPoint[Iterator l, Item l ~ Int](
+fun checkPoint[Colour i, Iterator l, Item l ~ Int](
 	out : Vec String,
-	f : Func A.Inst,
+	f : Func i,
 	c : Colouring,
 	forbidden : Array Int,
 	live : l,
@@ -1122,8 +1248,9 @@ fun checkPoint[Iterator l, Item l ~ Int](
 			)
 		}
 		if r >= 0 {
-			let slot = key(f, id, r)
-			let k = keyName(slot)
+			let file = fileOf(f, id)
+			let slot = keyIn(f, file, r)
+			let k = registerName(f, file, r)
 			match Map.get(seen, slot) {
 				Some(other) -> Vec.push(
 					out,
@@ -1149,11 +1276,7 @@ fun checkPoint[Iterator l, Item l ~ Int](
 						+ at,
 				)
 			}
-			let held = match A.bankOf(f.reps[id]) {
-				Gp -> physical.gp
-				Fp -> physical.fp
-			}
-			if Array.contains(held, r) {
+			if Array.contains(physical.byFile[fileIndex(f, file)], r) {
 				Vec.push(
 					out,
 					"value %"
@@ -1182,60 +1305,50 @@ fun where_(b : Int, n : Int) -> String =
 --- This number is the answer to "what if there are too many untraced values":
 --- if it fits in the file, the traced fallback is enough and nothing needs a
 --- frame; if it does not, a real spiller does, and this says by how much.
-fun untracedPressure(f : Func A.Inst) -> Pressure {
+fun untracedPressure[Colour i](f : Func i) -> Pressure {
 	-- An untraced value has no root slot, so spilling one needs a real stack
-	-- slot and therefore a frame -- which does not exist yet.
-	let liveOut = Ssa.liveness(f)
+	-- slot and therefore a frame.
 	let traced = BitSet.new(len(f.reps))
 	for var id = 0; id < len(f.reps); id = id + 1 {
 		if f.reps[id].traced { BitSet.add(traced, id) }
 	}
-	var gp = 0
-	var fp = 0
-	for var b = 0; b < len(f.blocks); b = b + 1 {
-		let at = Ssa.BlockId(b)
-		let (og, of_) = countExcept(f, BitSet.elements(liveOut[b]), traced)
-		if og > gp { gp = og }
-		if of_ > fp { fp = of_ }
-		for live in Ssa.liveAfter(f, at, liveOut[b]) {
-			let (ig, if_) = countExcept(f, live, traced)
-			if ig > gp { gp = ig }
-			if if_ > fp { fp = if_ }
-		}
-	}
-	Pressure { gp = gp, fp = fp }
+	peakPressure(f, Ssa.liveness(f), traced)
 }
 
---- The most values live across any single call, traced and untraced together,
---- counting the calls `acrossCalls` counts.
+--- The most values live across any single call in each file, traced and
+--- untraced together, counting the calls `acrossCalls` counts.
 ---
 --- `acrossCalls` reports the two categories' maxima independently, which can be
 --- at different call sites and so understates the worst one. This is the number
 --- the callee-saved budget is actually spent against.
-fun worstCall(f : Func A.Inst) -> Int {
+fun worstCall[Colour i](f : Func i) -> Pressure {
 	let liveOut = Ssa.liveness(f)
-	var worst = 0
+	let worst = Array.filled(len(files(f)), 0)
+	let here = Array.filled(len(worst), 0)
 	for var b = 0; b < len(f.blocks); b = b + 1 {
 		let block = f.blocks[b]
 		let after = Ssa.liveAfter(f, Ssa.BlockId(b), liveOut[b])
 		for var n = 0; n < len(block.insts); n = n + 1 {
-			if clobbersOnCall(block.insts[n]) {
-				var here = 0
+			if clobbersOnCall(f, block.insts[n]) {
+				for var k = 0; k < len(here); k = k + 1 { here[k] = 0 }
 				for id in after[n] {
-					if let Gp = A.bankOf(f.reps[id]) { here = here + 1 }
+					let k = fileIndex(f, fileOf(f, id))
+					here[k] = here[k] + 1
 				}
-				if here > worst { worst = here }
+				for var k = 0; k < len(here); k = k + 1 {
+					if here[k] > worst[k] { worst[k] = here[k] }
+				}
 			}
 		}
 	}
-	worst
+	Pressure(worst)
 }
 
 --- Which register each value would rather have, or `-1`.
 ---
 --- A preference, never a pin: taking it makes a move redundant, and missing it
 --- keeps the move and is still correct.
-fun moveHints(f : Func A.Inst) -> Array Int {
+fun moveHints[Colour i](f : Func i) -> Array Int {
 	-- A pin could contradict -- a parameter fixed in `x0` and live across a
 	-- call has had `x0` destroyed -- and a preference cannot, which is the
 	-- whole reason the calling convention is written as moves
@@ -1243,12 +1356,11 @@ fun moveHints(f : Func A.Inst) -> Array Int {
 	--
 	-- Read off those moves: a value moved out of a physical register, or into
 	-- one, would like that register. That covers the parameters, the arguments
-	-- and the results at once, where the hints used to cover the parameters
-	-- alone.
+	-- and the results at once.
 	let out = Array.filled(len(f.reps), -1)
 	for block in f.blocks {
 		for i in block.insts {
-			if let Some((id, n)) = A.moveHint(i.op) {
+			if let Some((id, n)) = moveHint(i) {
 				if out[id] < 0 { out[id] = n }
 			}
 		}
@@ -1258,10 +1370,10 @@ fun moveHints(f : Func A.Inst) -> Array Int {
 
 --- How many hinted values got the register their move wanted.
 ---
---- Every miss is one `mov` the emitter keeps. A miss is not a bug -- a value
+--- Every miss is one move the emitter keeps. A miss is not a bug -- a value
 --- live across a call *must* miss an argument register, which is caller-saved
 --- -- so this is a code-quality number rather than a correctness one.
-fun hintsTaken(f : Func A.Inst, c : Colouring) -> (Int, Int) {
+fun hintsTaken[Colour i](f : Func i, c : Colouring) -> (Int, Int) {
 	let hints = moveHints(f)
 	var taken = 0
 	var total = 0
@@ -1276,15 +1388,15 @@ fun hintsTaken(f : Func A.Inst, c : Colouring) -> (Int, Int) {
 
 -- -- spilling ---------------------------------------------------------------
 
---- What has gone to memory, and where.
-type Spills = Spills {
+--- What has gone to memory, and where. `s` is the target's `Slot i`.
+type Spills i s = Spills {
 	--- Spilled value id -> its slot: its root slot if `Turkey.Roots` gave it
 	--- one, a spill slot of its own otherwise.
-	slots : Map Int A.Mem
+	slots : Map Int s
 	--- Rematerialized value id -> its defining instruction. Such a value has
 	--- no slot and no store: its definition is deleted, and each reload of it
 	--- repeats that instruction into the reload's value.
-	remat : Map Int A.Arm
+	remat : Map Int i
 	--- Reload value id -> the spilled or rematerialized value it reloads.
 	reloadOf : Map Int Int
 	--- The reloads read more than once. Only these may be evicted: a later
@@ -1294,7 +1406,7 @@ type Spills = Spills {
 	var stores     : Int
 }
 
-fun newSpills() -> Spills =
+fun newSpills() -> Spills i s =
 	Spills {
 		slots      = Map.new()
 		remat      = Map.new()
@@ -1304,11 +1416,12 @@ fun newSpills() -> Spills =
 		stores     = 0
 	}
 
-type Allocation = Allocation {
+--- What `allocate` answers. `s` is the target's `Slot i`.
+type Allocation i s = Allocation {
 	--- The function as allocated: unreachable blocks gone, spill code in.
-	func      : Func A.Inst
+	func      : Func i
 	colouring : Colouring
-	spills    : Spills
+	spills    : Spills i s
 	--- How many times spill code was inserted before the colouring finished.
 	rounds      : Int
 	var stopped : Option String
@@ -1322,7 +1435,7 @@ let maxRounds = 16
 --- Spill, then colour, until the colouring finishes.
 ---
 --- The input is not changed.
-fun allocate(f : Func A.Inst, roots : Map Int Int) -> Allocation {
+fun allocate[Spill i](f : Func i, roots : Map Int Int) -> Allocation i (Slot i) {
 	-- A spilled value is stored once, directly after its definition, and
 	-- reloaded into a fresh value before a read -- once for every read up to
 	-- the next call, in its block and in the blocks below it that have no
@@ -1353,7 +1466,7 @@ fun allocate(f : Func A.Inst, roots : Map Int Int) -> Allocation {
 	}
 	var going = True
 	while going {
-		let w = walk(g, spills, roots, True)
+		let w = walk(g, spills, roots, Some(spillCosts))
 		answer = Allocation {
 			func      = g
 			colouring = Colouring { of_ = w.of_, stopped = w.stopped }
@@ -1383,14 +1496,14 @@ fun allocate(f : Func A.Inst, roots : Map Int Int) -> Allocation {
 -- Each value `spill` sends to memory by repeating its definition, and that
 -- definition. Not a rooted one: its root store reads the value after its
 -- definition, and the frame table names its slot.
-fun rematerializable(g : Func A.Inst, roots : Map Int Int) -> Map Int A.Arm {
+fun rematerializations[Spill i](g : Func i, roots : Map Int Int) -> Map Int i {
 	let out = Map.new()
 	for block in g.blocks {
 		for i in block.insts {
-			if A.rematerializable(i.op) {
+			if rematerializable(i) {
 				Ssa.eachDef(i, fun(d) {
 					let id = Ssa.valueId(d)
-					if !Map.contains(roots, id) { Map.put(out, id, i.op) }
+					if !Map.contains(roots, id) { Map.put(out, id, i) }
 				})
 			}
 		}
@@ -1398,7 +1511,7 @@ fun rematerializable(g : Func A.Inst, roots : Map Int Int) -> Map Int A.Arm {
 	out
 }
 
-fun copyFunc(f : Func A.Inst) -> Func A.Inst {
+fun copyFunc(f : Func i) -> Func i {
 	let g = Ssa.newFunc(f.name, f.results)
 	g.module_ = f.module_
 	for r in f.reps { Vec.push(g.reps, r) }
@@ -1441,39 +1554,40 @@ fun copyFunc(f : Func A.Inst) -> Func A.Inst {
 -- only by the emitter. It is also why splitting at the calls costs only the
 -- loads: the store was owed anyway.
 --
--- A value `rematerializable` names gets no slot and no store. Its definition
--- is deleted, since every read of it is renamed, and its reload is a copy of
--- that definition into the reload's value: a constant is one instruction to
--- recompute, where a slot costs a store, a load, and room in the frame.
+-- A value `rematerializations` names gets no slot and no store. Its
+-- definition is deleted, since every read of it is renamed, and its reload is
+-- a copy of that definition into the reload's value: a constant is one
+-- instruction to recompute, where a slot costs a store, a load, and room in
+-- the frame.
 --
 -- Positions: a store takes its definition's, a reload or a recomputation the
 -- position of the read it serves, and neither is a stepping target. A block
 -- parameter is defined at the block's start, so its store takes the position
 -- of what the block does first.
-fun spill(
-	g : Func A.Inst,
+fun spill[Spill i](
+	g : Func i,
 	ids : Set.Set Int,
 	crowded : Set.Set Int,
 	roots : Map Int Int,
-	spills : Spills,
+	spills : Spills i (Slot i),
 ) -> Unit {
 	let splitting = Set.new()
-	let remade = rematerializable(g, roots)
+	let remat = rematerializations(g, roots)
 	for id in Array.sort(Set.elements(ids)) {
 		if Map.contains(spills.reloadOf, id) {
 			Set.add(splitting, id)
 			continue
 		}
-		if let Some(op) = Map.get(remade, id) {
-			Map.put(spills.remat, id, op)
+		if let Some(def) = Map.get(remat, id) {
+			Map.put(spills.remat, id, def)
 			continue
 		}
 		let slot = match Map.get(roots, id) {
-			Some(n) -> A.RootSlot(n)
+			Some(n) -> rootSlot(g, n)
 			None -> {
 				let n = spills.spillSlots
 				spills.spillSlots = n + 1
-				A.SpillSlot(n)
+				spillSlot(g, n)
 			}
 		}
 		Map.put(spills.slots, id, slot)
@@ -1485,9 +1599,9 @@ fun spill(
 		let block = g.blocks[b]
 		-- Spilled value -> the reload standing in for it here.
 		let ready = inherited(preds, leaving, b)
-		let out : Vec A.Inst = []
+		let out : Vec i = []
 		let entered = Position.notStmt(
-			if len(block.insts) > 0 { block.insts[0].at } else { block.termAt },
+			if len(block.insts) > 0 { positionOf(block.insts[0]) } else { block.termAt },
 		)
 		for p in block.params { storeIfSpilled(out, spills, ids, Ssa.valueId(p), entered) }
 		for var n = 0; n < len(block.insts); n = n + 1 {
@@ -1496,28 +1610,32 @@ fun spill(
 			-- A value spilled into that same slot is stored there by
 			-- `storeIfSpilled` at the same point, so selection's store would
 			-- be a reload and a second write of what the slot holds.
-			if isRootStoreOfSpilled(i.op, ids, spills) { continue }
+			if isRootStoreOfSpilled(g, i, ids, spills) { continue }
 			if Ssa.anyDef(i, fun(d) = isRemade(Ssa.valueId(d), ids, splitting, spills)) {
 				continue
 			}
-			var op = i.op
+			var renamed = i
 			for id in Array.sort(Set.elements(usedSpilled(Ssa.uses(i), ids))) {
-				let t = standIn(g, out, spills, ready, crowded, id, Position.notStmt(i.at))
-				op = A.mapUses(op, renamed(_, id, t))
+				let t = standIn(g, out, spills, ready, crowded, id, Position.notStmt(positionOf(i)))
+				renamed = Ssa.renameUses(renamed, renamedValue(_, id, t))
 			}
-			Vec.push(out, A.Inst { op = op, at = i.at })
-			-- A call that defines its own result (`Allocate`) keeps its
-			-- safepoint map directly after it, where the frame expects it, and
-			-- the result's spill store goes after the map.
-			if A.isCall(i)
-					&& n + 1 < len(block.insts)
-					&& Option.isSome(A.safepointOf(block.insts[n + 1].op)) {
+			Vec.push(out, renamed)
+			-- A call that defines its own result (on arm64, `Allocate`) keeps
+			-- its safepoint map directly after it, where the frame expects
+			-- it, and the result's spill store goes after the map.
+			if isCall(i) && n + 1 < len(block.insts) && isSafepointMap(block.insts[n + 1]) {
 				Vec.push(out, block.insts[n + 1])
 				n = n + 1
 			}
 			Ssa.eachDef(
 				i,
-				fun(d) = storeIfSpilled(out, spills, ids, Ssa.valueId(d), Position.notStmt(i.at)),
+				fun(d) = storeIfSpilled(
+					out,
+					spills,
+					ids,
+					Ssa.valueId(d),
+					Position.notStmt(positionOf(i)),
+				),
 			)
 			if endsReloads(i) { clear(ready) }
 		}
@@ -1538,10 +1656,10 @@ fun spill(
 
 -- The value to read in place of the spilled or split `id`, loading it at the
 -- end of `out` with position `at` if nothing loaded already stands in for it.
-fun standIn(
-	g : Func A.Inst,
-	out : Vec A.Inst,
-	spills : Spills,
+fun standIn[Spill i](
+	g : Func i,
+	out : Vec i,
+	spills : Spills i (Slot i),
 	ready : Map Int Int,
 	crowded : Set.Set Int,
 	id : Int,
@@ -1566,8 +1684,7 @@ fun standIn(
 -- Whether an instruction ends every reload's stretch: a call, which destroys
 -- the registers a reload could otherwise keep, or an allocation or a poll, at
 -- which the collector may run.
-fun endsReloads(i : A.Inst) -> Bool =
-	A.isCall(i) || Option.isSome(A.pollOf(i.op))
+fun endsReloads[Spill i](inst : i) -> Bool = isCall(inst) || isPoll(inst)
 
 -- What a block starts out knowing from above, as `leaving` records each
 -- block's end: its predecessor's, if it has exactly one and that one is
@@ -1610,15 +1727,24 @@ fun clear(m : Map Int v) -> Unit {
 -- Whether `spill` deletes the definition of `id`, because each of its reads
 -- gets a reload of its own instead: a reload being split, or a value being
 -- rematerialized.
-fun isRemade(id : Int, ids : Set.Set Int, splitting : Set.Set Int, spills : Spills) -> Bool =
+fun isRemade(id : Int, ids : Set.Set Int, splitting : Set.Set Int, spills : Spills i s) -> Bool =
 	Set.contains(splitting, id) || (Set.contains(ids, id) && Map.contains(spills.remat, id))
 
-fun isRootStoreOfSpilled(op : A.Arm, ids : Set.Set Int, spills : Spills) -> Bool =
-	match A.slotStore(op) {
-		Some((v, m)) -> A.isRootSlot(m)
-			&& Set.contains(ids, v)
-			&& show(m) == show(Map.getOr(spills.slots, v, A.SpillSlot(-1)))
-		None -> False
+fun isRootStoreOfSpilled[Spill i](
+	g : Func i,
+	inst : i,
+	ids : Set.Set Int,
+	spills : Spills i (Slot i),
+) -> Bool = match slotStore(inst) {
+	Some((v, m)) -> isRootSlot(g, m) && Set.contains(ids, v) && spilledInto(g, spills, v, m)
+	None         -> False
+}
+
+-- Whether `m` is the slot value `id` was spilled into.
+fun spilledInto[Spill i](g : Func i, spills : Spills i (Slot i), id : Int, m : Slot i) -> Bool =
+	match Map.get(spills.slots, id) {
+		Some(slot) -> slotName(g, slot) == slotName(g, m)
+		None       -> False
 	}
 
 fun usedSpilled[Iterator c, Item c ~ Value](vs : c, ids : Set.Set Int) -> Set.Set Int {
@@ -1629,16 +1755,16 @@ fun usedSpilled[Iterator c, Item c ~ Value](vs : c, ids : Set.Set Int) -> Set.Se
 	out
 }
 
-fun storeIfSpilled(
-	out : Vec A.Inst,
-	spills : Spills,
+fun storeIfSpilled[Spill i](
+	out : Vec i,
+	spills : Spills i (Slot i),
 	ids : Set.Set Int,
 	id : Int,
 	at : Int,
 ) -> Unit {
 	if Set.contains(ids, id) {
 		if let Some(slot) = Map.get(spills.slots, id) {
-			Vec.push(out, A.Inst { op = A.Str(A.Virtual(id), slot, A.W64), at = at })
+			Vec.push(out, spillStore(id, slot, at))
 			spills.stores = spills.stores + 1
 		}
 	}
@@ -1646,25 +1772,22 @@ fun storeIfSpilled(
 
 -- A fresh value holding `id`, at the end of `out` with position `at`: loaded
 -- from its slot, or computed again by a copy of its definition.
-fun reload(g : Func A.Inst, out : Vec A.Inst, spills : Spills, id : Int, at : Int) -> Int {
+fun reload[Spill i](
+	g : Func i,
+	out : Vec i,
+	spills : Spills i (Slot i),
+	id : Int,
+	at : Int,
+) -> Int {
 	let t = Ssa.valueId(Ssa.freshValue(g, g.reps[id]))
 	Map.put(spills.reloadOf, t, id)
 	match Map.get(spills.slots, id) {
-		Some(slot) -> Vec.push(out, A.Inst { op = A.Ldr(A.Virtual(t), slot, A.W64), at = at })
-		None -> if let Some(op) = Map.get(spills.remat, id) {
-			Vec.push(out, A.Inst { op = remade(op, id, t), at = at })
+		Some(slot) -> Vec.push(out, spillLoad(t, slot, at))
+		None -> if let Some(def) = Map.get(spills.remat, id) {
+			Vec.push(out, remade(def, id, t, at))
 		}
 	}
 	t
-}
-
--- The definition `op` of `id`, defining `t` instead.
-fun remade(op : A.Arm, id : Int, t : Int) -> A.Arm =
-	A.rewrite(op, renamed(_, id, t), fun(m) = m)
-
-fun renamed(r : Reg, from : Int, to : Int) -> Reg = match r {
-	Virtual(n)     -> if n == from { Virtual(to) } else { r }
-	Physical(_, _) -> r
 }
 
 fun renamedValue(v : Value, from : Int, to : Int) -> Value =
@@ -1687,14 +1810,14 @@ fun renamedTerm(t : Term, from : Int, to : Int) -> Term = match t {
 --- spilling needs: a register colouring can be perfect over code whose stores
 --- and reloads are in the wrong places, and that is a wrong program which
 --- neither of the other two can see.
-fun verifyAllocation(a : Allocation) -> Vec String {
+fun verifyAllocation[Spill i](a : Allocation i (Slot i)) -> Vec String {
 	let out : Vec String = []
 	let g = a.func
 	let spills = a.spills
 	-- One value per slot.
 	let owner = Map.new()
-	for id in Map.keys(spills.slots) {
-		let name = show(Map.getOr(spills.slots, id, A.SpillSlot(-1)))
+	for (id, slot) in Map.entries(spills.slots) {
+		let name = slotName(g, slot)
 		match Map.get(owner, name) {
 			Some(other) -> Vec.push(
 				out,
@@ -1720,19 +1843,19 @@ fun verifyAllocation(a : Allocation) -> Vec String {
 		-- The reloads that may be read here: `spill`'s rule, kept apart.
 		let ready = inherited(preds, leaving, b)
 		for var n = 0; n < len(block.insts); n = n + 1 {
-			let op = block.insts[n].op
-			Ssa.eachUse(block.insts[n], fun(u) {
+			let inst = block.insts[n]
+			Ssa.eachUse(inst, fun(u) {
 				let id = Ssa.valueId(u)
 				if Map.contains(spills.slots, id) {
-					checkStore(out, spills, block, definers, b, n, id)
+					checkStore(out, g, spills, definers, b, n, id)
 				}
 				checkRematRead(out, spills, id, where_(b, n))
 				checkReloadRead(out, spills, ready, id, where_(b, n))
 			})
-			match A.slotLoad(op) {
+			match slotLoad(inst) {
 				Some((t, mem)) -> match Map.get(spills.reloadOf, t) {
 					Some(from) -> {
-						if show(mem) != show(Map.getOr(spills.slots, from, A.SpillSlot(-1))) {
+						if !spilledInto(g, spills, from, mem) {
 							Vec.push(
 								out,
 								"reload %"
@@ -1748,10 +1871,17 @@ fun verifyAllocation(a : Allocation) -> Vec String {
 						"a slot load at " + where_(b, n) + " is not a recorded reload",
 					)
 				}
-				None -> checkRemade(out, spills, ready, block.insts[n], where_(b, n))
+				None -> checkRemade(out, spills, ready, inst, where_(b, n))
 			}
-			if endsReloads(block.insts[n]) { clear(ready) }
-			if A.isCSet(op) { checkFlags(out, block, b, n) }
+			if endsReloads(inst) { clear(ready) }
+			if !flagsIntact(block, n) {
+				Vec.push(
+					out,
+					"the instruction at "
+						+ where_(b, n)
+						+ " does not follow the instruction that sets the flags it reads",
+				)
+			}
 		}
 		for u in Ssa.termUses(block.term) {
 			let id = Ssa.valueId(u)
@@ -1772,9 +1902,6 @@ fun verifyAllocation(a : Allocation) -> Vec String {
 	out
 }
 
--- Spill code: a store or a load against a frame slot.
-fun isSpillCode(op : A.Arm) -> Bool = isStore(op) || isReload(op)
-
 -- A spilled value is read by exactly one thing: the store of it to its own
 -- slot, placed directly after its definition -- after a run of other stores at
 -- most, or at the head of the block that defines it as a parameter.
@@ -1784,18 +1911,18 @@ fun isSpillCode(op : A.Arm) -> Bool = isStore(op) || isReload(op)
 -- parameters are nine in the general file -- a call this backend cannot yet
 -- select. The first version had eight here and in `checkPoint`, and `turkey`
 -- gained two stack-argument stops from its own allocator.
-fun checkStore(
+fun checkStore[Spill i](
 	out : Vec String,
-	spills : Spills,
-	block : Ssa.Block A.Inst,
+	g : Func i,
+	spills : Spills i (Slot i),
 	definers : Vec Value,
 	b : Int,
 	n : Int,
 	id : Int,
 ) -> Unit {
-	let slot = show(Map.getOr(spills.slots, id, A.SpillSlot(-1)))
-	let ok = match A.slotStore(block.insts[n].op) {
-		Some((v, mem)) -> v == id && show(mem) == slot
+	let block = g.blocks[b]
+	let ok = match slotStore(block.insts[n]) {
+		Some((v, mem)) -> v == id && spilledInto(g, spills, id, mem)
 		None           -> False
 	}
 	if !ok {
@@ -1810,9 +1937,10 @@ fun checkStore(
 		return
 	}
 	var m = n - 1
-	while m >= 0 && isStore(block.insts[m].op) { m = m - 1 }
-	-- An `Allocate`'s result is stored after its safepoint map.
-	if m >= 1 && Option.isSome(A.safepointOf(block.insts[m].op)) && A.isCall(block.insts[m - 1]) {
+	while m >= 0 && isStore(block.insts[m]) { m = m - 1 }
+	-- A call that defines its own result (on arm64, `Allocate`) has it stored
+	-- after its safepoint map.
+	if m >= 1 && isSafepointMap(block.insts[m]) && isCall(block.insts[m - 1]) {
 		m = m - 1
 	}
 	let defined = if m >= 0 {
@@ -1839,10 +1967,7 @@ fun mentions[Iterator c, Item c ~ Value](vs : c, id : Int) -> Bool {
 	False
 }
 
-fun isStore(op : A.Arm) -> Bool = match A.slotStore(op) {
-	Some(_) -> True
-	None    -> False
-}
+fun isStore[Spill i](inst : i) -> Bool = Option.isSome(slotStore(inst))
 
 -- A reload is read only where no call or poll lies between its load and the
 -- read: later in its own block, or in a block reached from the end of that one
@@ -1855,7 +1980,7 @@ fun isStore(op : A.Arm) -> Bool = match A.slotStore(op) {
 -- the register holding it is gone.
 fun checkReloadRead(
 	out : Vec String,
-	spills : Spills,
+	spills : Spills i s,
 	ready : Map Int Unit,
 	id : Int,
 	at : String,
@@ -1876,7 +2001,7 @@ fun checkReloadRead(
 -- read reads a reload instead: a copy of that definition into a fresh value,
 -- which `checkReloadRead` holds to a reload's rule, never read across a call
 -- or a poll from where it was placed.
-fun checkRematRead(out : Vec String, spills : Spills, id : Int, at : String) -> Unit {
+fun checkRematRead(out : Vec String, spills : Spills i s, id : Int, at : String) -> Unit {
 	if Map.contains(spills.remat, id) {
 		Vec.push(out, "rematerialized value %" + Int.toString(id) + " is read at " + at)
 	}
@@ -1885,18 +2010,18 @@ fun checkRematRead(out : Vec String, spills : Spills, id : Int, at : String) -> 
 -- A reload defined by anything but a slot load is a rematerialized value's,
 -- and is defined by exactly that value's definition, renamed. From there it may
 -- be read as any reload may.
-fun checkRemade(
+fun checkRemade[Spill i](
 	out : Vec String,
-	spills : Spills,
+	spills : Spills i (Slot i),
 	ready : Map Int Unit,
-	i : A.Inst,
+	inst : i,
 	at : String,
 ) -> Unit {
-	Ssa.eachDef(i, fun(d) {
+	Ssa.eachDef(inst, fun(d) {
 		let t = Ssa.valueId(d)
 		if let Some(from) = Map.get(spills.reloadOf, t) {
 			match Map.get(spills.remat, from) {
-				Some(op) -> if show(A.Inst { op = remade(op, from, t), at = i.at }) != show(i) {
+				Some(def) -> if show(remade(def, from, t, positionOf(inst))) != show(inst) {
 					Vec.push(
 						out,
 						"reload %"
@@ -1921,25 +2046,4 @@ fun checkRemade(
 			Map.put(ready, t, ())
 		}
 	})
-}
-
-fun isReload(op : A.Arm) -> Bool = match A.slotLoad(op) {
-	Some(_) -> True
-	None    -> False
-}
-
--- `cset` reads the flags, so walking back from it over other `cset`s and
--- spill code -- neither touches the flags -- has to reach the instruction that
--- set them. If it reaches anything else, something was put between the pair.
-fun checkFlags(out : Vec String, block : Ssa.Block A.Inst, b : Int, n : Int) -> Unit {
-	var m = n - 1
-	while m >= 0 && (A.isCSet(block.insts[m].op) || isSpillCode(block.insts[m].op)) {
-		m = m - 1
-	}
-	if m < 0 || !A.setsFlags(block.insts[m].op) {
-		Vec.push(
-			out,
-			"the cset at " + where_(b, n) + " does not follow the instruction that sets its flags",
-		)
-	}
 }

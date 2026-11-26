@@ -108,7 +108,6 @@ RANGE = """
 import System.Parallel as Parallel
 
 type Upto = Upto(Int)
-type UptoCursor = UptoCursor { var at : Int }
 
 instance Length Upto { fun len(Upto(n)) = n }
 
@@ -120,14 +119,9 @@ instance Index Upto {
 
 instance Iterator Upto {
     type Item = Int
-    type Cursor = UptoCursor
-    fun iter(_) = UptoCursor { at = 0 }
-    fun next(Upto(n), cursor) {
-        if cursor.at >= n { return None }
-        let i = cursor.at
-        cursor.at = i + 1
-        Some(i)
-    }
+    type Cursor = Int
+    fun iter(_) = 0
+    fun next(Upto(n), i) = if i < n { Iter.Yield(i, i + 1) } else { Iter.Done }
 }
 
 fun main() {

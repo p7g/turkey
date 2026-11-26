@@ -374,6 +374,40 @@ fun main() {
 Variables captured by the rest of the block are shared, not copied, across
 those calls ([Closures](declarations.md#anonymous-functions)).
 
+A `for` loop's position is not one of them. The loop hands each round the
+position after that round's element ([`Iterator`](builtins.md#iterator)), so
+when `bind` runs the rest of the loop several times, each run goes on from its
+own element's position, as nested loops would. Here every `y` goes on to both
+rounds of `x = 2`, and the loop ends four times:
+
+<!-- run -->
+```kotlin
+fun pairs() {
+    for x in [1, 2] {
+        let y = ["a", "b"]?
+        print(show(x) + y)
+    }
+    [()]
+}
+
+fun main() {
+    print(len(pairs()))
+}
+```
+
+```text
+1a
+1b
+2a
+2b
+2a
+2b
+4
+```
+
+A source that keeps its own position, such as `Iter.resumable(xs)`, is shared
+like any other captured state: every run steps the one position.
+
 A loop holding a `?` goes round again inside the function it hands to `bind`.
 When `bind` calls that function last, as `Option`'s does, or returns a
 function that does, as a reader's or a state monad's does, the call is a

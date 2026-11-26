@@ -1039,8 +1039,9 @@ chooses among them. Its value is spelled `arch-os`: `arm64-darwin`,
 itself runs on. The two arm64 targets produce an executable. `wasm32-wasi`
 produces a WebAssembly module, `main.wasm` for `main.gob`, which a WASI host
 such as `wasmtime run main.wasm` runs. The wasm backend does not compile every
-operation yet: a function that uses one it cannot, such as a coroutine's
-switch, is built as a trap, and the build warns how many there are.
+operation yet: a function that uses one it cannot is built as a trap, and the
+build warns how many there are. Tasks run on `wasm32-wasi`, all of them on the
+program's one thread.
 
 ```sh
 turkey build --target arm64-linux main.gob

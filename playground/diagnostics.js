@@ -1,10 +1,10 @@
 // Filters the compiler's diagnostics for the page. No DOM, so node loads it.
 
 // The wasm32 backend refuses some functions and compiles each to a trap. It
-// warns on every compile, "main.gob: warning: N functions use operations the
-// wasm32 backend does not compile yet ...", and counts the runtime's own
-// refused functions along with the user's. The count says nothing certain: a
-// program that prints and one that only spawns tasks both report 2.
+// warns once per compile that has any, "main.gob: warning: N functions use
+// operations the wasm32 backend does not compile yet ...", and counts the
+// library's refused functions along with the user's, whether the program
+// calls them or not.
 const REFUSED = /functions? use operations the wasm32 backend does not compile yet/;
 
 // Returns the diagnostics to show for a program, trimmed. The refused-functions

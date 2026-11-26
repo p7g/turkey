@@ -142,6 +142,7 @@ export (
 --- ids are, and two types when `typeKey` says so.
 
 import Data.Set as Set
+import System.Sync as Sync
 import Turkey.Diag as Diag
 import Turkey.Prelude as P
 import Turkey.Source (Span(..), isGenerated)
@@ -174,10 +175,7 @@ type Kind
 
 fun kstar() -> Kind = KStar
 
-fun kvar() -> Kind {
-	counters.kind = counters.kind + 1
-	KVar(KCell { id = counters.kind, ref = None })
-}
+fun kvar() -> Kind = KVar(KCell { id = Sync.addAndGet(counters.kind, 1), ref = None })
 
 fun kprune(k : Kind) -> Kind = match k {
 	KVar(cell) -> match cell.ref {
@@ -355,13 +353,24 @@ let equals = "~"
 
 -- Global counters. The values never reach any output -- `show` names variables
 -- positionally -- so all that matters is that two live cells never share one.
+--
+-- Each is atomic because passes that run on several workers at once make
+-- cells: the Core checker instantiates a builtin's scheme afresh at every use.
+-- A plain read-add-store can lose an update, and a worker paused between its
+-- read and its store then stores a count below one another worker has already
+-- handed out. Two binders of one scheme can then share an id, and substituting
+-- for one substitutes for both.
 type Counters = Counters {
-	var kind   : Int
-	var tyvar  : Int
-	var skolem : Int
+	kind   : Sync.AtomicInt
+	tyvar  : Sync.AtomicInt
+	skolem : Sync.AtomicInt
 }
 
-let counters = Counters { kind = 0, tyvar = 0, skolem = 0 }
+let counters = Counters {
+	kind   = Sync.atomicInt(0)
+	tyvar  = Sync.atomicInt(0)
+	skolem = Sync.atomicInt(0)
+}
 
 -- The rigid constants an existential pattern opened, by `uid`, and the
 -- constructor that opened each. A signature's constants are not here, which is
@@ -412,10 +421,8 @@ fun markHeaderVar(cell : VarCell) -> Unit = Set.add(headerVars.ids, cell.id)
 --- Returns whether a partial annotation's header names `cell`.
 fun isHeaderVar(cell : VarCell) -> Bool = Set.contains(headerVars.ids, cell.id)
 
-fun newVar(level : Int, kind : Kind) -> VarCell {
-	counters.tyvar = counters.tyvar + 1
-	VarCell { id = counters.tyvar, level = level, ref = None, kind = kind }
-}
+fun newVar(level : Int, kind : Kind) -> VarCell =
+	VarCell { id = Sync.addAndGet(counters.tyvar, 1), level = level, ref = None, kind = kind }
 
 fun freshVar(level : Int) -> VarCell = newVar(level, kvar())
 
@@ -426,10 +433,8 @@ fun tcon(name : String, kind : Kind, level : Int) -> Type =
 
 --- A fresh skolem's cell: rigid, and a type distinct from every other skolem's
 --- whatever it is called.
-fun skolemCon(name : String, kind : Kind) -> ConCell {
-	counters.skolem = counters.skolem + 1
-	ConCell { name = name, kind = kind, level = noScope, uid = counters.skolem }
-}
+fun skolemCon(name : String, kind : Kind) -> ConCell =
+	ConCell { name = name, kind = kind, level = noScope, uid = Sync.addAndGet(counters.skolem, 1) }
 
 -- -- names --------------------------------------------------------------------------
 

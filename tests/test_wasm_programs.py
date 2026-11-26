@@ -424,6 +424,36 @@ def test_multiple_results(stress):
     assert (result.returncode, result.stdout) == (0, "-7\n12\n"), result.stderr
 
 
+# A call's results are all written as it returns, so none may share a local
+# with another, whichever of them the caller reads.
+SOME_OF_SEVERAL_RESULTS = """\
+import System.Env as Env
+
+fun stats(xs : Array Int, i : Int, low : Int, high : Int, sum : Int) -> (Int, Int, Int) =
+    if i == len(xs) { (low, high, sum) }
+    else { stats(xs, i + 1, if xs[i] < low { xs[i] } else { low },
+                 if xs[i] > high { xs[i] } else { high }, sum + xs[i]) }
+
+fun main() {
+    let k = len(Env.args())
+    let xs = [3 + k, -7, 12, 0, 5 * k]
+    let (low, _, sum) = stats(xs, 0, xs[0], xs[0], 0)
+    print(low)
+    print(sum)
+    let (_, high, _) = stats(xs, 0, xs[0], xs[0], 0)
+    print(high)
+    let (a, b, c) = stats(xs, 1, xs[1], xs[1], k)
+    print(a + b * 100 + c * 10000)
+}
+"""
+
+
+@both
+def test_some_of_several_results(stress):
+    result = _run(SOME_OF_SEVERAL_RESULTS, stress=stress)
+    assert (result.returncode, result.stdout) == (0, "-7\n8\n12\n51193\n"), result.stderr
+
+
 FLOATS = """\
 import System.Env as Env
 

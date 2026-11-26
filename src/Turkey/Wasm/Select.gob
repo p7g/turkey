@@ -11,13 +11,12 @@ export (
 
 --- The low IR to WebAssembly: one function's body as `Turkey.Wasm` instructions.
 ---
---- **Every value is a local.** Nothing is allocated to registers: each value
---- is held in the local `Turkey.Wasm.Locals` gives it, a local shared only by
---- values that are never live at once, the parameters first as wasm numbers
---- them, and selection
---- adds locals for its own temporaries. An instruction reads its operands with
---- `local.get` and writes its result with `local.set`, so no value stays on
---- the operand stack between two low IR instructions.
+--- **Every value is a local.** Each value is held in a local shared only by
+--- values that are never live at once (`localsOf`), the parameters first as
+--- wasm numbers them, and selection adds locals for its own temporaries. An
+--- instruction reads its operands with `local.get` and writes its result with
+--- `local.set`, so no value stays on the operand stack between two low IR
+--- instructions.
 ---
 --- **Control flow is `Turkey.Wasm.Structure`'s.** The graph becomes nested
 --- `block`, `loop` and `if`, and each block's code is placed where that tree
@@ -69,12 +68,12 @@ import Turkey.LowIr (
 	Callee(..),
 	IndexCheck(..),
 )
+import Turkey.Regalloc as Regalloc
 import Turkey.Roots as Roots
 import Turkey.Runtime as Rt
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Value(..), Rep(..), RepClass(..), Func(..), Block(..))
 import Turkey.Wasm as W
-import Turkey.Wasm.Locals as Locals
 import Turkey.Wasm.Module as M
 import Turkey.Wasm.Structure as St
 
@@ -153,11 +152,7 @@ type Selected = Selected {
 
 --- Returns the wasm type a value of `r` is held in. A narrow integer is an
 --- `i32`, zero-extended from its width, and a unit is an `i32` holding 0.
-fun valType(r : Rep) -> W.ValType = match r.class_ {
-	I64 | Ptr -> W.I64
-	F64       -> W.F64
-	_         -> W.I32
-}
+fun valType(r : Rep) -> W.ValType = storageType(L.storageOf(r.class_))
 
 --- Returns the type an import takes an argument of `r` at. A pointer is the
 --- memory's own 32-bit address, which is what the host reads; everything
@@ -313,10 +308,8 @@ fun selectFunction(cx : Context, f : Func Low) -> Selected {
 }
 
 fun start(cx : Context, f : Func Low) -> Sel {
-	let held = Locals.allocate(f, valType)
+	let (local, locals) = localsOf(f)
 	let params = len(f.params)
-	let locals = []
-	for var k = params; k < len(held.types); k = k + 1 { Vec.push(locals, held.types[k]) }
 	let frame = Roots.analyze(f)
 	-- Every shadow frame has the header, so that a walk can step over one
 	-- whatever it holds; a function with neither roots nor objects has no
@@ -343,7 +336,7 @@ fun start(cx : Context, f : Func Low) -> Sel {
 		cx           = cx
 		out          = []
 		locals       = locals
-		local        = held.local
+		local        = local
 		params       = params
 		stopped      = None
 		frame        = frame
@@ -362,6 +355,97 @@ fun start(cx : Context, f : Func Low) -> Sel {
 		entered      = Map.new()
 		called       = Map.new()
 	}
+}
+
+-- Returns the local of each of `f`'s values, by value id, and the types of
+-- the locals it declares for them, in index order after its parameters. A
+-- value of a block the entry does not reach has the local -1.
+--
+-- `Regalloc.colour` gives each value a register of its storage's file, and a
+-- file's registers become locals of that file's type. The colouring keeps
+-- what selection relies on (`Turkey.LowIr`'s `Colour` instance): a value
+-- shares a local with no value live where it is written, with no operand of
+-- the instruction that writes it, and a call's results with nothing the call
+-- reads. A block parameter prefers the register of a value a jump passes it,
+-- and `code` leaves out the moves that makes empty.
+fun localsOf(f : Func Low) -> (Array Int, Vec W.ValType) {
+	let c = Regalloc.colour(f)
+	if let Some(why) = c.stopped { error("internal error: wasm locals stopped at " + why) }
+	let params = len(f.params)
+	let local = Array.filled(len(f.reps), -1)
+	let files = Regalloc.files(f)
+	-- A file's registers, renamed to locals, by file and register.
+	let renamed : Array (Vec Int) = Array.map(files, fun(_) = [])
+	for var id = 0; id < len(f.reps); id = id + 1 {
+		let r = c.of_[id]
+		if r >= 0 {
+			let held = renamed[Regalloc.fileIndex(f, Regalloc.fileOf(f, id))]
+			while len(held) <= r { Vec.push(held, -1) }
+		}
+	}
+	-- Wasm holds the parameters in locals 0 up. A register is only a name, so
+	-- renaming a file's registers one to one keeps the colouring, and each
+	-- parameter's register is renamed to the parameter's local. The walk
+	-- places every parameter before it releases any, so we know they hold
+	-- distinct registers.
+	for var k = 0; k < params; k = k + 1 {
+		let id = Ssa.valueId(f.params[k])
+		local[id] = k
+		let held = renamed[Regalloc.fileIndex(f, Regalloc.fileOf(f, id))]
+		if held[c.of_[id]] >= 0 { error("internal error: two wasm parameters share a register") }
+		held[c.of_[id]] = k
+	}
+	-- The rest of each file's registers are declared locals, a file's
+	-- together, so that they declare as one run of a type.
+	let locals = []
+	for file in files {
+		if holdsBits(file) {
+			let held = renamed[Regalloc.fileIndex(f, file)]
+			for var r = 0; r < len(held); r = r + 1 {
+				if held[r] < 0 {
+					held[r] = params + len(locals)
+					Vec.push(locals, storageType(file))
+				}
+			}
+		}
+	}
+	-- Every unit but a parameter is held in one `i32` local, which only ever
+	-- holds 0. A local starts at 0, and in every function every write to a
+	-- unit's local writes 0: what it writes is read from a unit's local (a
+	-- unit argument, a unit a call returns, a jump's unit argument), loaded
+	-- from a cell or global that only a unit's local was stored into
+	-- (`loadWord`), or the 0 `load` pushes for a unit field. A unit nothing
+	-- writes, such as a `ConstUnit`, therefore reads as 0 wherever it is read,
+	-- whichever unit last wrote the local.
+	var unit = -1
+	for var id = 0; id < len(f.reps); id = id + 1 {
+		let r = c.of_[id]
+		if local[id] < 0 && r >= 0 {
+			let file = Regalloc.fileOf(f, id)
+			if !holdsBits(file) {
+				if unit < 0 {
+					unit = params + len(locals)
+					Vec.push(locals, W.I32)
+				}
+				local[id] = unit
+			} else {
+				local[id] = renamed[Regalloc.fileIndex(f, file)][r]
+			}
+		}
+	}
+	(local, locals)
+}
+
+-- Returns the wasm type a local of storage `s` has.
+fun storageType(s : L.Storage) -> W.ValType = match s {
+	L.Word             -> W.I64
+	L.Double           -> W.F64
+	L.Small | L.NoBits -> W.I32
+}
+
+fun holdsBits(s : L.Storage) -> Bool = match s {
+	L.NoBits -> False
+	_        -> True
 }
 
 -- Whether some site of `f` has a root live in its frame: a slot, or a traced
@@ -763,7 +847,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
 			op(s, W.ConstF64(x))
 			set(s, d)
 		}
-		-- A unit's local only ever holds 0 (`Turkey.Wasm.Locals`).
+		-- A unit's local only ever holds 0 (`localsOf`).
 		ConstUnit -> {}
 		-- A literal is a static object in data, so reading one is its address.
 		ConstString(text) -> {

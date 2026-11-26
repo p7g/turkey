@@ -59,6 +59,14 @@ def _host(inputs: tuple[Path, Path], tmp_path: Path, source: str, stdin: str | N
     return json.loads(result.stdout)
 
 
+def test_diagnostics_filter():
+    """The page keeps a refused-functions warning unless it is the baseline's."""
+    node = toolchain.needs_node()
+    result = subprocess.run([node, str(REPO_ROOT / "tests" / "playground_diagnostics.test.mjs")],
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr[-4000:]
+
+
 def test_hello_world_compiles_and_runs(inputs, tmp_path):
     result = _host(inputs, tmp_path, 'fun main() {\n\tprint("hello, world")\n}\n')
     assert result["compiled"]["status"] == 0, result["compiled"]["diagnostics"]

@@ -35,6 +35,8 @@ export (
 	anchorAt,
 	carryHolds,
 	Inst(..),
+	Slot(..),
+	slotLiveness,
 	eachUse,
 	eachDef,
 	freshValue,
@@ -535,7 +537,14 @@ class Inst i : Show i {
 	--- by the source everywhere. An instantiation answers `None` for anything it
 	--- does not want renamed, including a copy between representations.
 	fun copyOf(i) -> Option (Value, Value)
+	--- Which slot the instruction loads or stores, if it is a slot access
+	--- (`slotLiveness`). An instruction type with no slots keeps the default.
+	fun slotOf(inst : i) -> Slot = NoSlot
 }
+
+--- How an instruction touches its function's slots: numbered local storage,
+--- each read by loads and written by stores, which are not SSA values.
+type Slot = NoSlot | Loads(Int) | Stores(Int)
 
 fun eachUse[Inst i](i : i, f : fun(Value) -> Unit) -> Unit {
 	let _ = anyUse(i, fun(v) {
@@ -1175,6 +1184,58 @@ fun transfer[Inst i](f : Func i, b : Int, out : BitSet, into : BitSet) -> Unit {
 	for p in block.params {
 		let _ = BitSet.remove(into, valueId(p))
 	}
+}
+
+--- Returns, for each block of `f`, the slots below `count` live on entry to
+--- it: loaded in the block before any store to them there, or live on entry
+--- to a successor and not stored in the block. Each block's slots are in an
+--- order that depends only on `f`.
+fun slotLiveness[Inst i](f : Func i, count : Int) -> Vec (Vec Int) {
+	-- Each block's live slots twice: as a list, in the order found, and as a
+	-- bitset, to ask whether one is there already. The order is the one
+	-- `Turkey.Promote` gives the parameters a block gains.
+	--
+	-- Iterated to the fixpoint, unlike `livenessInOut`: a slot is stored any
+	-- number of times, so a store does not dominate the loads it reaches,
+	-- which the loop-forest pass there relies on.
+	let live : Vec (Vec Int) = []
+	let liveSet : Vec BitSet = []
+	let stored : Vec BitSet = []
+	for block in f.blocks {
+		let loads = []
+		let loadSet = BitSet.new(count)
+		let stores = BitSet.new(count)
+		for inst in block.insts {
+			match slotOf(inst) {
+				Loads(slot) ->
+					if !BitSet.contains(stores, slot) && !BitSet.contains(loadSet, slot) {
+						BitSet.add(loadSet, slot)
+						Vec.push(loads, slot)
+					}
+				Stores(slot) -> BitSet.add(stores, slot)
+				NoSlot       -> {}
+			}
+		}
+		Vec.push(live, loads)
+		Vec.push(liveSet, loadSet)
+		Vec.push(stored, stores)
+	}
+	var changed = True
+	while changed {
+		changed = False
+		for var b = len(f.blocks) - 1; b >= 0; b = b - 1 {
+			for target in successors(f.blocks[b].term) {
+				for slot in live[blockId(target)] {
+					if !BitSet.contains(stored[b], slot) && !BitSet.contains(liveSet[b], slot) {
+						BitSet.add(liveSet[b], slot)
+						Vec.push(live[b], slot)
+						changed = True
+					}
+				}
+			}
+		}
+	}
+	live
 }
 
 --- The loop-nesting forest of the blocks the entry reaches, or `None` if some

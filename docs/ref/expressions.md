@@ -714,6 +714,8 @@ value. `show` of a `String` is the string itself, so a string goes in without
 quotes. The holes are evaluated once each, left to right, and the literal's
 type is always `String`.
 
+A [multi-line string](lexical.md#multi-line-strings) takes holes the same way.
+
 <!-- run -->
 ```kotlin
 fun main() {

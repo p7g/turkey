@@ -268,7 +268,8 @@ def test_the_tools_worker_checks_every_file_with_the_library(inputs, tmp_path):
         ("main.gob", "unused-variable", 4, 4),
     ]
     # The same check gives the types of every file's bindings, warnings and
-    # all.
+    # all, and the status the Types view reads them by.
+    assert checked["status"] == 0
     assert checked["types"] == [
         {"file": "Shapes.gob", "line": 3, "column": 1, "name": "area", "type": "fun(Int) -> Int"},
         {"file": "main.gob", "line": 3, "column": 1, "name": "main", "type": "fun() -> Unit"},

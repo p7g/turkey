@@ -124,7 +124,7 @@ export function startSession(elements, { lazy = false, editable = false, timeLim
     const key = keyOf(data.files);
     if (data.diagnostics !== null && key === keyOf(files.all())) {
       checked = key;
-      const view = typesFor(data.diagnostics, data.types, files.list().map((f) => f.name));
+      const view = typesFor(data.status, data.types, files.list().map((f) => f.name));
       showTypes(view);
       for (const file of files.list()) {
         const problems = marksFor(file.textarea.value, data.diagnostics, file.name);
@@ -164,6 +164,13 @@ export function startSession(elements, { lazy = false, editable = false, timeLim
       flushHighlight();
       checkWhenIdle();
     },
+    // Another program's types would name bindings this one may not have, at
+    // positions in other text, so they are forgotten, not kept as out of
+    // date.
+    onReplace() {
+      lastTypes = null;
+      awaitTypes();
+    },
   });
 
   // -- The Types tab -----------------------------------------------------------
@@ -174,11 +181,17 @@ export function startSession(elements, { lazy = false, editable = false, timeLim
   // again, marked as out of date, rather than leaving the tab empty for
   // every typo.
   let lastTypes = null;
-  renderTypes(typesPanel, null, {
-    message: lazy
-      ? "The types appear once the compiler has loaded: edit the program, or press Run."
-      : "The types appear once the compiler has loaded.",
-  });
+  // Says that the types will come, and when.
+  function awaitTypes() {
+    let message = "The types appear once the program has been checked.";
+    if (!toolsReady) {
+      message = lazy
+        ? "The types appear once the compiler has loaded: edit the program, or press Run."
+        : "The types appear once the compiler has loaded.";
+    }
+    renderTypes(typesPanel, null, { message });
+  }
+  awaitTypes();
   function showTypes(view) {
     if (view.current) {
       lastTypes = view;
@@ -642,9 +655,11 @@ export function startSession(elements, { lazy = false, editable = false, timeLim
 
   // -- Keyboard shortcuts --------------------------------------------------------
 
-  // Caught before the editor sees the key, so that none types a character.
-  // A press of a disabled button does nothing, so a shortcut does what its
-  // button would.
+  // Caught before the editor sees the key, so that none types a character,
+  // even held down; a held key presses its button once. A press of a
+  // disabled button does nothing, so a shortcut does what its button would.
+  // On a link, Ctrl+Enter and Cmd+Enter open it in a new tab, so there they
+  // are left to the browser.
   const mac = /Mac|iPhone|iPad/.test(navigator.userAgentData?.platform ?? navigator.platform);
   for (const [action, button, label] of [
     ["run", runButton, "Run"],
@@ -658,8 +673,11 @@ export function startSession(elements, { lazy = false, editable = false, timeLim
     "keydown",
     (event) => {
       const action = shortcutFor(event);
-      if (action !== null) {
-        event.preventDefault();
+      if (action === null || (action === "run" && event.target.closest?.("a[href]"))) {
+        return;
+      }
+      event.preventDefault();
+      if (!event.repeat) {
         (action === "run" ? runButton : formatButton).click();
       }
     },

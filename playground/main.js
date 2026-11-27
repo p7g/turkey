@@ -205,9 +205,17 @@ picker.addEventListener("change", async () => {
 // -- The Options menu ------------------------------------------------------------
 
 // A `<details>`, so it opens and closes with no script. Its body floats over
-// the page, so it also closes on a click outside it, and on Escape, which
-// gives the focus back to its summary.
+// the page, so it also closes on a click outside it, when the focus leaves
+// it, and on Escape, which gives the focus back to its summary.
 const options = $("options");
+// Focus that goes nowhere, as a click on the menu's own padding sends it in
+// some browsers, is left to the click handler below.
+options.addEventListener("focusout", (event) => {
+  const to = event.relatedTarget;
+  if (options.open && to !== null && !options.contains(to)) {
+    options.open = false;
+  }
+});
 document.addEventListener("click", (event) => {
   if (options.open && !options.contains(event.target)) {
     options.open = false;

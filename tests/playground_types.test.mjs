@@ -11,8 +11,6 @@ import { nameRange, typeMarksFor, typesFor } from "../playground/types.js";
 
 // Bindings as `turkey check --types=json` writes them.
 const at = (file, line, column, name, type) => ({ file, line, column, name, type });
-const error = { severity: "error" };
-const warning = { severity: "warning" };
 
 // The files come in the order the page lists them, whatever the compiler's,
 // and a file's bindings in the order of their positions.
@@ -23,7 +21,7 @@ const warning = { severity: "warning" };
     at("main.gob", 3, 6, "a", "String"),
     at("main.gob", 1, 1, "main", "fun() -> Unit"),
   ];
-  const view = typesFor([warning], types, ["main.gob", "Shapes.gob", "Empty.gob"]);
+  const view = typesFor(0, types, ["main.gob", "Shapes.gob", "Empty.gob"]);
   assert.equal(view.current, true);
   assert.deepEqual(
     view.files.map(({ file, bindings }) => [file, bindings.map((b) => b.name)]),
@@ -36,14 +34,17 @@ const warning = { severity: "warning" };
 }
 
 // A file the page no longer has is left out.
-assert.deepEqual(typesFor([], [at("Gone.gob", 1, 1, "x", "Int")], ["main.gob"]).files, []);
+assert.deepEqual(typesFor(0, [at("Gone.gob", 1, 1, "x", "Int")], ["main.gob"]).files, []);
 
-// A check that found an error and wrote no types says nothing about the
-// program; one that found an error after the types were written, or none,
-// is current.
-assert.equal(typesFor([error], [], ["main.gob"]).current, false);
-assert.equal(typesFor([error], [at("main.gob", 1, 1, "main", "fun() -> Unit")], ["main.gob"]).current, true);
-assert.equal(typesFor([], [], ["main.gob"]).current, true);
+// A check that stopped before it wrote the types says nothing about the
+// program: an error (status 1), a panic (101) or a trap (null), which may
+// leave no diagnostic at all. One that exited cleanly, or found an error
+// after the types were written, is current.
+assert.equal(typesFor(1, [], ["main.gob"]).current, false);
+assert.equal(typesFor(101, [], ["main.gob"]).current, false);
+assert.equal(typesFor(null, [], ["main.gob"]).current, false);
+assert.equal(typesFor(1, [at("main.gob", 1, 1, "main", "fun() -> Unit")], ["main.gob"]).current, true);
+assert.equal(typesFor(0, [], ["main.gob"]).current, true);
 
 // A `fun` is placed at its keyword, and its name is found after it; a
 // variable is placed at its name.
@@ -94,11 +95,17 @@ assert.equal(shortcutFor(key("Enter", "Enter", { ctrlKey: true })), "run");
 assert.equal(shortcutFor(key("Enter", "NumpadEnter", { metaKey: true })), "run");
 assert.equal(shortcutFor(key("Enter", "Enter")), null);
 assert.equal(shortcutFor(key("Enter", "Enter", { ctrlKey: true, shiftKey: true })), null);
-assert.equal(shortcutFor(key("Enter", "Enter", { ctrlKey: true, repeat: true })), null);
+// A held key still asks, so that the page keeps it from typing; the page
+// presses the button only for the first.
+assert.equal(shortcutFor(key("Ï", "KeyF", { shiftKey: true, altKey: true, repeat: true })), "format");
 assert.equal(shortcutFor(key("Enter", "Enter", { ctrlKey: true, isComposing: true })), null);
-// Option+Shift+F types "Ï" on a Mac, and the key's place is what counts.
+// Option+Shift+F types "Ï" on a Mac, and then the key's place is what counts.
 assert.equal(shortcutFor(key("Ï", "KeyF", { shiftKey: true, altKey: true })), "format");
 assert.equal(shortcutFor(key("F", "KeyF", { shiftKey: true, altKey: true })), "format");
+// A key that types a letter goes by the letter: on Dvorak, F is where
+// QWERTY has Y, and QWERTY's F is U.
+assert.equal(shortcutFor(key("F", "KeyY", { shiftKey: true, altKey: true })), "format");
+assert.equal(shortcutFor(key("U", "KeyF", { shiftKey: true, altKey: true })), null);
 assert.equal(shortcutFor(key("F", "KeyF", { shiftKey: true })), null);
 assert.equal(shortcutFor(key("F", "KeyF", { shiftKey: true, altKey: true, ctrlKey: true })), null);
 assert.equal(shortcutFor(key("f", "KeyF", { ctrlKey: true })), null);

@@ -5,31 +5,41 @@
 //   Shift+Alt+F, Shift+Option+F on a Mac Format
 //
 // Many editors and playgrounds use these keys for these actions, so a
-// reader's hands may know them already. Neither is a browser's own shortcut.
-// The page takes both before the editor sees them, so Option+Shift+F, which
-// types a letter on a Mac, types nothing.
+// reader's hands may know them already. Ctrl+Enter and Cmd+Enter are the
+// browser's own on a link, where they open it in a new tab, so the page
+// leaves them to the browser there. The page takes the keys before the
+// editor sees them, so Option+Shift+F, which types a letter on a Mac, types
+// nothing.
 //
 // No DOM, so node loads it.
 
 /**
  * Returns the action a `keydown` event asks for, "run" or "format", or null
- * for any other key. A key held down asks once, and a key that an input
- * method is composing with asks nothing.
+ * for any other key. A key that an input method is composing with asks
+ * nothing. A key held down asks again on each repeat; the caller decides
+ * whether a repeat acts.
  */
 export function shortcutFor(event) {
-  if (event.repeat || event.isComposing) {
+  if (event.isComposing) {
     return null;
   }
   const command = event.ctrlKey || event.metaKey;
   if (event.key === "Enter" && command && !event.shiftKey && !event.altKey) {
     return "run";
   }
-  // By the key's place, not its character: Option+Shift+F types a letter on
-  // a Mac, which `key` would hold instead of "F".
-  if (event.code === "KeyF" && event.shiftKey && event.altKey && !command) {
+  if (event.shiftKey && event.altKey && !command && isF(event)) {
     return "format";
   }
   return null;
+}
+
+// Returns whether the key is F. A key that types a letter is F when the
+// letter is, whatever the layout puts where. Option+Shift on a Mac types a
+// symbol instead, and then only the key's place is left to go by: the key
+// where QWERTY has F, which on most layouts, AZERTY among them, is F too,
+// though on Dvorak it is U.
+function isF(event) {
+  return /^[a-z]$/i.test(event.key) ? event.key.toLowerCase() === "f" : event.code === "KeyF";
 }
 
 /**

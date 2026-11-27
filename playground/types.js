@@ -9,21 +9,22 @@ import { offsetsIn } from "./diagnostics.js";
 
 /**
  * Returns what the Types view shows for one check of a program whose files
- * are named `names`, the entry first: `{ current, files }`. `diagnostics`
- * and `types` are what `check` returned. `files` holds one `{ file,
- * bindings }` for each file in `names` that has a binding, in the order of
- * `names`, and each binding is `{ name, type, line, column }`, in the order
- * of their positions in the file; a binding in a file not in `names` is left
- * out. `current` is false when the check found an error before the types
- * were known, so `types` is empty and says nothing about the program as it
- * is; it is true otherwise, even with `files` empty.
+ * are named `names`, the entry first: `{ current, files }`. `status` and
+ * `types` are what `check` returned. `files` holds one `{ file, bindings }`
+ * for each file in `names` that has a binding, in the order of `names`, and
+ * each binding is `{ name, type, line, column }`, in the order of their
+ * positions in the file; a binding in a file not in `names` is left out.
+ * `current` is false when the check stopped before the types were known, so
+ * `types` is empty and says nothing about the program as it is; it is true
+ * otherwise, even with `files` empty.
  */
-export function typesFor(diagnostics, types, names) {
-  const errors = diagnostics.some((d) => d.severity === "error");
+export function typesFor(status, types, names) {
   // The compiler writes the types once inference succeeds, and an error
   // found later, by a lint denied or by lowering, leaves them in place, so
-  // any types at all say they are the program's.
-  const current = types.length > 0 || !errors;
+  // any types at all are the program's. Without any, only a clean exit says
+  // the program has none: an error, a panic and a trap (a null status) all
+  // stop the check before the types are written.
+  const current = status === 0 || types.length > 0;
   const byFile = new Map(names.map((name) => [name, []]));
   for (const { file, name, type, line, column } of types) {
     byFile.get(file)?.push({ name, type, line, column });
@@ -94,6 +95,9 @@ export function renderTypes(container, view, { message = "", onPick = () => {} }
     return element;
   };
   container.classList.toggle("stale", view !== null && !view.current);
+  // A tab panel with nothing to focus in it takes the focus itself, so the
+  // keyboard can reach and scroll what it says.
+  container.tabIndex = 0;
   if (view === null) {
     container.replaceChildren(say(message));
     return;
@@ -130,4 +134,7 @@ export function renderTypes(container, view, { message = "", onPick = () => {} }
     parts.push(list);
   }
   container.replaceChildren(...parts);
+  if (view.files.length > 0) {
+    container.removeAttribute("tabindex");
+  }
 }

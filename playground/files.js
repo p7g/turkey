@@ -91,7 +91,8 @@ export function filesProblem(pairs) {
  * entry; without it, they only switch between files, and are hidden while
  * there is only one. `say(...parts)` reports what an action did, or why it
  * did not, as text and nodes. `requestHighlight(file, text)` is called as
- * `attachEditor` calls its own, with the file it is for.
+ * `attachEditor` calls its own, with the file it is for. `onReplace()` is
+ * called at the start of every `replace`, quiet or not.
  *
  * Returns the file set: `all()` returns the files as `[name, text]` pairs,
  * the entry first; `list()` returns the files themselves, in that order;
@@ -104,7 +105,10 @@ export function filesProblem(pairs) {
  * `quiet`. A file is `{ id, name, textarea, editor, tab }`, `editor` being
  * what `attachEditor` returned for it, and `tab` its tab, a button.
  */
-export function attachFiles(container, { editable = false, say = () => {}, requestHighlight = () => {} } = {}) {
+export function attachFiles(
+  container,
+  { editable = false, say = () => {}, requestHighlight = () => {}, onReplace = () => {} } = {},
+) {
   const panels = [...container.querySelectorAll(":scope > .editor")];
   const template = panels[0];
   const tabs = document.createElement("div");
@@ -346,6 +350,7 @@ export function attachFiles(container, { editable = false, say = () => {}, reque
   // the page's storage brings back are not the reader's edit, and are saved
   // only once the reader edits them.
   function replace(pairs, { undoable = false, quiet = false } = {}) {
+    onReplace();
     quieted = quiet;
     try {
       replaceAll(pairs, undoable);

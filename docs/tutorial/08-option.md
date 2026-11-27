@@ -1,20 +1,26 @@
 # Option, Either and `!`
 
-Turkey has no null and no exceptions. A value that may be missing is an
-`Option`, and a result that may have failed is an `Either`. Both are ordinary
-variants from the Prelude:
+Turkey has no null and no exceptions. An optional value is an `Option`, and
+the result of an operation that can fail is an `Either`. Both are ordinary
+variant types. They are declared in the Prelude, the module that every program
+imports automatically:
 
 ```text
 type Option a = None | Some(a)
 type Either l r = Left(l) | Right(r)
 ```
 
-The `a`, `l` and `r` are type parameters, so `Int.parse` returns an
-`Option Int`. By convention a `Left` holds why something failed and a
-`Right` holds the result.
+`Option` and `Either` are generic: `a`, `l` and `r` are type parameters.
+`Int.parse` returns an `Option Int`, which is `None` or a `Some` that carries
+an `Int`. By convention, `Left` carries an error and `Right` carries a result.
 
-`x!` takes the value out of an `Option` or an `Either`, and panics if there
-is none. Use it where the program's own logic makes sure the value is there.
+To use the value, match on the `Option` or the `Either`, as `main` does with
+the result of `age`.
+
+The `!` operator unwraps an `Option` without a `match`. `x!` evaluates to the
+value in a `Some`, and panics on `None`. A panic stops the program, so use `!`
+only when you know the value is there. `!` also unwraps the `Right` of an
+`Either` whose `Left` is an error type ([Errors as values](11-errors.md)).
 
 <!-- run -->
 ```kotlin
@@ -47,8 +53,8 @@ no age: 'old' is not a number
 2027
 ```
 
-A `!` on `None` stops the program with a panic. The trace names the line and
-column of the `!`:
+When `!` panics, the stack trace gives the line and column of the `!`. Here
+`Map.get` returns `None`, because the map has no `"gopher"` key:
 
 <!-- panic: unwrapped None -->
 ```kotlin
@@ -64,7 +70,7 @@ fun main() {
 80
 ```
 
-and on standard error, the panic and its trace:
+The panic message and the stack trace go to standard error:
 
 <!-- stderr -->
 ```text
@@ -73,8 +79,8 @@ panic: unwrapped None
   at main (Main.gob:5:32)
 ```
 
-Return a failure the caller should handle instead of panicking on it.
-[Errors as values](11-errors.md) shows how `?` passes one along.
+Don't panic on a failure that the caller could handle. Return the failure
+instead. [Errors as values](11-errors.md) shows how `?` propagates it.
 
 ## In the reference
 

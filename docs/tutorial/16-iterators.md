@@ -1,14 +1,22 @@
 # Iterators and cursors
 
-`for` works on any type with an `Iterator` instance. The instance gives two
-associated types, `Item` for the elements and `Cursor` for a position, and
-two methods: `iter` returns the first position, and `next` returns the
-element at a position with the position after it, or `Iter.Done`.
+To make a type iterable, implement the `Iterator` class. `for` then works on
+the type, and so does every function that takes an iterable.
 
-`next` changes nothing. A position is a value that can be kept and stepped
-from again, and a second loop over a `Countdown` starts from the top. Neither
-method asks for a length, so a type can be iterated even when it can't be
-indexed.
+Iteration in Turkey uses cursors. A cursor is an immutable value that marks a
+position in a collection. `Iterator` has two associated types and two methods:
+
+* `Item` is the type of the elements, and `Cursor` is the type of the cursors.
+* `iter(c)` returns the cursor of the first element.
+* `next(c, cursor)` returns `Iter.Yield(item, after)`, with the element at
+  `cursor` and the cursor after it, or `Iter.Done` at the end.
+
+`next` has no side effects. You can keep a cursor and resume from it, and a
+second loop over the same collection starts from the beginning. Neither method
+needs a length, so you can iterate over a type that can't be indexed, such as
+a linked list or a generated sequence.
+
+`Countdown` uses an `Int` as its cursor: the number it will yield next.
 
 <!-- run -->
 ```kotlin
@@ -44,12 +52,13 @@ fun main() {
 2 then 1
 ```
 
-`Iter.sum` and `Iter.pairwise` take any iterator, so a new type gets them
-with no more code.
+`Iter.sum` and `Iter.pairwise` accept any iterable, so they work on a
+`Countdown` with no more code.
 
-A source that keeps its own position has `()` as its cursor, and a loop over
-it goes on from where the last one stopped. `Iter.resumable(xs)` makes one,
-which splits a header from a body:
+An iterator can also be stateful. Its cursor type is then `()`, and each loop
+over it continues where the previous one stopped. `Iter.resumable(xs)` makes a
+stateful iterator from any iterable. The example reads a header with one loop
+and the body with the next:
 
 <!-- run -->
 ```kotlin

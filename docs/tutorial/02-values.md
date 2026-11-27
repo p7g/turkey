@@ -1,12 +1,10 @@
 # Values, `let` and `var`
 
-`let` gives a value a name. The program names an `Int`, a `Float`, a `Char`,
-a `String` and a `Bool` without writing a type: the compiler works out every
-name's type. A number literal takes its type from how it is used:
-`12` is an `Int` here, since `total` is made from it and passed to
-`Float.fromInt`, and the same `12` could be a `Float` elsewhere.
+`let` declares an immutable variable, and `var` declares a mutable one. You
+can assign to a `var` variable again, but not to a `let` variable.
 
-`var` makes a name that can be assigned again. A `let` name can't be.
+You don't have to write types, because the compiler infers them. The program
+declares an `Int`, a `Float`, a `Char`, a `String` and a `Bool`.
 
 <!-- run -->
 ```kotlin
@@ -35,11 +33,14 @@ A
 True
 ```
 
-A value, once it has a type, never converts to another by itself. `total`
-is an `Int`, so it becomes a `Float` through `Float.fromInt` before it is
-multiplied by a `Float`.
+Turkey has no implicit conversions. `total` is an `Int`, so the program
+converts it with `Float.fromInt` before it multiplies it by a `Float`.
 
-Assigning a name bound with `let` is an error:
+An integer literal such as `12` can be an `Int` or a `Float`, and the compiler
+infers which from how you use the value. A literal with a decimal point, such
+as `0.25`, is always a `Float`.
+
+Assigning to a `let` variable is a compile error:
 
 <!-- error: cannot assign to 'limit': it was bound with 'let' -->
 ```kotlin
@@ -49,8 +50,8 @@ fun main() {
 }
 ```
 
-A later `let` can reuse a name and hide the earlier one, which lets a value
-change type as a program works on it:
+You can declare a variable again with the same name. The new variable shadows
+the old one, and it can have a different type:
 
 <!-- run -->
 ```kotlin
@@ -65,8 +66,8 @@ fun main() {
 Some(42)
 ```
 
-`Int.parse` can fail, so it returns an `Option Int`, which
-[Option, Either and `!`](08-option.md) covers.
+`Int.parse` returns an `Option Int`, because parsing can fail.
+[Option, Either and `!`](08-option.md) explains `Option`.
 
 ## In the reference
 

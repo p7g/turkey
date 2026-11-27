@@ -1,13 +1,23 @@
 # Functions
 
-A function's body is either `= expression`, for one that fits on a line, or a
-block. A block's value is the value of its last line, so there is no
-`return` at the end.
+`fun` declares a function. Write a short body after `=`, as `square` does, and
+a longer one as a block, as `describe` does.
 
-`fun(x) = ...` without a name is a lambda, a function written where it is
-used. A short lambda that uses its parameter once can leave the parameter
-out: `_.moons > 0` is `fun(p) = p.moons > 0`, and `_.name` reads each
-planet's `name`.
+A block evaluates to its last expression, so you don't write `return` at the
+end. `if` is an expression too: in `describe`, `word` is the value of the
+branch that ran.
+
+An anonymous function, or lambda, is a `fun` without a name, such as
+`fun(p) = square(p.moons)`. You can pass one wherever a function is expected.
+
+When a lambda uses its parameter once, you can shorten it to a placeholder
+function. Write `_` for the parameter and leave out the `fun`: `_.moons > 0`
+means `fun(p) = p.moons > 0`, and `_.name` means `fun(p) = p.name`.
+
+The pipe operator `|>` passes the value on its left to the function on its
+right. On the last line of `main`, that function is `Array.map(_, _.name)`. An
+argument that is only `_` makes the whole call a function of that argument, so
+it means `fun(xs) = Array.map(xs, _.name)`.
 
 <!-- run -->
 ```kotlin
@@ -46,14 +56,11 @@ Mars has 2 moons
 ["Earth", "Mars"]
 ```
 
-`Planet` is a record, which [Records](06-records.md) covers. `if` is an
-expression, so `word` is whichever branch ran. `|>` passes the value on its
-left to the function on its right. In `Array.map(_, _.name)`, the bare `_`
-makes the whole call a function of the array, and `_.name` makes a function
-of its own, at the argument it stands in.
+`Planet` is a record type, which [Records](06-records.md) explains.
 
-Functions can call each other in any order, and a function declared inside a
-block is visible to the lines after it:
+You can declare top-level functions in any order: a function can call one that
+is declared below it. You can also declare a function inside a block. It is in
+scope for the statements after it and for itself, so it can be recursive:
 
 <!-- run -->
 ```kotlin

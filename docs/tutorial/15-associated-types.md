@@ -1,10 +1,15 @@
 # Associated types
 
-A class has one type parameter, and an *associated type* lets it refer to a
-second type that depends on the first: a container's element type, say.
-The class declares it with `type Elem c`, and each instance sets it.
-`Elem (Pair Int)` is `Int`, and `Elem (Array String)` is `String`. `first`
-returns an `Option (Elem c)`, since an array may have no first element.
+An associated type is a type that a class declares and each instance defines.
+Use one when a method's signature needs a type that depends on the instance.
+
+`Container` is a class of collections with a method `first`. What `first`
+returns depends on the container: an `Int` for a `Pair Int`, a `String` for an
+`Array String`. So the class declares the element type as an associated type,
+`type Elem c`, and each instance defines it with `type Elem = ...`.
+`Elem (Pair Int)` is `Int`, and `Elem (Array String)` is `String`.
+
+`first` returns an `Option (Elem c)`, because a container can be empty.
 
 <!-- run -->
 ```kotlin
@@ -38,9 +43,11 @@ Some("left")
 None
 ```
 
-A constraint can fix an associated type with `~`. The library's `Iterator`
-class has one for its elements, `Item`, so `total` takes anything iterable
-whose elements are `Int`s, and adds them as `Int`s:
+A constraint can require an associated type to equal another type. Write the
+equality with `~`. The library's `Iterator` class has an associated type
+`Item`, the type of the elements. The constraints `[Iterator s, Item s ~ Int]`
+require `s` to be iterable and its elements to be `Int`s. So `total` accepts
+any iterable collection of `Int`s: an array, a range, or an `Option`.
 
 <!-- run -->
 ```kotlin

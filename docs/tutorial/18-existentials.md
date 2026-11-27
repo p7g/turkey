@@ -1,13 +1,17 @@
 # Existential types
 
-A constructor can hide the type of what it holds. `Shown[Show a](a)` declares
-that a `Shown` holds a value of *some* type `a` that has a `Show` instance.
-Each `Shown` can hold a different type, and they all have the one type
-`Shown`, so an array can mix numbers, strings and options.
+An existential type hides a type parameter. Values of different types can then
+share one type, as long as they implement the same classes. Use one to build a
+heterogeneous collection.
 
-A pattern opens one, in a function's parameter or a `match` arm. Inside the
-function that opened it, the hidden type has only the instances the
-brackets declared, so `cell` can show `value` and do nothing else with it.
+`type Shown = Shown[Show a](a)` declares a constructor that accepts a value of
+any type `a` that implements `Show`. The type `Shown` has no parameter, so `a`
+is hidden: `Shown(42)` and `Shown("text")` have the same type, and you can put
+them in one array.
+
+To use the value, match on the constructor, in a parameter pattern or a
+`match` arm. You know only that the hidden type implements the classes in the
+brackets. So `cell` can show `value`, and can do nothing else with it.
 
 <!-- run -->
 ```kotlin
@@ -30,9 +34,10 @@ fun main() {
 [[True]]
 ```
 
-A record constructor can hide a type too, and its fields can be functions
-over it. That packs state together with what works on it, and the users of a
-`Counter` never learn what its state is:
+A record constructor can hide a type too, and its fields can be functions that
+take the hidden type. That gives you an abstract data type: state packaged
+with the operations on it. Code that uses a `Counter` can't depend on the type
+of its state, which is an `Int` in `ticks` and a `String` in `marks`.
 
 <!-- run -->
 ```kotlin
@@ -63,8 +68,8 @@ fun main() {
 |||
 ```
 
-The hidden type can't leave the place that opened it, so a function can't
-return the value a `Shown` holds:
+The hidden type can't escape the function or `match` arm that unpacks it. You
+can't return the value inside a `Shown`, for example:
 
 <!-- error: the type 'a' hidden by 'Shown' cannot leave the 'match' arm or function that opened it -->
 ```kotlin

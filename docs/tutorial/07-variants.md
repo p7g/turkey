@@ -1,12 +1,14 @@
 # Variants and pattern matching
 
-A type can have several constructors, each with its own payload. A `Shape` is
-a `Circle` with a radius, a `Rect` with a width and a height, or a `Point`
-with nothing.
+A variant type is a sum type, also called a tagged union: each value is one of
+several alternatives. Every alternative has a constructor, and a constructor
+can carry data. A `Shape` is a `Circle` with a radius, a `Rect` with a width
+and a height, or a `Point` with no data.
 
-`match` tries each arm's pattern in turn and runs the first that matches,
-with the pattern's names bound to the parts of the value. `|` joins two
-patterns into one arm.
+Use `match` to branch on a variant. `match` tests the patterns in order and
+runs the first arm whose pattern matches. A pattern such as `Circle(r)` binds
+the variable `r` to the data the constructor carries. `_` is a wildcard, which
+matches any value without binding it. `|` combines two patterns in one arm.
 
 <!-- run -->
 ```kotlin
@@ -44,9 +46,9 @@ a rectangle has area 10.0 and 4 corners
 a point has area 0.0 and 0 corners
 ```
 
-A `match` must cover every value. One that misses a constructor is an error
-that names what it doesn't handle, so adding a constructor to `Shape` points
-at every `match` that needs a new arm:
+A `match` must be exhaustive: its patterns must cover every possible value. If
+you miss a constructor, the compiler reports which one. So when you add a
+constructor to `Shape`, the compiler finds every `match` that needs a new arm.
 
 <!-- error: this match is not exhaustive; 'Point' is not handled -->
 ```kotlin
@@ -58,8 +60,8 @@ fun area(shape) = match shape {
 }
 ```
 
-Patterns nest, and they match literals too: `Some(0)`, `"port"` and
-`(_, 'x')` are patterns.
+You can nest patterns, and you can match literals: `Some(0)`, `"port"` and
+`(_, 'x')` are all patterns.
 
 ## In the reference
 

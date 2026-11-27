@@ -1,14 +1,22 @@
 # Modules
 
-Each `.gob` file is a module, named by its path: `Geometry.gob` beside the
-program is the module `Geometry`, and `Shapes/Circle.gob` would be
-`Shapes.Circle`. A module's `export` list names what other modules may use.
-`Shape(..)` exports the type with its constructors, and `Shape` alone would
-export the type and keep them hidden.
+Every `.gob` file is a module, and its path is its name. `Geometry.gob`, in
+the same directory as the program, is the module `Geometry`.
+`Shapes/Circle.gob` would be `Shapes.Circle`.
 
-An import loads a module and names what it brings in. `import Geometry`
-gives the qualified names `Geometry.area` and `Geometry.Shape`, `as` gives
-the module a shorter name, and a list after it brings names in unqualified.
+A module's declarations are private unless you export them. List the public
+names in an `export` declaration. `Shape(..)` exports a type with its
+constructors. `Shape` alone would export the type and keep its constructors
+private.
+
+To use a module, import it:
+
+* `import Geometry` gives you its exports under qualified names:
+  `Geometry.area`, `Geometry.Shape`.
+* `import Geometry as Geo` gives the module an alias, so you write `Geo.area`.
+* `import Geometry (Shape(..))` also imports the listed names unqualified.
+
+The program combines the last two.
 
 <!-- module: Geometry.gob -->
 ```kotlin
@@ -46,9 +54,10 @@ fun main() {
 3.14159
 ```
 
-`pi` isn't exported, so only `Geometry` can use it. The Prelude is imported
-into every module without asking, which is where `print`, `Option` and the
-qualifiers `String`, `Vec` and `Map` come from.
+`pi` isn't exported, so only `Geometry` can use it.
+
+Every module imports the Prelude automatically. The Prelude provides `print`
+and `Option`, and the qualifiers `String`, `Vec` and `Map`.
 
 ## In the reference
 

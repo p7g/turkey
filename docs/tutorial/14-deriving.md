@@ -1,20 +1,24 @@
 # Deriving
 
-Every type declaration gets `Eq` and `Hash` without asking, wherever its
-fields have them. So two values compare by their fields, and a type of your
-own works as a `Map` key with no code. `Point` below has no instance written
-and is both.
+The compiler can derive an instance of some classes: it writes the instance
+for you from the type's declaration.
 
-`Ord` is derived only when the declaration asks for it, with `: Ord` after
-the type's name. The order follows the order the constructors are written
-in, so a type has to ask: otherwise reordering its constructors would
-reorder every sort without warning. A record compares its fields from first
-to last.
+`Eq` and `Hash` are derived automatically for every type whose fields
+implement them. So you can compare two values of your own type with `==`,
+which compares their fields, and you can use the type as a `Map` key. The
+program compares two `Card`s and uses a `Point` as a key, and declares no
+instance for either.
 
-`Debug` is derived, without asking, for every type whose fields have it. It
-prints a value as Turkey would build it, and that is what `print` shows for
-each element of a collection. `dbg(x)` writes `debug(x)` to standard error
-and returns `x`, so it can wrap any expression.
+`Ord` is derived only if you ask for it. Write `: Ord` after the type's name.
+Constructors are ordered as they are declared, and records are compared field
+by field, first field first. That is why `Ord` is opt-in: if it were
+automatic, reordering a type's constructors would silently change the result
+of every sort.
+
+`Debug` is derived automatically for every type whose fields implement it.
+`debug(x)` formats a value as the expression that constructs it, and `print`
+formats the elements of a collection the same way. `dbg(x)` writes `debug(x)`
+to standard error and returns `x`, so you can wrap it around any expression.
 
 <!-- run -->
 ```kotlin
@@ -45,15 +49,15 @@ Some("origin")
 3
 ```
 
-`dbg` wrote `Point { x = 3, y = 4 }` on standard error, beside the output.
+`dbg` wrote the `Point` to standard error:
 
 <!-- stderr -->
 ```text
 Point { x = 3, y = 4 }
 ```
 
-A type has no instance of a class unless all its fields have one, and the
-error follows the fields to the one that lacks it:
+A type gets a derived instance only if all its fields implement the class.
+When one doesn't, the compile error names the field:
 
 <!-- error: 'Job' has no 'Eq': field 'run' has type 'fun() -> Int', which has no 'Eq' -->
 ```kotlin

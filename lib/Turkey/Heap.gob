@@ -2171,7 +2171,8 @@ fun fullDue() -> Bool {
 -- the bytes the sweep kept plus that budget, so the budget is the trade of
 -- time for memory.
 --
--- The budget is the square-root rule of MemBalancer (Kirisame, Shenoy and
+-- Natively the budget is a fixed 512 MiB (`nativeBudget`); on wasm32 it
+-- is the square-root rule of MemBalancer (Kirisame, Shenoy and
 -- Panchekha, "Optimal Heap Limits for Reducing Browser Memory Use", OOPSLA
 -- 2022): with L the bytes the sweep kept, g the allocation rate and s the
 -- collection rate, sqrt(L * g / s) times a tuning factor. The paper derives
@@ -2214,10 +2215,34 @@ fun fullDue() -> Bool {
 -- of linear memory against 2432, in 2% more wall time. Programs with small
 -- heaps, whose square-root budget is above the cap, collect as at the scale.
 --
+-- Natively a fixed budget does better on both counts. The rule gives the
+-- compiler's early phases, whose heaps are small, small budgets that cost
+-- little, but its parallel optimizer, which allocates fast, budgets of
+-- 300 MB and more, collected every few milliseconds. A fixed budget spends
+-- its memory evenly instead. The self-compile, medians of 7 interleaved
+-- runs:
+--
+-- | budget         | wall   | user    | footprint | minor / full |
+-- |----------------|--------|---------|-----------|--------------|
+-- | rule, 40000    | 7.07 s | 19.7 s  | 2.68 GB   | 78 / 23      |
+-- | fixed 384 MiB  | 7.27 s | 20.0 s  | 1.95 GB   | 90 / 24      |
+-- | fixed 448 MiB  | 7.14 s | 19.9 s  | 2.45 GB   | 79 / 23      |
+-- | fixed 512 MiB  | 7.03 s | 19.4 s  | 2.43 GB   | 72 / 22      |
+--
+-- 512 MiB takes 9% off the rule's footprint at no cost in time, and 384 MiB
+-- takes 27% for 3% more wall time. The footprint does not fall evenly with
+-- the budget, because the peak is set by where collections fall against the
+-- compiler's phases. A floor under the rule without the cap does not help:
+-- with a floor of 256, 384 or 512 MiB the footprint is 2.42-2.62 GB.
+-- The clamps below keep the fixed budget from changing small and mid-sized
+-- programs, whose cap is below it: `tests/programs/adt.gob`, a scaled map
+-- churn, a phase program and the compiler compiling `adt.gob` run at the
+-- same time and footprint as under the rule.
+--
 -- The budget is clamped:
 -- * Below by a twentieth of L, Julia's floor, so that a heap whose
 --   collections are cheap is not collected at every few allocations, and
---   never below `thresholdScale` times 64KB, so that a program with almost
+--   never below `thresholdScale` times 64 KiB, so that a program with almost
 --   nothing live does not collect more often than that.
 -- * Above by `thresholdScale` times the bytes the last full collection
 --   kept, so that no program collects less often than at that scale.
@@ -2229,16 +2254,17 @@ fun fullDue() -> Bool {
 -- linear memory, less the collector's own reserve (`roomUnderCeiling`), caps
 -- the budget too, and there the floor is at most 32 MiB, half the reserve,
 -- less whatever of the reserve the heap already holds, and never below
--- 64KB: a heap living in the reserve collects every so often rather than at
+-- 64 KiB: a heap living in the reserve collects every so often rather than at
 -- every few allocations, and leaves the marking at least half.
 --
 -- The next collection is full (`fullNext`) when the bytes promoted since the
 -- last full collection are more than the room left after the sweep, and,
 -- under a target, more than the floor. Under wasm32's ceiling there is no
 -- floor to wait for: past the room is the reserve, and promoted bytes that
--- stay there leave the marking nothing. A minor collection frees no old object that has
--- died. A full one frees those promoted since and those it kept itself;
--- nothing counts the dead ones, and the promoted bytes stand in for them.
+-- stay there leave the marking nothing. A minor collection frees no old
+-- object that has died. A full one frees those promoted since and those it
+-- kept itself; nothing counts the dead ones, and the promoted bytes stand
+-- in for them.
 -- Right after a full collection nothing has been promoted, so a heap held
 -- near its target collects in full only once a floor's worth has been, and
 -- one whose garbage dies young stays minor. The test is made after the
@@ -2268,6 +2294,11 @@ fun fullDue() -> Bool {
 
 -- The tuning factor of the square-root rule, in bytes^(1/2).
 let tuning : Float = 40000.0
+
+-- The young generation's budget on native targets, before the clamps.
+-- The square-root rule's rates are still smoothed there, but only wasm32
+-- reads them.
+let nativeBudget : Int = 0x2000_0000
 
 -- TURKEY_GC_TARGET, the bytes the regions in use should stay under, or 0
 -- for no target.
@@ -2323,7 +2354,10 @@ fun schedule(
 	let most = saturated(Float.fromInt(atLeast64K(liveBytesAfterFull)) * thresholdScale)
 	let fewest = if liveBytes / 20 > smallest { liveBytes / 20 } else { smallest }
 	let least = if fewest < most { fewest } else { most }
-	var budget = squareRootBudget()
+	var budget = match Target.os {
+		Wasi -> squareRootBudget()
+		_    -> nativeBudget
+	}
 	if budget > most { budget = most }
 	if budget < least { budget = least }
 	let room = if guarding { maxInt() } else { roomUnderTarget() }
@@ -2336,7 +2370,8 @@ fun schedule(
 	let nearCeiling = if nearest > 65536 { nearest } else { 65536 }
 	if ceiling < budget { budget = if ceiling > nearCeiling { ceiling } else { nearCeiling } }
 	-- Under the ceiling, wait for no floor's worth of promotion: the floor
-	-- is a twentieth of the live bytes, far more than the reserve.
+	-- is a twentieth of the live bytes, which passes the 64 MiB reserve
+	-- once more than 1.3 GB is live.
 	let promoted = liveBytes - liveBytesAfterFull
 	fullNext = if ceiling <= room {
 		promoted > (if ceiling > 0 { ceiling } else { 0 })

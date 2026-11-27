@@ -2096,8 +2096,11 @@ type Made = Made {
 	base      : Asm.Symbol
 	-- Its calls' return addresses and positions, for the trace table.
 	calls : Vec (Asm.Symbol, Int)
-	texts : Array (Option String)
-	cost  : Duration
+	-- Its safepoint maps in the order of their return addresses, for the
+	-- frame table.
+	placed : Vec Frame.SafepointMap
+	texts  : Array (Option String)
+	cost   : Duration
 }
 
 -- Selected function `i`, through the backend. It reads only what selection
@@ -2133,6 +2136,7 @@ fun backendOf(
 			variables  = []
 			base       = Emit.functionEnd(asm.dialect, i)
 			calls      = []
+			placed     = []
 			texts      = []
 			cost       = Stopwatch.elapsed(started)
 		}
@@ -2146,7 +2150,8 @@ fun backendOf(
 			}
 			let emitted = []
 			let calls = []
-			Emit.emitFunc(asm, a.func, a, l, i, debugInfo(), marks, calls, emitted)
+			let placed = []
+			Emit.emitFunc(asm, a.func, a, l, i, debugInfo(), marks, calls, placed, emitted)
 			let (code, inlined, variables) = if debugInfo() {
 				Dwarf.inlinedCalls(
 					asm.dialect,
@@ -2175,6 +2180,7 @@ fun backendOf(
 				variables  = variables
 				base       = base
 				calls      = calls
+				placed     = placed
 				texts      = texts
 				cost       = Stopwatch.elapsed(started)
 			}
@@ -2321,9 +2327,11 @@ fun emitModule(
 	}
 	let lows = Map.new()
 	for low in module_.functions { Map.put(lows, low.name, low) }
-	-- Each function's frame layout is kept: the frame table is one section
-	-- after the code, and its entries are those layouts' safepoint maps.
+	-- Each function's frame layout is kept, and its safepoint maps in the
+	-- order `Emit.emitFunc` placed them: the frame table is one section after
+	-- the code, and its entries are those maps.
 	let layouts = []
+	let placed = []
 	-- With `-g`, each laid-out function's inlined calls and variables, beside
 	-- its layout.
 	let inlinedCalls = []
@@ -2359,6 +2367,7 @@ fun emitModule(
 					}
 					flush()
 					Vec.push(layouts, (i, l))
+					Vec.push(placed, (i, m.placed))
 					Vec.push(inlinedCalls, m.inlined)
 					Vec.push(variables, (m.variables, m.base))
 					Vec.push(traced, Trace.Traced {
@@ -2407,7 +2416,7 @@ fun emitModule(
 	Emit.emitDefinitions(module_, asm, code)
 	Emit.emitMessages(asm, code)
 	Emit.emitData(module_, asm, sites, code)
-	Emit.emitFrameTable(asm, layouts, code)
+	Emit.emitFrameTable(asm, placed, code)
 	Emit.emitTraceTable(asm, tracedFiles(files, path), traced, tracedName, code)
 	if debugInfo() {
 		-- The end of the code, after everything the text section holds.

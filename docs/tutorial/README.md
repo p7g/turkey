@@ -78,8 +78,8 @@ reference's. It also runs the `run` and `panic` examples with
 `--target wasm32-wasi`, because that is what the browser runs. To skip an
 example there, write `<!-- skip: wasm32-wasi: REASON -->` on the line before
 its directive. The page then shows the program with its recorded output and
-the reason, and turns Run off. It shows a program with `module` files the
-same way, because the browser compiles one file.
+the reason, and turns Run off. The page puts a program's `module` files in
+the editor with it, one tab each, after the program's own tab, `main.gob`.
 
 **Format the programs with `turkey format`.** The page's Format button would
 otherwise change a lesson's program, and the site's build rejects a lesson

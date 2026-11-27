@@ -3,7 +3,9 @@
 //     node tests/playground_host.mjs TURKEY.WASM LIB.TAR.GZ SOURCE [STDIN]
 //
 // compiles SOURCE with the wasm compiler and, if it wrote a program, runs that
-// with STDIN's contents on its standard input. Prints one JSON object:
+// with STDIN's contents on its standard input. SOURCE is a file, compiled as
+// `main.gob`, or a directory, whose `main.gob` is the entry and whose other
+// `.gob` files, at any depth, are its modules. Prints one JSON object:
 // `compiled`, what `compile` returned less its bytes, `ran`, what `run`
 // returned, or null, and `streamed`, what `run` passed to `onWrite`: the
 // bytes of each stream, concatenated and decoded, and the number of calls.
@@ -14,8 +16,23 @@
 // and prints `{ highlighted, formatted }`, what `highlight` and `format`
 // return for SOURCE.
 
-import { readFile } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
+import { join, sep } from "node:path";
 import { loadCompiler, compile, run, highlight, format } from "../playground/host.js";
+
+// Returns the `[name, source]` pairs `compile` takes for SOURCE.
+async function filesAt(path) {
+  if (!(await stat(path)).isDirectory()) {
+    return [["main.gob", await readFile(path, "utf8")]];
+  }
+  const names = (await readdir(path, { recursive: true }))
+    .map((name) => name.split(sep).join("/"))
+    .filter((name) => name.endsWith(".gob") && name !== "main.gob")
+    .sort();
+  return Promise.all(
+    ["main.gob", ...names].map(async (name) => [name, await readFile(join(path, name), "utf8")]),
+  );
+}
 
 if (process.argv[2] === "--tools") {
   const [wasmPath, sourcePath] = process.argv.slice(3);
@@ -27,7 +44,7 @@ if (process.argv[2] === "--tools") {
 } else {
   const [wasmPath, libPath, sourcePath, stdinPath] = process.argv.slice(2);
   const compiler = await loadCompiler(await readFile(wasmPath), await readFile(libPath));
-  const { bytes, ...compiled } = await compile(compiler, await readFile(sourcePath, "utf8"));
+  const { bytes, ...compiled } = await compile(compiler, await filesAt(sourcePath));
   const stdin = stdinPath === undefined ? "" : await readFile(stdinPath);
   const parts = { stdout: [], stderr: [] };
   let calls = 0;

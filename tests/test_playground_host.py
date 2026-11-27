@@ -51,11 +51,20 @@ def inputs(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path]:
     return bootc.written_compiler("turkey-wasm", "--target", "wasm32-wasi"), archive
 
 
-def _host(inputs: tuple[Path, Path], tmp_path: Path, source: str, stdin: str | None = None) -> dict:
+def _host(inputs: tuple[Path, Path], tmp_path: Path, source: str | dict[str, str],
+          stdin: str | None = None) -> dict:
+    """Compiles `source`, one file or several by name with `main.gob` the
+    entry, and runs what the compiler writes."""
     node = toolchain.needs_node()
     compiler, archive = inputs
-    entry = tmp_path / "main.gob"
-    entry.write_text(source)
+    if isinstance(source, str):
+        entry = tmp_path / "main.gob"
+        entry.write_text(source)
+    else:
+        entry = tmp_path / "program"
+        for name, text in source.items():
+            (entry / name).parent.mkdir(parents=True, exist_ok=True)
+            (entry / name).write_text(text)
     argv = [node, f"--stack-size={STACK_KIB}", str(DRIVER), str(compiler), str(archive), str(entry)]
     if stdin is not None:
         (tmp_path / "stdin").write_text(stdin)
@@ -137,6 +146,49 @@ def test_a_program_reads_its_standard_input(inputs, tmp_path):
     assert result["ran"]["stdout"] == "read quack\nread honk\n"
 
 
+def test_a_program_of_several_files_compiles_and_runs(inputs, tmp_path):
+    """Each file is written beside the entry, a subdirectory for a dotted
+    module name, and the compiler finds them by their imports."""
+    result = _host(inputs, tmp_path, {
+        "main.gob": ("import Geometry as Geo\nimport Shapes.Circle (area)\n\n"
+                     "fun main() {\n\tprint(Geo.double(21))\n\tprint(area(2))\n}\n"),
+        "Geometry.gob": "export (double)\n\nfun double(n : Int) -> Int = n * 2\n",
+        "Shapes/Circle.gob": "export (area)\n\nfun area(r : Int) -> Int = 3 * r * r\n",
+    })
+    assert result["compiled"]["status"] == 0, result["compiled"]["diagnostics"]
+    assert result["ran"]["stdout"] == "42\n12\n"
+
+
+def test_an_error_in_a_module_names_its_file(inputs, tmp_path):
+    result = _host(inputs, tmp_path, {
+        "main.gob": "import Geometry\n\nfun main() {\n\tprint(Geometry.double(21))\n}\n",
+        "Geometry.gob": 'export (double)\n\nfun double(n : Int) -> Int = n + "a"\n',
+    })
+    assert result["compiled"]["status"] == 1
+    assert result["compiled"]["diagnostics"].startswith("Geometry.gob:3:")
+    assert result["ran"] is None
+
+
+def test_streamed_writes_concatenate_to_the_output(inputs, tmp_path):
+    """`onWrite` sees every write as it happens, so what it is given adds up
+    to the `stdout` and `stderr` that `run` returns."""
+    source = ("fun main() {\n"
+              "\tfor i in Int.range(0, 50) {\n"
+              "\t\tprint(\"line ${i} \u00e9\")\n"
+              "\t}\n"
+              "\tlet xs = [1]\n"
+              "\tprint(xs[3])\n"
+              "}\n")
+    result = _host(inputs, tmp_path, source)
+    assert result["compiled"]["status"] == 0, result["compiled"]["diagnostics"]
+    ran, streamed = result["ran"], result["streamed"]
+    assert ran["stdout"].startswith("line 0 \u00e9\nline 1 \u00e9\n")
+    assert ran["stderr"].startswith("panic: array index out of bounds")
+    assert streamed["stdout"] == ran["stdout"]
+    assert streamed["stderr"] == ran["stderr"]
+    assert streamed["calls"] > 2
+
+
 def test_a_type_error_comes_back_as_diagnostics(inputs, tmp_path):
     result = _host(inputs, tmp_path, 'fun main() {\n\tprint(1 + "a")\n}\n')
     assert result["compiled"]["status"] == 1
@@ -146,10 +198,17 @@ def test_a_type_error_comes_back_as_diagnostics(inputs, tmp_path):
     assert result["ran"] is None
 
 
-def _driver(inputs: tuple[Path, Path], tmp_path: Path, mode: str, source: str) -> dict:
+def _driver(inputs: tuple[Path, Path], tmp_path: Path, mode: str,
+            source: str | dict[str, str]) -> dict:
     node = toolchain.needs_node()
-    entry = tmp_path / "main.gob"
-    entry.write_text(source)
+    if isinstance(source, str):
+        entry = tmp_path / "main.gob"
+        entry.write_text(source)
+    else:
+        entry = tmp_path / "program"
+        for name, text in source.items():
+            (entry / name).parent.mkdir(parents=True, exist_ok=True)
+            (entry / name).write_text(text)
     argv = [node, f"--stack-size={STACK_KIB}", str(DRIVER), mode, str(inputs[0]), str(inputs[1]),
             str(entry)]
     result = subprocess.run(argv, capture_output=True, text=True, timeout=300)
@@ -177,17 +236,23 @@ def test_check_returns_the_diagnostics_as_objects(inputs, tmp_path):
     }
 
 
-def test_the_tools_worker_checks_with_the_library(inputs, tmp_path):
+def test_the_tools_worker_checks_every_file_with_the_library(inputs, tmp_path):
     """The page's tools Worker fetches `lib.tar.gz` and answers a `check`
-    message with the source it checked and the lint's warnings."""
-    source = "fun main() {\n\tlet unused = 4\n\tmatch 3 {\n\t\tx -> print(x)\n\t}\n}\n"
-    answer = _driver(inputs, tmp_path, "--worker", source)
+    message with the files it checked and each file's diagnostics."""
+    files = {
+        "main.gob": "import Shapes\n\nfun main() {\n\tlet unused = 4\n\tprint(Shapes.area(2))\n}\n",
+        "Shapes.gob": "export (area)\n\nfun area(side : Int) -> Int {\n\tmatch side {\n"
+                      "\t\ts -> s * s\n\t}\n}\n",
+    }
+    answer = _driver(inputs, tmp_path, "--worker", files)
     assert answer["replies"] == ["status", "ready", "checked"]
     checked = answer["checked"]
-    assert (checked["type"], checked["id"], checked["source"]) == ("checked", 7, source)
-    assert [(d["code"], d["severity"], d["line"], d["endLine"]) for d in checked["diagnostics"]] == [
-        ("unused-variable", "warning", 2, 2),
-        ("irrefutable-match", "warning", 3, 5),
+    assert (checked["type"], checked["id"]) == ("checked", 7)
+    assert checked["files"] == [["main.gob", files["main.gob"]], ["Shapes.gob", files["Shapes.gob"]]]
+    found = [(d["file"], d["code"], d["line"], d["endLine"]) for d in checked["diagnostics"]]
+    assert sorted(found) == [
+        ("Shapes.gob", "irrefutable-match", 4, 6),
+        ("main.gob", "unused-variable", 4, 4),
     ]
 
 

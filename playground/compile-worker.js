@@ -18,15 +18,18 @@
 //                                                   or null to fetch one, and
 //                                                   `lib` says whether to
 //                                                   fetch lib.tar.gz
-//               { type: "compile", id, source }
-//               { type: "check", id, source }
+//               { type: "compile", id, files }      `files` as `compile`
+//                                                   takes them, the entry
+//                                                   first
+//               { type: "check", id, files }        `files` as for `compile`
 //               { type: "highlight", id, source }
-//               { type: "format", id, source }
+//               { type: "format", id, source, name } `name` is the file's,
+//                                                   for the diagnostics
 // Messages out: { type: "status", text }            progress while loading
 //               { type: "ready", module }           the compiler is loaded
 //               { type: "failed", text }            loading failed for good
 //               { type: "compiled", id, bytes, status, diagnostics, ms }
-//               { type: "checked", id, source, diagnostics, ms }
+//               { type: "checked", id, files, diagnostics, ms }
 //               { type: "highlighted", id, source, html }
 //               { type: "formatted", id, source, text, status, diagnostics }
 // where `html` and `text` are null if the command failed, and a `checked`
@@ -94,10 +97,10 @@ function start(data) {
 // Each reply carries the source it was made from, so the page can tell a
 // reply for text it has since edited.
 const handlers = {
-  async compile(compiler, { id, source }) {
+  async compile(compiler, { id, files }) {
     const started = performance.now();
     try {
-      const built = await compile(compiler, source);
+      const built = await compile(compiler, files);
       postMessage({
         type: "compiled",
         id,
@@ -117,13 +120,13 @@ const handlers = {
       });
     }
   },
-  async check(compiler, { id, source }) {
+  async check(compiler, { id, files }) {
     const started = performance.now();
     let diagnostics = null;
     try {
-      diagnostics = (await check(compiler, source)).diagnostics;
+      diagnostics = (await check(compiler, files)).diagnostics;
     } catch {}
-    postMessage({ type: "checked", id, source, diagnostics, ms: performance.now() - started });
+    postMessage({ type: "checked", id, files, diagnostics, ms: performance.now() - started });
   },
   async highlight(compiler, { id, source }) {
     let html = null;
@@ -132,9 +135,9 @@ const handlers = {
     } catch {}
     postMessage({ type: "highlighted", id, source, html });
   },
-  async format(compiler, { id, source }) {
+  async format(compiler, { id, source, name }) {
     try {
-      const { text, status, diagnostics } = await format(compiler, source);
+      const { text, status, diagnostics } = await format(compiler, source, name);
       postMessage({ type: "formatted", id, source, text, status, diagnostics });
     } catch (error) {
       postMessage({

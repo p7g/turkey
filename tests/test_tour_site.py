@@ -2,9 +2,9 @@
 
 `tests/tour/` is a small repository of its own, with three lessons, a
 reference chapter and a library module: one lesson whose program runs in the
-browser, one whose program has a module file, and one that a `skip`
-directive keeps out of the browser. The tests that need a broken lesson copy
-it and break the copy. The real tour is built too, so that a lesson whose
+browser, one whose program has a module file and runs there too, and one
+that a `skip` directive keeps out of the browser. The tests that need a
+broken lesson copy it and break the copy. The real tour is built too, so that a lesson whose
 link or layout the site's build would refuse fails here, before the deploy.
 """
 
@@ -73,15 +73,37 @@ def test_a_lesson_page_holds_its_program_examples_and_links(tmp_path):
     ]
 
 
-def test_a_program_the_browser_cannot_run_is_shown_with_the_reason(tmp_path):
+def test_a_program_of_several_files_gets_an_editor_for_each(tmp_path):
+    """The entry, `main.gob`, comes first, then each module file, each in an
+    editor named by `data-file`; the module's block is not shown again in
+    the prose."""
     out = _built(FIXTURE, tmp_path / "out")
     second = (out / "02-second.html").read_text()
-    assert 'data-static=""' in second and 'id="source"' not in second
-    assert "has more than one file" in second
-    assert '<div class="label">Greeting.gob</div>' in second
-    assert '<div class="label">Main.gob</div>' in second
-    assert '<pre class="output">hi\n</pre>' in second
+    assert 'data-static=""' not in second and 'id="run"' in second
+    editors = re.findall(r'<div class="editor" data-file="([^"]*)">.*?wrap="off">\n(.*?)</textarea>',
+                         second, re.S)
+    assert [(name, html.unescape(text)) for name, text in editors] == [
+        ("main.gob", 'import Greeting (greeting)\n\nfun main() {\n\tprint(greeting())\n}\n'),
+        ("Greeting.gob", 'export (greeting)\n\nfun greeting() -> String = "hi"\n'),
+    ]
+    assert second.count('id="source"') == 1 and second.count('id="highlighted"') == 1
+    assert '<div class="label">Greeting.gob</div>' not in second
+    assert '<pre class="stdout">hi\n</pre>' in second
+
+
+def test_a_module_file_the_page_would_refuse_fails_the_build(tmp_path):
+    """The page takes a module file's name to be its module path, as the
+    playground's tabs and share links do."""
+    result = _broken(tmp_path, "02-second.md", "module: Greeting.gob", "module: greeting.gob")
+    assert result.code == 1
+    assert ("docs/tutorial/02-second.md: the program's module file 'greeting.gob' is not named "
+            "as the page requires") in result.stderr
+
+
+def test_a_program_the_browser_cannot_run_is_shown_with_the_reason(tmp_path):
+    out = _built(FIXTURE, tmp_path / "out")
     third = (out / "03-third.html").read_text()
+    assert 'data-static=""' in third and 'id="source"' not in third
     assert "does not run in the browser: it needs a second thread." in third
     assert 'id="run"' not in third
 
@@ -92,12 +114,17 @@ def test_the_contents_and_the_playgrounds_picker_list_the_lessons(tmp_path):
     assert re.findall(r'<li><a href="([^"]*)">', contents.split("<main", 1)[1]) == [
         "01-first.html", "02-second.html", "03-third.html"]
     assert not (out / "README.html").exists()
-    # Only a program the browser runs goes in the picker.
+    # Only a program the browser runs goes in the picker, with its modules.
     assert json.loads((out / "examples.json").read_text()) == [
-        {"name": "01-first", "title": "First steps", "file": "programs/01-first.gob"}]
+        {"name": "01-first", "title": "First steps", "file": "programs/01-first.gob"},
+        {"name": "02-second", "title": "Second", "file": "programs/02-second.gob",
+         "modules": [{"name": "Greeting.gob", "file": "programs/02-second/Greeting.gob"}]}]
     assert (out / "programs" / "01-first.gob").read_text() == (
         'fun main() {\n\tprint("<first> & \\"last\\"")\n}\n')
-    assert sorted(p.name for p in (out / "programs").iterdir()) == ["01-first.gob"]
+    assert (out / "programs" / "02-second" / "Greeting.gob").read_text() == (
+        'export (greeting)\n\nfun greeting() -> String = "hi"\n')
+    assert sorted(str(p.relative_to(out / "programs")) for p in (out / "programs").rglob("*")) == [
+        "01-first.gob", "02-second", "02-second.gob", "02-second/Greeting.gob"]
 
 
 def test_a_link_to_a_missing_heading_fails_the_build(tmp_path):
@@ -153,3 +180,9 @@ def test_the_tour_builds(tmp_path):
         assert (out / entry["file"]).read_text() == program
         page = (out / f"{entry['name']}.html").read_text()
         assert html.unescape(page.split('wrap="off">\n', 1)[1].split("</textarea>")[0]) == program
+        for module in entry.get("modules", []):
+            fence = f"<!-- module: {module['name']} -->\n```kotlin\n"
+            assert fence in lesson
+            assert (out / module["file"]).read_text() == lesson.split(fence, 1)[1].split("```\n")[0]
+    # The Modules lesson, whose program has a module file, runs in the browser.
+    assert "19-modules" in [entry["name"] for entry in picker]

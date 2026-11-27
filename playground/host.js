@@ -7,11 +7,11 @@
 // hands over their bytes.
 //
 //     const compiler = await loadCompiler(wasmBytes, libTarGz);
-//     const built = await compile(compiler, source);
+//     const built = await compile(compiler, [["main.gob", source], ["Geometry.gob", geometry]]);
 //     if (built.bytes) { const ran = await run(built.bytes); }
 //     const { html } = await highlight(compiler, source);
 //     const { text } = await format(compiler, source);
-//     const { diagnostics } = await check(compiler, source);
+//     const { diagnostics } = await check(compiler, [["main.gob", source]]);
 
 import {
   WASI,
@@ -46,19 +46,30 @@ export async function loadCompiler(wasm, libArchive = null) {
 }
 
 /**
- * Compiles `source` as the module `main.gob` for wasm32-wasi. Returns
- * `{ bytes, status, diagnostics, memory }`: `bytes` is the program as a
- * `Uint8Array`, or null when the compiler wrote none; `status` is the
- * compiler's exit status, or null if it trapped; `diagnostics` is everything
- * it wrote to stdout and stderr, as text, with a trap's message last; `memory`
- * is its linear memory's size in bytes at exit, which is its peak, since wasm
- * memory never shrinks. Throws for a compiler loaded without the library.
+ * Compiles a program for wasm32-wasi. `files` is its source files as
+ * `[name, source]` pairs, the entry first, each name a path relative to the
+ * entry's directory, such as `Geometry.gob` or `Shapes/Circle.gob`; a string
+ * is one file, `main.gob`. Returns `{ bytes, status, diagnostics, memory }`:
+ * `bytes` is the program as a `Uint8Array`, or null when the compiler wrote
+ * none; `status` is the compiler's exit status, or null if it trapped;
+ * `diagnostics` is everything it wrote to stdout and stderr, as text, with a
+ * trap's message last; `memory` is its linear memory's size in bytes at exit,
+ * which is its peak, since wasm memory never shrinks. Throws for a compiler
+ * loaded without the library, for no files, and for a name that is not a
+ * relative path, has a `.` or `..` part, is under `lib/` or is `out.wasm`,
+ * or names a file twice or a file and a directory.
  */
-export async function compile(compiler, source) {
+export async function compile(compiler, files) {
   if (compiler.lib === null) {
     throw new Error("this compiler was loaded without lib.tar.gz, so it cannot compile");
   }
-  const work = new PreopenDirectory(".", [["main.gob", new File(new TextEncoder().encode(source))]]);
+  const pairs = typeof files === "string" ? [["main.gob", files]] : files;
+  checkNames(pairs.map(([name]) => name));
+  const encoder = new TextEncoder();
+  const work = new PreopenDirectory(
+    ".",
+    entriesOf(pairs.map(([name, source]) => [name, encoder.encode(source)])),
+  );
   // `lib` is its own preopen: the compiler resolves `lib/...` against the
   // preopen with the longest matching name, and everything else against `.`.
   // Each compile gets its own copy of the tree, files and all, so nothing one
@@ -73,7 +84,7 @@ export async function compile(compiler, source) {
     new PreopenDirectory("lib", entriesOf(compiler.lib, { readonly: true })),
     work,
   ];
-  const argv = ["turkey", "build", "-o", "out.wasm", "--target", "wasm32-wasi", "main.gob"];
+  const argv = ["turkey", "build", "-o", "out.wasm", "--target", "wasm32-wasi", pairs[0][0]];
   const result = await start(compiler.module, argv, ["TURKEY_LIB=lib"], fds, { merged: true });
   const out = work.dir.contents.get("out.wasm");
   return {
@@ -97,32 +108,39 @@ export async function highlight(compiler, source) {
 }
 
 /**
- * Returns `source`, as the module `main.gob`, laid out as `turkey format`
- * lays it out: `{ text, status, diagnostics }`. `text` is the formatted
- * source, or null if it did not parse or the formatter refused it, and
- * `diagnostics` is what the formatter wrote to stderr, with a trap's message
- * last.
+ * Returns `source`, as the file `name`, laid out as `turkey format` lays it
+ * out: `{ text, status, diagnostics }`. `text` is the formatted source, or
+ * null if it did not parse or the formatter refused it, and `diagnostics` is
+ * what the formatter wrote to stderr, which names the file `name`, with a
+ * trap's message last.
  */
-export async function format(compiler, source) {
-  const result = await tool(compiler, ["format", "--stdin-name", "main.gob", "-"], source);
+export async function format(compiler, source, name = "main.gob") {
+  const result = await tool(compiler, ["format", "--stdin-name", name, "-"], source);
   return { text: result.output, status: result.status, diagnostics: result.diagnostics };
 }
 
 /**
- * Checks `source` as the module `main.gob`, as `turkey check
- * --diagnostics=json` does, which writes no program. Returns `{ diagnostics,
+ * Checks a program as `turkey check --diagnostics=json` does, which writes
+ * no program. `files` is as `compile` takes it. Returns `{ diagnostics,
  * status, text }`: `diagnostics` is an array of the objects the compiler
- * wrote, one per diagnostic, whose members `turkey`'s usage text lists;
+ * wrote, one per diagnostic, whose members `turkey`'s usage text lists and
+ * whose `file` is a name in `files`, or a library file's under `lib/`;
  * `status` is its exit status, or null if it trapped; and `text` is the rest
  * of what it wrote, such as a panic's report, with a trap's message last.
  * Positions are the compiler's: 1-based lines and columns counted in code
- * points. Throws for a compiler loaded without the library.
+ * points. Throws as `compile` does.
  */
-export async function check(compiler, source) {
+export async function check(compiler, files) {
   if (compiler.lib === null) {
     throw new Error("this compiler was loaded without lib.tar.gz, so it cannot check");
   }
-  const work = new PreopenDirectory(".", [["main.gob", new File(new TextEncoder().encode(source))]]);
+  const pairs = typeof files === "string" ? [["main.gob", files]] : files;
+  checkNames(pairs.map(([name]) => name));
+  const encoder = new TextEncoder();
+  const work = new PreopenDirectory(
+    ".",
+    entriesOf(pairs.map(([name, source]) => [name, encoder.encode(source)])),
+  );
   // A copy of the library for each check, as `compile` makes, and for the
   // same reason.
   const fds = [
@@ -132,7 +150,7 @@ export async function check(compiler, source) {
     new PreopenDirectory("lib", entriesOf(compiler.lib, { readonly: true })),
     work,
   ];
-  const argv = ["turkey", "check", "--diagnostics=json", "main.gob"];
+  const argv = ["turkey", "check", "--diagnostics=json", pairs[0][0]];
   const result = await start(compiler.module, argv, ["TURKEY_LIB=lib"], fds, { merged: false });
   const diagnostics = [];
   let text = "";
@@ -172,18 +190,25 @@ async function tool(compiler, args, source) {
  * memory }`: `status` is its exit status, or null if it trapped, and `trap` is
  * the trap's message, or null. A panic is not a trap: it writes its report to
  * stderr and exits with a non-zero status.
+ *
+ * With `onWrite`, each write the program makes is also passed to
+ * `onWrite(stream, bytes)` as it happens, `stream` being "stdout" or "stderr"
+ * and `bytes` a `Uint8Array` the callback may keep. `stdout` and `stderr` in
+ * the result still hold everything written, so a stream's streamed bytes,
+ * concatenated, are its text encoded.
  */
-export async function run(program, { stdin = "", args = [] } = {}) {
+export async function run(program, { stdin = "", args = [], onWrite = null } = {}) {
   const module = program instanceof WebAssembly.Module ? program : await WebAssembly.compile(program);
   const input = typeof stdin === "string" ? new TextEncoder().encode(stdin) : stdin;
   const fds = [new OpenFile(new File(input)), null, null, new PreopenDirectory(".", [])];
-  return await start(module, ["main", ...args], [], fds, { merged: false });
+  return await start(module, ["main", ...args], [], fds, { merged: false, onWrite });
 }
 
 // Instantiates `module`, fills fds 1 and 2 with streams that collect what is
 // written, and runs `_start`. With `merged`, both streams collect into one
-// text, in the order the writes were made, as a terminal shows them.
-async function start(module, argv, env, fds, { merged }) {
+// text, in the order the writes were made, as a terminal shows them. With
+// `onWrite`, each write is also passed to it, as `run` documents.
+async function start(module, argv, env, fds, { merged, onWrite = null }) {
   const decoder = { stdout: new TextDecoder(), stderr: new TextDecoder() };
   const text = { stdout: "", stderr: "" };
   // A `ConsoleStdout` is a character device that cannot seek, which the
@@ -191,6 +216,9 @@ async function start(module, argv, env, fds, { merged }) {
   // stdout and stderr interleaved as they were written.
   const stream = (name) =>
     new ConsoleStdout((bytes) => {
+      // Copy, so the callback may keep the bytes whatever the shim does with
+      // its buffer afterwards.
+      onWrite?.(name, bytes.slice());
       const into = merged ? "stdout" : name;
       text[into] += decoder[into].decode(bytes, { stream: true });
     });
@@ -285,6 +313,36 @@ function untar(tar) {
       throw new Error(`lib.tar.gz: '${name}' has type '${type}', which is not a file`);
     }
     at = body + Math.ceil(size / 512) * 512;
+  }
+}
+
+// Throws unless `names`, one or more, are paths `compile` can write into its
+// directory and find again: relative, with no empty, `.` or `..` part; not
+// under `lib/`, which resolves against the library's preopen, nor
+// `out.wasm`, which the compile writes; and none naming a file twice or a
+// file and a directory.
+function checkNames(names) {
+  if (names.length === 0) {
+    throw new Error("a program needs at least one file, its entry");
+  }
+  const files = new Set();
+  const directories = new Set();
+  for (const name of names) {
+    const parts = name.split("/");
+    if (parts.some((part) => part === "" || part === "." || part === "..")) {
+      throw new Error(`'${name}' is not a relative path to a file`);
+    }
+    if (parts[0] === "lib" || name === "out.wasm") {
+      throw new Error(`'${name}' is a name the compile keeps for itself`);
+    }
+    const parents = parts.slice(1).map((_, i) => parts.slice(0, i + 1).join("/"));
+    if (files.has(name) || directories.has(name) || parents.some((parent) => files.has(parent))) {
+      throw new Error(`'${name}' names a file twice, or a file and a directory`);
+    }
+    files.add(name);
+    for (const parent of parents) {
+      directories.add(parent);
+    }
   }
 }
 

@@ -1,42 +1,75 @@
-// Share links. The source is compressed with deflate-raw, written in
-// base64url, and put in the URL's fragment as `#code=...`. Browsers never
-// send the fragment to a server, so a link stores nothing anywhere and the
-// source never leaves the machine until someone pastes the link.
+// Share links. A link holds the program in the URL's fragment, compressed
+// with deflate-raw and written in base64url:
+//
+//   #code=...   one file, `main.gob`: its text, as UTF-8
+//   #files=...  any number: a JSON array of [name, text] pairs, the entry
+//               first, as UTF-8
+//
+// A program that is only `main.gob` gets a `#code=` link, the one it would
+// get from a page that knows only `#code=`, so either page opens it.
+// Browsers never send the fragment to a server, so a link stores nothing
+// anywhere and the source never leaves the machine until someone pastes the
+// link.
 //
 // No DOM, so node loads it.
+
+import { ENTRY, filesProblem } from "./files.js";
 
 /** The most bytes of UTF-8 a link holds, either way. */
 export const MAX_SOURCE_BYTES = 1 << 20;
 
 /**
- * Returns the fragment, starting with `#`, that holds `text`. Throws if `text`
- * is longer than `MAX_SOURCE_BYTES` in UTF-8.
+ * Returns the fragment, starting with `#`, that holds `files`, `[name,
+ * text]` pairs with the entry, `ENTRY`, first, or a string, which is the
+ * entry alone. Throws if what the link holds is longer than
+ * `MAX_SOURCE_BYTES` in UTF-8.
  */
-export async function fragmentFor(text) {
-  const bytes = new TextEncoder().encode(text);
+export async function fragmentFor(files) {
+  const pairs = typeof files === "string" ? [[ENTRY, files]] : files;
+  const single = pairs.length === 1;
+  const bytes = new TextEncoder().encode(single ? pairs[0][1] : JSON.stringify(pairs));
   if (bytes.length > MAX_SOURCE_BYTES) {
     throw new Error(`the source is over ${MAX_SOURCE_BYTES >> 10} KiB, too long for a link`);
   }
-  return "#code=" + toBase64url(await pipe(bytes, new CompressionStream("deflate-raw")));
+  const encoded = toBase64url(await pipe(bytes, new CompressionStream("deflate-raw")));
+  return (single ? "#code=" : "#files=") + encoded;
 }
 
 /**
- * Returns the source a fragment holds, or null for a fragment that holds
- * none, such as "" or "#". Throws if the fragment's `code` is not base64url,
- * does not decompress, decompresses to more than `MAX_SOURCE_BYTES`, or is not
- * UTF-8.
+ * Returns the files a fragment holds, as `[name, text]` pairs with the entry
+ * first, or null for a fragment that holds none, such as "" or "#". A
+ * fragment with both keys is read by its `files`. Throws if the value is not
+ * base64url, does not decompress, decompresses to more than
+ * `MAX_SOURCE_BYTES`, or is not UTF-8, and if a `files` value is not an array
+ * of files `filesProblem` accepts.
  */
-export async function sourceFromFragment(fragment) {
-  const encoded = new URLSearchParams(fragment.replace(/^#/, "")).get("code");
-  if (encoded === null) {
+export async function filesFromFragment(fragment) {
+  const params = new URLSearchParams(fragment.replace(/^#/, ""));
+  const key = params.has("files") ? "files" : params.has("code") ? "code" : null;
+  if (key === null) {
     return null;
   }
-  const bytes = await pipe(fromBase64url(encoded), new DecompressionStream("deflate-raw"), MAX_SOURCE_BYTES);
+  const bytes = await pipe(fromBase64url(params.get(key)), new DecompressionStream("deflate-raw"), MAX_SOURCE_BYTES);
+  let text;
   try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
     throw new Error("the link's source is not UTF-8");
   }
+  if (key === "code") {
+    return [[ENTRY, text]];
+  }
+  let pairs;
+  try {
+    pairs = JSON.parse(text);
+  } catch {
+    throw new Error("the link's files are damaged: they are not JSON");
+  }
+  const problem = filesProblem(pairs);
+  if (problem !== null) {
+    throw new Error(`the link's files are damaged: ${problem}`);
+  }
+  return pairs;
 }
 
 // Returns `bytes` passed through `transform`. Throws once the output passes

@@ -1,25 +1,26 @@
 // A lesson of the tour, as `src/TourSite.gob` writes it: the lesson's prose
-// beside its program, in an editor with Run, Stop, Format, Reset and Share.
+// beside its program, in an editor with Run, Stop, Format, Reset and Share,
+// and a tab for each file of a program that has several.
 //
 // The compiler loads on the first edit or Run, not with the page, so reading
 // a lesson costs no download; until then the output pane shows the output
 // recorded when the page was made. Edits are kept in `localStorage` for each
-// lesson, under a key that includes a hash of the lesson's program, so a
-// lesson whose program has since changed starts from the new one. Share
-// copies a link that opens the editor's text in the playground.
+// lesson, every file's, under a key that includes a hash of the lesson's
+// program, so a lesson whose program has since changed starts from the new
+// one. Share copies a link that opens the files in the playground.
 //
 // A lesson whose program the browser cannot run has no editor, and this
 // does nothing on its page.
 
-import { replaceText } from "./editor.js";
+import { filesProblem } from "./files.js";
 import { startSession } from "./session.js";
 import { fragmentFor } from "./share.js";
 
 const $ = (id) => document.getElementById(id);
-const source = $("source");
+const filesElement = $("files");
 const lesson = document.querySelector("main.lesson");
 
-if (source !== null && lesson !== null) {
+if (filesElement !== null && lesson !== null) {
   start();
 }
 
@@ -34,29 +35,51 @@ function fnv1a(text) {
   return hash.toString(16).padStart(8, "0");
 }
 
+// Returns whether two sets of files, as `[name, text]` pairs, are the same.
+function same(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
 function start() {
   const output = $("output");
   const note = $("note");
   const formatError = $("format-error");
   const resetButton = $("reset");
   const shareButton = $("share");
-  // The textarea's own text is the lesson's program, whatever `value` holds.
-  const original = source.defaultValue;
-  const key = `turkey-tour:${lesson.dataset.lesson}:${fnv1a(original)}`;
+  // The textareas' own texts are the lesson's program, whatever `value` holds.
+  const original = [...filesElement.querySelectorAll(":scope > .editor")].map((panel) => [
+    panel.dataset.file,
+    panel.querySelector("textarea").defaultValue,
+  ]);
+  // A program of one file is hashed by its text alone. What is stored is
+  // `{"files": PAIRS}` as JSON, or, for a program of one file, may be the
+  // text of `main.gob` alone, as a plain string.
+  const key = `turkey-tour:${lesson.dataset.lesson}:${fnv1a(
+    original.length === 1 ? original[0][1] : JSON.stringify(original),
+  )}`;
   const recorded = [...output.childNodes].map((node) => node.cloneNode(true));
 
-  let saved = null;
-  try {
-    saved = localStorage.getItem(key);
-  } catch {}
-  if (saved !== null && saved !== original) {
-    source.value = saved;
+  // Returns the files stored for this lesson, or null.
+  function stored() {
+    let saved = null;
+    try {
+      saved = localStorage.getItem(key);
+    } catch {}
+    if (saved === null) {
+      return null;
+    }
+    try {
+      const { files } = JSON.parse(saved);
+      if (filesProblem(files) === null) {
+        return files;
+      }
+    } catch {}
+    return original.length === 1 ? [[original[0][0], saved]] : null;
   }
 
   const session = startSession(
     {
-      source,
-      highlighted: $("highlighted"),
+      files: filesElement,
       run: $("run"),
       stop: $("stop"),
       format: $("format"),
@@ -67,7 +90,10 @@ function start() {
     },
     { lazy: true },
   );
-  if (source.value !== original) {
+  const { files } = session;
+  const saved = stored();
+  if (saved !== null && !same(saved, original)) {
+    files.replace(saved, { quiet: true });
     note.textContent = "Your edits to this lesson are back. Reset brings back its program.";
     session.load();
   }
@@ -76,39 +102,38 @@ function start() {
   // an edit of the reader's: what is stored stays as it was, so a reload
   // brings back the reader's own edits, or the program.
   let loadingExample = false;
-  source.addEventListener("input", () => {
+  files.onChange(() => {
     if (loadingExample) {
       return;
     }
     try {
-      if (source.value === original) {
+      if (same(files.all(), original)) {
         localStorage.removeItem(key);
       } else {
-        localStorage.setItem(key, source.value);
+        localStorage.setItem(key, JSON.stringify({ files: files.all() }));
       }
     } catch {}
   });
   // Focusing the editor is a sign of an edit to come, so the compiler starts
   // loading then rather than on the first keystroke.
-  source.addEventListener("focus", () => session.load());
+  filesElement.addEventListener("focusin", () => session.load());
 
   // Reset puts the program back through the undo stack, so Ctrl+Z brings the
   // edits back, and shows the recorded output again. A run in flight is
   // stopped first, so its output cannot replace the recorded output.
   resetButton.addEventListener("click", () => {
     session.cancel();
-    if (source.value !== original) {
-      replaceText(source, original);
-      source.setSelectionRange(0, 0);
-      source.scrollTop = 0;
+    if (!same(files.all(), original)) {
+      files.replace(original, { undoable: true });
     }
     formatError.hidden = true;
     output.replaceChildren(...recorded.map((node) => node.cloneNode(true)));
     note.textContent = "This is the lesson's program again. Undo brings back your edits.";
   });
 
-  // Each "Try it" loads its example into the editor. The example's highlighted
-  // code reads exactly as its source does, so its text is the source.
+  // Each "Try it" loads its example into the entry's editor, leaving the
+  // other files as they are. The example's highlighted code reads exactly as
+  // its source does, so its text is the source.
   for (const button of document.querySelectorAll("button.try")) {
     button.disabled = false;
     button.addEventListener("click", () => {
@@ -116,24 +141,22 @@ function start() {
       session.cancel();
       loadingExample = true;
       try {
-        replaceText(source, code.textContent);
+        const [[entry], ...modules] = files.all();
+        files.replace([[entry, code.textContent], ...modules], { undoable: true });
       } finally {
         loadingExample = false;
       }
-      source.setSelectionRange(0, 0);
-      source.scrollTop = 0;
       session.show([]);
       formatError.hidden = true;
       note.textContent = "The example is in the editor. Run it, or Reset to bring back the lesson's program.";
-      source.scrollIntoView({ block: "nearest" });
+      filesElement.scrollIntoView({ block: "nearest" });
     });
   }
 
   shareButton.addEventListener("click", async () => {
-    const text = source.value;
     let fragment;
     try {
-      fragment = await fragmentFor(text);
+      fragment = await fragmentFor(files.all());
     } catch (error) {
       note.textContent = `No link: ${error.message}.`;
       return;

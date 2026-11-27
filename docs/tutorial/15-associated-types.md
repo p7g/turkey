@@ -1,8 +1,8 @@
 # Associated types
 
-A class has one type parameter, and an *associated type* lets it talk about
-a second type that depends on the first: a container's element type, say.
-The class declares it with `type Elem c`, and each instance says what it is.
+A class has one type parameter, and an *associated type* lets it refer to a
+second type that depends on the first: a container's element type, say.
+The class declares it with `type Elem c`, and each instance sets it.
 `Elem (Pair Int)` is `Int`, and `Elem (Array String)` is `String`. `first`
 returns an `Option (Elem c)`, since an array may have no first element.
 

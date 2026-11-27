@@ -176,6 +176,8 @@ fun functionEnd(d : Asm.Dialect, tag : Int) -> Asm.Symbol =
 --- Function `tag`, with a line table row at each change of position if `rows`,
 --- and the labels `marks` asks for (`markKey`). Each call that has a position
 --- gets a label at its return address, appended to `calls` with the position.
+--- Appends every safepoint map of `l` to `placed`, in ascending order of the
+--- return address its label is placed at.
 fun emitFunc(
 	asm : Asm.Asm,
 	f : Func Inst,
@@ -185,8 +187,10 @@ fun emitFunc(
 	rows : Bool,
 	marks : Map.Map Int Asm.Symbol,
 	calls : Vec (Asm.Symbol, Int),
+	placed : Vec Frame.SafepointMap,
 	out : Vec (Item Inst),
 ) -> Unit {
+	let start = len(out)
 	let b = Code {
 		items        = out
 		at           = 0
@@ -260,6 +264,42 @@ fun emitFunc(
 	}
 	cfi(b, EndProc)
 	if rows { emit(b, Label(functionEnd(d, tag))) }
+	placeMaps(d, tag, l, out, start, placed)
+}
+
+-- Appends each map of `l` to `placed` in the order its label is placed in
+-- `items` from `start` on, which is the order of the return addresses: the
+-- assembler places items in the order they come, and nothing it does moves
+-- code within a section (`Turkey.Assembler.finish`).
+--
+-- `l.maps` is in another order, for two reasons. The blocks are placed in
+-- `blockOrder`, not in the order `Frame.layout` visits them. And the call of
+-- every poll and allocation stub is in the cold code after all the blocks.
+-- The frame table is written in this order so that the runtime finds it
+-- ascending and need not sort it (`Turkey.Heap.frameTableSet`).
+fun placeMaps(
+	d : Asm.Dialect,
+	tag : Int,
+	l : Frame.Layout,
+	items : Vec (Item Inst),
+	start : Int,
+	placed : Vec Frame.SafepointMap,
+) -> Unit {
+	let byLabel = Map.new()
+	for m in l.maps {
+		Map.put(byLabel, Asm.spell(safepointLabel(d, tag, m.block, m.index)), m)
+	}
+	let before = len(placed)
+	for var k = start; k < len(items); k = k + 1 {
+		if let Label(sym) = items[k] {
+			if let Some(m) = Map.get(byLabel, Asm.spell(sym)) { Vec.push(placed, m) }
+		}
+	}
+	-- A map whose label is never placed names a return address no code has,
+	-- and the assembler refuses it; one placed twice is two labels of one name.
+	if len(placed) - before != len(l.maps) {
+		error("internal error: a safepoint label is not placed exactly once")
+	}
 }
 
 --- The blocks of `f` in the order `emitFunc` places them: reverse postorder,
@@ -1827,18 +1867,22 @@ fun byteLength(text : String) -> Int {
 --- address's distance from the entry, its number of roots, and each root's
 --- offset from `x29`, signed (`Turkey.Frame.layout`).
 ---
+--- `functions` holds each function's number and its maps as `emitFunc`
+--- placed them, in the order the functions' code is placed. The entries are
+--- then in ascending order of return address.
+---
 --- A distance must fit in a signed 32-bit field, so the code must be under
 --- 2 GB. `Turkey.Assembler` refuses a distance that does not fit; on the
 --- assembly path nothing here checks it.
 fun emitFrameTable(
 	asm : Asm.Asm,
-	layouts : Vec (Int, Frame.Layout),
+	functions : Vec (Int, Vec Frame.SafepointMap),
 	out : Vec (Item Inst),
 ) -> Unit {
-	-- The emitter cannot sort this: it writes labels, whose addresses are not
-	-- known until the assembler has placed them. So the emitted format only
-	-- carries the facts across, and the runtime builds the structure it
-	-- queries.
+	-- The emitter knows no addresses: it writes labels, which the assembler
+	-- places. It knows their order, though, and the order is all a sorted
+	-- table needs, so the runtime builds its lookup from this without
+	-- sorting it.
 	let b = code(out, False, asm.dialect)
 	let d = asm.dialect
 	emit(b, Section(Asm.Constants))
@@ -1846,10 +1890,10 @@ fun emitFrameTable(
 	emit(b, Global(Asm.frameTableSymbol(d)))
 	emit(b, Label(Asm.frameTableSymbol(d)))
 	var n = 0
-	for (_, l) in layouts { n = n + len(l.maps) }
+	for (_, maps) in functions { n = n + len(maps) }
 	tableField(b, n, "safepoint count")
-	for (tag, l) in layouts {
-		for m in l.maps {
+	for (tag, maps) in functions {
+		for m in maps {
 			-- The return address is a distance and not an address because both
 			-- labels are in the code, so the distance is fixed once the program
 			-- is linked, and the table needs no relocation at load: it is

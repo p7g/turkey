@@ -6,8 +6,9 @@ two methods: `iter` returns the first position, and `next` returns the
 element at a position with the position after it, or `Iter.Done`.
 
 `next` changes nothing. A position is a value that can be kept and stepped
-from again, and a second loop over a `Countdown` starts from the top. Nothing
-asks for a length, so a type can be iterated even when it can't be indexed.
+from again, and a second loop over a `Countdown` starts from the top. Neither
+method asks for a length, so a type can be iterated even when it can't be
+indexed.
 
 <!-- run -->
 ```kotlin

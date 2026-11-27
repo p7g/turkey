@@ -1,13 +1,13 @@
 # Existential types
 
-A constructor can hide the type of what it holds. `Shown[Show a](a)` says
+A constructor can hide the type of what it holds. `Shown[Show a](a)` declares
 that a `Shown` holds a value of *some* type `a` that has a `Show` instance.
 Each `Shown` can hold a different type, and they all have the one type
 `Shown`, so an array can mix numbers, strings and options.
 
 A pattern opens one, in a function's parameter or a `match` arm. Inside the
-function that opened it, the hidden type is known only by what the brackets
-said: `value` can be shown, and that's all.
+function that opened it, the hidden type has only the instances the
+brackets declared, so `cell` can show `value` and do nothing else with it.
 
 <!-- run -->
 ```kotlin

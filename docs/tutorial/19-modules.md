@@ -2,9 +2,9 @@
 
 Each `.gob` file is a module, named by its path: `Geometry.gob` beside the
 program is the module `Geometry`, and `Shapes/Circle.gob` would be
-`Shapes.Circle`. A module's `export` list says which of its names others may
-use. `Shape(..)` exports the type with its constructors, and `Shape` alone
-would export the type and keep them hidden.
+`Shapes.Circle`. A module's `export` list names what other modules may use.
+`Shape(..)` exports the type with its constructors, and `Shape` alone would
+export the type and keep them hidden.
 
 An import loads a module and names what it brings in. `import Geometry`
 gives the qualified names `Geometry.area` and `Geometry.Shape`, `as` gives
@@ -46,8 +46,8 @@ fun main() {
 3.14159
 ```
 
-`pi` isn't exported, so it is the module's own. The Prelude is imported into
-every module without asking, which is where `print`, `Option` and the
+`pi` isn't exported, so only `Geometry` can use it. The Prelude is imported
+into every module without asking, which is where `print`, `Option` and the
 qualifiers `String`, `Vec` and `Map` come from.
 
 ## In the reference

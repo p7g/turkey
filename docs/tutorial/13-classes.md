@@ -4,9 +4,9 @@ A class names operations that many types can have. Its body lists method
 signatures, and an instance gives them for one type. A method is called like
 any function, and the argument's type picks the instance.
 
-An instance can depend on others: `Describe (Array a) : Describe a` says
-that an array can be described whenever its elements can, and the one
-instance covers arrays of anything describable.
+An instance can depend on others: `Describe (Array a) : Describe a` declares
+that an array can be described whenever its elements can, so one instance
+covers arrays of anything describable.
 
 <!-- run -->
 ```kotlin

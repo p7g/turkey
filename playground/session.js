@@ -1,6 +1,6 @@
-// A compile-and-run session for one editor on a page: the editor's
-// highlighting and diagnostic marks, Run and Stop, Format, and the output
-// pane. Compiling happens in one Worker, checking, highlighting and
+// A compile-and-run session for one program on a page: its files' editors,
+// their highlighting and diagnostic marks, Run and Stop, Format, and the
+// output pane. Compiling happens in one Worker, checking, highlighting and
 // formatting in a second, and running in a third, so the page itself never
 // waits. The playground and each lesson of the tour start one.
 //
@@ -8,12 +8,17 @@
 // relative to itself, so a page in another directory starts the same ones.
 
 import { diagnosticsFor, marksFor } from "./diagnostics.js";
-import { attachEditor, replaceText } from "./editor.js";
+import { replaceText } from "./editor.js";
+import { attachFiles } from "./files.js";
+
+// The most characters the output pane keeps of a run's output. A program that
+// prints without end would otherwise grow the page until the tab hangs.
+const OUTPUT_CAP = 1 << 20;
 
 /**
- * Starts a session over `elements`, an object holding the page's
- * `source` textarea, the `highlighted` code element beneath it, the `run`,
- * `stop` and `format` buttons, the `output` pane, the `formatError`
+ * Starts a session over `elements`, an object holding the page's `files`,
+ * the element holding the program's editors as `attachFiles` takes it, the
+ * `run`, `stop` and `format` buttons, the `output` pane, the `formatError`
  * element beside the editor, and the `state` and `note` status elements.
  *
  * Without `lazy`, the compiler loads at once and Run waits for it. With
@@ -21,14 +26,23 @@ import { attachEditor, replaceText } from "./editor.js";
  * or Run is pressed, which then runs the program once the compiler is ready.
  * `timeLimit()` returns how many seconds a run may take.
  *
- * Returns `{ editor, load, show, cancel }`: the editor `attachEditor` returned,
- * `load()`, `show(parts)`, which fills the output pane with `[kind,
+ * A running program's output appears in the pane as it is written, at most
+ * once per animation frame. Stop and the time limit keep what was written.
+ * The pane keeps the last `OUTPUT_CAP` characters of a run, with a note when
+ * it has dropped earlier ones.
+ *
+ * With `editable`, the files can be added, renamed and removed, as
+ * `attachFiles` says. Run compiles them all, and Format lays out the file
+ * shown.
+ *
+ * Returns `{ files, load, show, cancel }`: the file set `attachFiles`
+ * returned, `load()`, `show(parts)`, which fills the output pane with `[kind,
  * text]` parts, each a `<pre>` of that class, leaving out empty ones; and
  * `cancel()`, which stops a compile or run in flight, as Stop does, and drops
  * a Run that waits for the compiler.
  */
-export function startSession(elements, { lazy = false, timeLimit = () => 10 } = {}) {
-  const { source, highlighted, output, formatError, state, note } = elements;
+export function startSession(elements, { lazy = false, editable = false, timeLimit = () => 10 } = {}) {
+  const { output, formatError, state, note } = elements;
   const runButton = elements.run;
   const stopButton = elements.stop;
   const formatButton = elements.format;
@@ -39,40 +53,50 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
   let tools = null; // the Worker that highlights and formats
   let toolsReady = false;
   let formatting = null; // the id of the Format in flight, or null
+  let formattingFile = null; // the file it lays out
 
   // A keystroke highlights at once when none is in flight. At most one is in
-  // flight, and only the latest text waits behind it, so a burst of keystrokes
-  // during a highlight costs one more, and a Format never queues behind many.
+  // flight, and only each file's latest text waits behind it, so a burst of
+  // keystrokes during a highlight costs one more, and a Format never queues
+  // behind many. A request's id is its file's, which its reply carries back.
   let highlighting = false;
-  let pendingHighlight = null;
+  const pendingHighlights = new Map(); // file id -> text
   function flushHighlight() {
-    if (pendingHighlight !== null && toolsReady && !highlighting) {
-      tools.postMessage({ type: "highlight", id: 0, source: pendingHighlight });
-      pendingHighlight = null;
+    if (pendingHighlights.size > 0 && toolsReady && !highlighting) {
+      const [[id, text]] = pendingHighlights;
+      pendingHighlights.delete(id);
+      tools.postMessage({ type: "highlight", id, source: text });
       highlighting = true;
     }
   }
-  // The editor's marks come from `turkey check`, run in the tools Worker once
-  // typing has paused for `IDLE_MS`, and at once when a Run fails to compile.
-  // A check takes a large part of a second whatever the program's size, since
-  // most of it goes on the Prelude, and the Worker highlights nothing while
-  // one runs. Waiting for a pause keeps checks from running mid-word and
-  // holding up the highlighting of the next keystrokes. One check is in
-  // flight at a time, a text already checked is not checked again, and a
-  // reply for text since edited is dropped. A check that failed leaves the
-  // marks as they were.
+
+  // The editors' marks come from `turkey check` on all the files, run in the
+  // tools Worker once typing has paused for `IDLE_MS`, and at once when a
+  // Run fails to compile. A check takes a large part of a second whatever
+  // the program's size, since most of it goes on the Prelude, and the Worker
+  // highlights nothing while one runs. Waiting for a pause keeps checks from
+  // running mid-word and holding up the highlighting of the next
+  // keystrokes. One check is in flight at a time, files already checked are
+  // not checked again, and a reply for files since edited, added, renamed
+  // or removed is dropped. A check that failed leaves the marks as they
+  // were. Marking changes no file's text, so it saves nothing.
   const IDLE_MS = 500;
   let checking = false;
   let checkAgain = false; // a check was asked for while one was in flight
-  let checked = null; // the text the marks were made for
+  let checked = null; // the files the marks were made for, as `keyOf` gives them
   let idle = null;
+  const keyOf = (pairs) => JSON.stringify(pairs);
   function checkWhenIdle() {
     clearTimeout(idle);
     idle = setTimeout(checkNow, IDLE_MS);
   }
   function checkNow() {
     clearTimeout(idle);
-    if (!toolsReady || source.value === checked) {
+    if (!toolsReady) {
+      return;
+    }
+    const pairs = files.all();
+    if (keyOf(pairs) === checked) {
       return;
     }
     if (checking) {
@@ -80,24 +104,50 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
       return;
     }
     checking = true;
-    tools.postMessage({ type: "check", id: 0, source: source.value });
+    tools.postMessage({ type: "check", id: 0, files: pairs });
   }
-  function checkedSource(data) {
+  function checkedFiles(data) {
     checking = false;
-    if (data.source === source.value && data.diagnostics !== null) {
-      checked = data.source;
-      editor.mark(marksFor(data.source, data.diagnostics));
+    const key = keyOf(data.files);
+    if (data.diagnostics !== null && key === keyOf(files.all())) {
+      checked = key;
+      for (const file of files.list()) {
+        const marks = marksFor(file.textarea.value, data.diagnostics, file.name);
+        file.editor.mark(marks);
+        markTab(file, marks);
+      }
     }
     if (checkAgain) {
       checkAgain = false;
       checkNow();
     }
   }
+  // Marks a file's tab with the worst of its marks, so that a file not shown
+  // still says it has a problem.
+  function markTab(file, marks) {
+    const errors = marks.filter((m) => m.severity === "error").length;
+    const warnings = marks.length - errors;
+    if (marks.length === 0) {
+      delete file.tab.dataset.problems;
+      file.tab.removeAttribute("title");
+      return;
+    }
+    file.tab.dataset.problems = errors > 0 ? "error" : "warning";
+    const counted = (n, noun) => `${n} ${noun}${n === 1 ? "" : "s"}`;
+    file.tab.title = [
+      ...(errors > 0 ? [counted(errors, "error")] : []),
+      ...(warnings > 0 ? [counted(warnings, "warning")] : []),
+    ].join(", ");
+  }
 
-  const editor = attachEditor(source, highlighted, (text) => {
-    pendingHighlight = text;
-    flushHighlight();
-    checkWhenIdle();
+  const files = attachFiles(elements.files, {
+    editable,
+    say: (...parts) => note.replaceChildren(...parts),
+    requestHighlight(file, text) {
+      pendingHighlights.set(file.id, text);
+      flushHighlight();
+      checkWhenIdle();
+    },
   });
 
   let compiler = null; // the compile Worker
@@ -135,6 +185,109 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
           return element;
         }),
     );
+  }
+
+  // -- Streamed output ---------------------------------------------------------
+
+  // The pane of the run in flight, or null: its warnings, a note that output
+  // was dropped, and one `<pre>` holding the program's output as a text node
+  // per stretch of a stream, stderr's in a styled span. Writes wait in
+  // `pending` until the next animation frame, and are cut to the cap there
+  // too, since a hidden tab runs no frames.
+  let live = null;
+
+  function beginStream(diagnostics) {
+    const make = (kind) => {
+      const element = document.createElement("pre");
+      element.className = kind;
+      element.hidden = true;
+      return element;
+    };
+    const warning = make("warning");
+    warning.textContent = diagnostics;
+    warning.hidden = diagnostics === "";
+    const trimmed = make("status");
+    trimmed.textContent = `Output before the last ${OUTPUT_CAP / 1024} KB is not shown.`;
+    live = { warning, trimmed, body: make("stdout"), nodes: [], size: 0, pending: [], pendingSize: 0, dropped: false, frame: 0 };
+    output.replaceChildren(warning, trimmed, live.body);
+  }
+
+  function streamed(chunks) {
+    for (const [stream, text] of chunks) {
+      const end = live.pending[live.pending.length - 1];
+      if (end !== undefined && end[0] === stream) {
+        end[1] += text;
+      } else {
+        live.pending.push([stream, text]);
+      }
+      live.pendingSize += text.length;
+    }
+    // Drop from the front until at most the cap is left.
+    while (live.pendingSize > OUTPUT_CAP) {
+      const excess = live.pendingSize - OUTPUT_CAP;
+      const first = live.pending[0];
+      live.dropped = true;
+      if (first[1].length <= excess) {
+        live.pending.shift();
+        live.pendingSize -= first[1].length;
+      } else {
+        first[1] = first[1].slice(excess);
+        live.pendingSize -= excess;
+      }
+    }
+    if (live.frame === 0) {
+      const mine = live;
+      live.frame = requestAnimationFrame(() => {
+        mine.frame = 0;
+        if (mine === live) {
+          flushStream();
+        }
+      });
+    }
+  }
+
+  // Moves what is pending into the pane and trims the pane to the cap.
+  function flushStream() {
+    const { body, nodes } = live;
+    for (const [stream, text] of live.pending) {
+      const node = document.createTextNode(text);
+      let element = node;
+      if (stream === "stderr") {
+        element = document.createElement("span");
+        element.className = "stderr";
+        element.append(node);
+      }
+      body.append(element);
+      nodes.push({ element, node });
+      live.size += text.length;
+    }
+    live.pending = [];
+    live.pendingSize = 0;
+    while (live.size > OUTPUT_CAP) {
+      const excess = live.size - OUTPUT_CAP;
+      const first = nodes[0];
+      live.dropped = true;
+      if (first.node.length <= excess) {
+        first.element.remove();
+        nodes.shift();
+        live.size -= first.node.length;
+      } else {
+        first.node.deleteData(0, excess);
+        live.size -= excess;
+      }
+    }
+    body.hidden = nodes.length === 0;
+    live.trimmed.hidden = !live.dropped;
+  }
+
+  // Ends the stream, keeping what it shows, and returns its pane for the
+  // run's last lines to follow.
+  function endStream() {
+    const ended = live;
+    cancelAnimationFrame(ended.frame);
+    flushStream();
+    live = null;
+    return ended;
   }
 
   function startCompiler() {
@@ -198,14 +351,17 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
       if (worker !== runner || phase !== "running") {
         return;
       }
+      if (data.type === "write") {
+        streamed(data.chunks);
+        return;
+      }
       const trapped = data.trap !== null;
+      // The compiler's warnings, with the refused-functions one only when the
+      // program trapped.
+      live.warning.textContent = diagnosticsFor(pendingDiagnostics, trapped);
+      live.warning.hidden = live.warning.textContent === "";
       finishRun(
         [
-          // The compiler's warnings, with the refused-functions one only when
-          // the program trapped.
-          ["warning", diagnosticsFor(pendingDiagnostics, trapped)],
-          ["stdout", data.stdout],
-          ["stderr", data.stderr],
           ["error", trapped ? `trap: ${data.trap}` : ""],
           ["status", trapped ? "no exit status (trapped)" : `exit status ${data.status}`],
         ],
@@ -221,6 +377,9 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
       clearTimeout(timer);
       worker.terminate();
       runner = null;
+      if (live !== null) {
+        endStream();
+      }
       show([["error", event.message || "the run Worker failed"]]);
       setPhase("idle", "Run failed.");
     };
@@ -228,14 +387,29 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
 
   let pendingDiagnostics = ""; // the compile's diagnostics, for the run that follows
 
-  // Ends the run in progress. A finished Worker is dropped for a fresh one, so
-  // no run sees another's leftovers.
+  // Ends the run in progress, and follows the output it wrote with `parts`. A
+  // finished Worker is dropped for a fresh one, so no run sees another's
+  // leftovers.
   function finishRun(parts, text) {
     clearTimeout(timer);
     runner.terminate();
     startRunner();
-    show(parts);
+    append(endStream(), parts);
     setPhase("idle", text);
+  }
+
+  // Adds the non-empty `[kind, text]` parts after the pane `ended`.
+  function append(ended, parts) {
+    ended.body.parentNode.append(
+      ...parts
+        .filter(([, line]) => line !== "")
+        .map(([kind, line]) => {
+          const element = document.createElement("pre");
+          element.className = kind;
+          element.textContent = line;
+          return element;
+        }),
+    );
   }
 
   function compiled(data) {
@@ -258,6 +432,7 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
       startRunner();
     }
     setPhase("running", "Running...");
+    beginStream(diagnosticsFor(pendingDiagnostics, false));
     timer = setTimeout(
       () => finishRun([["error", `Timed out after ${limit} s; the program was stopped.`]], "Timed out."),
       limit * 1000,
@@ -276,7 +451,10 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
     if (phase === "running") {
       runner.terminate();
       startRunner();
+      // Keep what the program wrote, and add the status after it.
+      append(endStream(), [["status", "Stopped."]]);
       setPhase("idle", "Stopped.");
+      return;
     } else if (phase === "compiling") {
       compiler.terminate();
       startCompiler();
@@ -291,7 +469,7 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
     currentId = ++nextId;
     show([]);
     setPhase("compiling", "Compiling...");
-    compiler.postMessage({ type: "compile", id: currentId, source: source.value });
+    compiler.postMessage({ type: "compile", id: currentId, files: files.all() });
   }
 
   runButton.addEventListener("click", () => {
@@ -333,12 +511,12 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
         flushHighlight();
         checkNow();
       } else if (data.type === "checked") {
-        checkedSource(data);
+        checkedFiles(data);
       } else if (data.type === "failed") {
         failed(data.text);
       } else if (data.type === "highlighted") {
         highlighting = false;
-        editor.highlighted(data.source, data.html);
+        files.byId(data.id)?.editor.highlighted(data.source, data.html);
         flushHighlight();
       } else if (data.type === "formatted" && data.id === formatting) {
         formatted(data);
@@ -357,14 +535,14 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
       formatError.textContent = `${data.diagnostics.trim()}\n${status}`;
       formatError.hidden = false;
       note.textContent = "Format failed; the source is unchanged.";
-    } else if (source.value !== data.source) {
+    } else if (formattingFile.textarea.value !== data.source || files.active() !== formattingFile) {
       // Replacing the source now would throw away what was typed since Format
       // was pressed.
-      note.textContent = "The source changed while it was formatted; press Format again.";
+      note.textContent = "The source changed, or another file was shown, while it was formatted; press Format again.";
     } else if (data.text === data.source) {
       note.textContent = "Already formatted.";
     } else {
-      replaceText(source, data.text);
+      replaceText(formattingFile.textarea, data.text);
       note.textContent = "Formatted.";
     }
   }
@@ -378,12 +556,20 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
     formatButton.disabled = true;
     formatError.hidden = true;
     note.textContent = "Formatting...";
-    tools.postMessage({ type: "format", id: formatting, source: source.value });
+    formattingFile = files.active();
+    tools.postMessage({
+      type: "format",
+      id: formatting,
+      source: formattingFile.textarea.value,
+      name: formattingFile.name,
+    });
   });
 
-  source.addEventListener("input", () => {
+  files.onChange(() => {
     formatError.hidden = true;
     load();
+    // A file added, renamed or removed changes the program without an edit.
+    checkWhenIdle();
   });
 
   // Starts the three Workers, once.
@@ -409,5 +595,5 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
     stop();
   }
 
-  return { editor, load, show, cancel };
+  return { files, load, show, cancel };
 }

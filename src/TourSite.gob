@@ -8,16 +8,20 @@
 --
 -- * `index.html`, the contents, and `NN-slug.html` for each lesson;
 -- * `programs/NN-slug.gob`, each lesson's program that runs in the browser,
---   and `examples.json`, which lists them for the playground's picker as
---   [{"name": SLUG, "title": TITLE, "file": "programs/SLUG.gob"}].
+--   with its module files under `programs/NN-slug/`, and `examples.json`,
+--   which lists them for the playground's picker as
+--   [{"name": SLUG, "title": TITLE, "file": "programs/SLUG.gob"}], with
+--   `"modules": [{"name": FILE, "file": "programs/SLUG/FILE"}]` in the entry
+--   of a program that has module files.
 --
 -- The pages take their scripts and style sheets from `../playground/`, so OUT
 -- is a directory beside the playground's. Each lesson's first `run` example
--- is its program: it goes in the page's editor, with its recorded output
--- under it. A program the browser cannot run, one with `module` files or a
--- `skip: wasm32-wasi` directive, is shown as its other examples are, with Run
--- left out and the reason said. Every other example is highlighted here, so
--- that a page reads without JavaScript.
+-- is its program: it goes in the page's editor, as `main.gob`, with an
+-- editor of its own for each of its `module` files, and its recorded output
+-- under it. A program the browser cannot run, one with a `skip: wasm32-wasi`
+-- directive, is shown as its other examples are, with Run left out and the
+-- reason said. Every other example is highlighted here, so that a page
+-- reads without JavaScript.
 --
 -- The build fails, after saying why, when a lesson cannot be read as the test
 -- harness reads it, when an example other than an `error` one is not as
@@ -39,6 +43,17 @@ import Turkey.Highlight as Highlight
 import Turkey.Markdown as Markdown
 import Turkey.Markdown (Hooks(..), escape)
 import Turkey.Source (Source(..))
+
+-- The name of a lesson's program on its page. The test harness writes the
+-- program as `Main.gob`, beside its `module` files, as the reference's
+-- `module:` directive says; the browser's entry is `main.gob`, the one name
+-- `playground/files.js` allows the entry, and the name a `#code=` share link
+-- implies. Nothing imports the entry, so the two compile the same program.
+-- They differ only where a file is named: a diagnostic, or a panic's trace,
+-- which a recorded `stderr` gives as `Main.gob` and the browser as
+-- `main.gob`. The page names the program `main.gob` throughout, so its label
+-- matches the tab and what Run reports.
+let entryName = "main.gob"
 
 -- Where a link to `../ref/CHAPTER.md` goes.
 let referenceURL = "https://github.com/p7g/turkey/blob/main/docs/ref/"
@@ -121,6 +136,9 @@ fun main() {
 		Vec.push(files, (lesson.slug + ".html", page(targets, lessons, k, problems)))
 		if let Some(p) = live(lesson) {
 			Vec.push(files, ("programs/" + lesson.slug + ".gob", lesson.examples[p].source))
+			for (name, source) in moduleFiles(lesson, lesson.examples[p]) {
+				Vec.push(files, ("programs/" + lesson.slug + "/" + name, source))
+			}
 		}
 	}
 	Vec.push(files, ("index.html", contents(lessons)))
@@ -242,11 +260,51 @@ fun parse(path : String, slug : String, text : String, problems : Vec String) ->
 		Run -> True
 		_   -> False
 	})
-	if Option.isNone(program) {
+	let Some(p) = program else {
 		Vec.push(problems, path + ": a lesson needs a 'run' example, its program")
 		return None
 	}
-	Some(Lesson { slug, title, body = String.unlines(body), blocks, examples, program })
+	let lesson = Lesson { slug, title, body = String.unlines(body), blocks, examples, program }
+	for (name, _) in moduleFiles(lesson, examples[p]) {
+		if !isModuleFileName(name) {
+			Vec.push(
+				problems,
+				path
+					+ ": the program's module file '"
+					+ name
+					+ "' is not named as the page requires: its module's path, each part a capital "
+					+ "letter then letters, digits, '_' and \"'\", with '.gob' after the last, "
+					+ "and at most "
+					+ show(maxNameLength)
+					+ " characters",
+			)
+			return None
+		}
+	}
+	Some(lesson)
+}
+
+-- The longest module file name the page accepts.
+let maxNameLength = 128
+
+-- Whether `name` is a module file name the page's editor accepts, by the rule
+-- `playground/files.js` checks a file name it is given by: the module's path,
+-- each part a capital letter, then letters, digits, `_` and `'`, with `.gob`
+-- after the last, and at most `maxNameLength` characters. A lesson whose
+-- program has another would put a file on the page that its share links and
+-- storage refuse.
+fun isModuleFileName(name : String) -> Bool {
+	if String.byteLength(name) > maxNameLength { return False }
+	let Some(path) = String.stripSuffix(name, ".gob") else { return False }
+	Iter.all(
+		String.split(path, "/"),
+		fun(part) = !String.isEmpty(part)
+			&& Iter.all(Iter.enumerate(String.codePoints(part)), fun((i, c)) = if i == 0 {
+				Char.isAsciiUpper(c)
+			} else {
+				Char.isAsciiAlphanumeric(c) || c == '_' || c == '\''
+			}),
+	)
 }
 
 fun withStderr(e : Example, stderr : String) -> Example = Example {
@@ -327,11 +385,22 @@ fun nonBlank(lines : Vec String, from : Int) -> Int {
 }
 
 -- The index of the lesson's program, if the browser can run it: it has no
--- module files and no `skip`.
+-- `skip`.
 fun live(lesson : Lesson) -> Option Int {
 	let p = lesson.program?
-	let e = lesson.examples[p]
-	if len(e.modules) == 0 && Option.isNone(e.skip) { Some(p) } else { None }
+	if Option.isNone(lesson.examples[p].skip) { Some(p) } else { None }
+}
+
+-- The module files of `e`, an example of `lesson`, as (file name, source),
+-- in the order the lesson gives them.
+fun moduleFiles(lesson : Lesson, e : Example) -> Array (String, String) {
+	let out = []
+	for m in e.modules {
+		if let ModuleFile(name, source) = lesson.blocks[m] {
+			Vec.push(out, (name, source))
+		}
+	}
+	Vec.toArray(out)
 }
 
 -- -- the reference's anchors ----------------------------------------------------------
@@ -587,9 +656,11 @@ fun plainTitle(lesson : Lesson) -> String = String.replace(lesson.title, "`", ""
 fun workspace(lesson : Lesson) -> String {
 	let e = lesson.examples[lesson.program!]
 	let output = Option.unwrapOr(e.stdout, "")
-	if let Some(p) = live(lesson) {
-		let source = lesson.examples[p].source
-		let rows = show(Iter.minimum([len(String.lines(source)) + 1, 30])!)
+	let modules = moduleFiles(lesson, e)
+	let Some(why) = e.skip else {
+		let editors = String.builder()
+		String.push(editors, editor(entryName, e.source, True))
+		for (name, source) in modules { String.push(editors, editor(name, source, False)) }
 		return "<section class=\"workspace\" aria-label=\"The program\">\n"
 			+ "<div class=\"bar\">\n"
 			+ "<button id=\"run\" type=\"button\" disabled>Run</button>\n"
@@ -599,14 +670,9 @@ fun workspace(lesson : Lesson) -> String {
 			+ "<button id=\"share\" type=\"button\" disabled>Share</button>\n"
 			+ "<span id=\"state\" role=\"status\" aria-live=\"polite\"></span>\n"
 			+ "</div>\n<pre id=\"format-error\" class=\"error\" hidden></pre>\n"
-			+ "<div class=\"editor\">\n<pre class=\"turkey\" aria-hidden=\"true\"><code id=\"highlighted\">"
-			+ Highlight.html(source)
-			+ "</code></pre>\n<textarea id=\"source\" rows=\""
-			+ rows
-			+ "\" spellcheck=\"false\" aria-label=\"Turkey source\" aria-describedby=\"keys\" "
-			+ "autocapitalize=\"off\" autocomplete=\"off\" autocorrect=\"off\" wrap=\"off\">\n"
-			+ escape(source)
-			+ "</textarea>\n</div>\n"
+			+ "<div id=\"files\" class=\"files\">\n"
+			+ String.build(editors)
+			+ "</div>\n"
 			+ "<p id=\"keys\">Tab inserts a tab; press Escape and then Tab to move on from the editor. Problems are underlined as you type; F8 and Shift+F8 (Fn+F8 on a Mac) move to the next and previous one, and the caret on one shows its message.</p>\n"
 			+ "<p id=\"note\" role=\"status\" aria-live=\"polite\"></p>\n"
 			+ "<div id=\"output\" aria-live=\"polite\" aria-label=\"Output\">"
@@ -621,21 +687,13 @@ fun workspace(lesson : Lesson) -> String {
 			+ "<pre class=\"status\">Recorded when this page was made. Run runs it in your browser.</pre>"
 			+ "</div>\n</section>\n"
 	}
-	let reason = match e.skip {
-		Some(why) -> "This program does not run in the browser: " + escape(why) + "."
-		None -> "This program has more than one file, and the browser compiles one, so it does not run here. "
-			+ "The output is what <code>turkey build Main.gob</code> gives."
-	}
 	let files = String.builder()
-	for m in e.modules {
-		if let ModuleFile(name, source) = lesson.blocks[m] {
-			String.push(files, file(name, source))
-		}
-	}
-	let main = if len(e.modules) > 0 { file("Main.gob", e.source) } else { code(e.source) }
+	for (name, source) in modules { String.push(files, file(name, source)) }
+	let main = if len(modules) > 0 { file(entryName, e.source) } else { code(e.source) }
 	"<section class=\"workspace static\" aria-label=\"The program\">\n<p class=\"reason\">"
-		+ reason
-		+ "</p>\n"
+		+ "This program does not run in the browser: "
+		+ escape(why)
+		+ ".</p>\n"
 		+ String.build(files)
 		+ main
 		+ "<div class=\"label\">Output</div>\n<pre class=\"output\">"
@@ -649,6 +707,30 @@ fun workspace(lesson : Lesson) -> String {
 				+ "</pre>\n",
 		)
 		+ "</section>\n"
+}
+
+-- The editor of the file `name`, holding `source`, highlighted, and as many
+-- rows tall as it has lines, up to 30. The entry's editor has the ids the
+-- page's scripts find the program by; `playground/files.js` puts a tab over
+-- each editor, and finds the file's name in `data-file`.
+fun editor(name : String, source : String, entry : Bool) -> String {
+	let rows = show(Iter.minimum([len(String.lines(source)) + 1, 30])!)
+	"<div class=\"editor\" data-file=\""
+		+ escape(name)
+		+ "\">\n<pre class=\"turkey\" aria-hidden=\"true\"><code"
+		+ (if entry { " id=\"highlighted\"" } else { "" })
+		+ ">"
+		+ Highlight.html(source)
+		+ "</code></pre>\n<textarea"
+		+ (if entry { " id=\"source\"" } else { "" })
+		+ " rows=\""
+		+ rows
+		+ "\" spellcheck=\"false\" aria-label=\"Turkey source, "
+		+ escape(name)
+		+ "\" aria-describedby=\"keys\" "
+		+ "autocapitalize=\"off\" autocomplete=\"off\" autocorrect=\"off\" wrap=\"off\">\n"
+		+ escape(source)
+		+ "</textarea>\n</div>\n"
 }
 
 -- The HTML of the fence `tour N`, which is the block `N` of the lesson, or of
@@ -731,24 +813,36 @@ fun code(source : String) -> String =
 fun examplesJSON(lessons : Vec Lesson) -> String {
 	let entries = []
 	for lesson in lessons {
-		if Option.isSome(live(lesson)) {
-			Vec.push(
-				entries,
-				"  {\"name\": "
-					+ json(lesson.slug)
-					+ ", \"title\": "
-					+ json(plainTitle(lesson))
-					+ ", \"file\": "
-					+ json("programs/" + lesson.slug + ".gob")
-					+ "}",
-			)
-		}
+		let Some(p) = live(lesson) else { continue }
+		let modules = Array.map(
+			moduleFiles(lesson, lesson.examples[p]),
+			fun((name, _)) = "{\"name\": "
+				+ json(name)
+				+ ", \"file\": "
+				+ json("programs/" + lesson.slug + "/" + name)
+				+ "}",
+		)
+		Vec.push(
+			entries,
+			"  {\"name\": "
+				+ json(lesson.slug)
+				+ ", \"title\": "
+				+ json(plainTitle(lesson))
+				+ ", \"file\": "
+				+ json("programs/" + lesson.slug + ".gob")
+				+ (if len(modules) == 0 {
+					""
+				} else {
+					", \"modules\": [" + String.join(modules, ", ") + "]"
+				})
+				+ "}",
+		)
 	}
 	"[\n" + String.join(entries, ",\n") + "\n]\n"
 }
 
--- `s` as a JSON string. A title is one line of text, so only `"` and `\`
--- need escaping.
+-- `s` as a JSON string. A title and a file name are each one line of text,
+-- so only `"` and `\` need escaping.
 fun json(s : String) -> String =
 	"\"" + String.replace(String.replace(s, "\\", "\\\\"), "\"", "\\\"") + "\""
 

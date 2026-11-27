@@ -279,8 +279,8 @@ some. It follows a `:`, the same `:` that gives an instance its
 requirements: `type Card : Ord = ...` says that `Card` has `Ord`. The
 compiler writes each instance from the declaration's constructors. It can
 write instances of three classes that a list may ask for, and it writes two
-more without being asked: `Debug` for every type, and `Object` for every type
-whose values are objects ([`Object` and
+more without being asked: `Debug` for every type whose fields have it, and
+`Object` for every type whose values are objects ([`Object` and
 `identical`](builtins.md#object-and-identical)):
 
 * **`Eq`.** Two values are equal when they were built by the same

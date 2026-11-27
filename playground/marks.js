@@ -36,17 +36,19 @@ export function attachMarks(textarea, overlay) {
   pre.append(code);
   overlay.after(pre);
 
+  // The tip and the status region are in the editor's own element, so they
+  // go with it when its file is removed or hidden. The tip is fixed in the
+  // viewport, which the editor's clipping does not reach.
   const tip = document.createElement("div");
   tip.className = "diagnostic-tip";
   tip.setAttribute("role", "tooltip");
   tip.hidden = true;
-  document.body.append(tip);
   // What the caret's tip says, for a screen reader. The tip itself is not a
   // live region, so a tip the pointer opens is not read out.
   const spoken = document.createElement("div");
   spoken.className = "visually-hidden";
   spoken.setAttribute("role", "status");
-  overlay.parentElement.after(spoken);
+  overlay.parentElement.append(tip, spoken);
 
   let marks = [];
   let text = textarea.value;

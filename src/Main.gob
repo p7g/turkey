@@ -117,8 +117,12 @@ import Turkey.Ast (
 	ForeignLibrary(..),
 	LibraryKind(..),
 	TypeKind(..),
-	patternVars,
+	Pat(..),
+	PatKind(..),
+	varPatterns,
 )
+import Turkey.JSON as JSON
+import Turkey.JSON (JSON(..))
 import Turkey.Libraries as Libraries
 import Turkey.Lint as Lint
 import Turkey.Lint (Level(..))
@@ -273,6 +277,13 @@ fun millis(d : Duration) -> String {
 -- does not.
 var linting = False
 
+-- How `--types` lists the types of the program's top-level bindings
+-- (`listTypes`): as text or as JSON.
+type TypesFormat = TypesText | TypesJSON
+
+-- The format `--types` asked for, or None when it was not given.
+var typesFormat : Option TypesFormat = None
+
 -- At most this many passes of `--fix`. Two checks whose fixes undo each other
 -- would otherwise rewrite a file for ever; past this many, they are reported
 -- as an internal error instead.
@@ -362,6 +373,11 @@ fun main() {
 							+ "'; the formats are 'text' and 'json'",
 					)
 				}
+				Long("types") -> match valueOf(p) {
+					"text" -> { typesFormat = Some(TypesText) }
+					"json" -> { typesFormat = Some(TypesJSON) }
+					other -> die("unknown types format '${other}'; the formats are 'text' and 'json'")
+				}
 				Long("timings") -> {
 					timings = True
 					Opt.measure(True)
@@ -397,6 +413,9 @@ fun main() {
 	}
 	if fixing && len(Set.elements(dumps)) > 0 {
 		die("'turkey check --fix' takes no --dump")
+	}
+	if let Some(_) = typesFormat {
+		if building || fixing { die("only 'turkey check' takes --types") }
 	}
 	let sink = if building {
 		Some(openSink(output, format, paths, len(Set.elements(dumps)) > 0))
@@ -1088,9 +1107,12 @@ fun compile(
 	if wants("classes") { dumpClasses(b, path) }
 	write(String.drain(b))
 	var at = Stopwatch.start()
-	let (checked, entry) = checkProgram(path)
+	let (checked, entry, groups) = checkSource(readOrDie(path))
 	at = lap("check", at)
 	if wants("types") { dumpTypes(b, checked, entry) }
+	-- Written at once, so that a program the later stages refuse still lists
+	-- the types it was given.
+	if let Some(format) = typesFormat { write(listTypes(format, checked, groups)) }
 	let program = lowered(checked)
 	at = lap("lower", at)
 	Lint.report(lint(checked))
@@ -1659,9 +1681,53 @@ fun registerTables(path : String, withClasses : Bool) -> (Decls.DeclTable, Class
 -- input rather than its output, because a scheme is what a reader can check by
 -- eye and evidence is not.
 fun dumpTypes(b : String.Builder, checked : Checked, entry : Modules.Module) -> Unit {
-	for (name, scheme) in signatures(entry, checked.env, checked.classes, checked.binders) {
+	for (name, _, scheme) in signatures(entry, checked.env, checked.classes, checked.binders) {
 		String.push(b, name + " : " + Ty.showScheme(scheme) + "\n")
 	}
+}
+
+-- What `--types` writes: the inferred type of each top-level binding and
+-- class method in every module of the program outside the library, a line
+-- each, a module's in the order it declares them. Under `TypesText` a line
+-- is `FILE:LINE:COLUMN: NAME : TYPE`; under `TypesJSON` it is one JSON object,
+-- `{"file":F,"line":L,"column":C,"name":S,"type":S}`, with its members in
+-- that order. The position is where the binding is declared, as `signatures`
+-- says, 1-based and counted in code points as a diagnostic's is.
+fun listTypes(
+	format : TypesFormat,
+	checked : Checked,
+	groups : Vec (Vec Modules.Module),
+) -> String {
+	let out = String.builder()
+	for group in groups {
+		for m in group {
+			if m.library { continue }
+			let found = signatures(m, checked.env, checked.classes, checked.binders)
+			for (name, span, scheme) in found {
+				let shown = Ty.showScheme(scheme)
+				match format {
+					TypesText -> String.push(
+						out,
+						"${span.file}:${span.line}:${span.col}: ${name} : ${shown}\n",
+					)
+					TypesJSON -> {
+						JSON.compact(
+							JObject([
+								("file", JString(span.file)),
+								("line", JInt(span.line)),
+								("column", JInt(span.col)),
+								("name", JString(name)),
+								("type", JString(shown)),
+							]),
+							out,
+						)
+						String.push(out, "\n")
+					}
+				}
+			}
+		}
+	}
+	String.build(out)
 }
 
 -- The typed Core the elaboration produces: what solving decided stops being
@@ -3480,7 +3546,7 @@ fun visibleConstructors(m : Modules.Module) -> Set.Set String {
 fun checkMain(entry : Modules.Module, env : Constraints.Env, classes : Classes.ClassTable) -> Unit {
 	for item in entry.program.decls {
 		if let DStmt(s) = item {
-			for name in bindingNames(s) {
+			for (name, _) in bindingNames(s) {
 				if name == Prelude.internal(entry.name, "main") {
 					if let Some(binding) = Constraints.lookup_(env, name) {
 						let scheme = reduced(classes, binding.scheme)
@@ -3537,9 +3603,6 @@ fun initialEnv(binders : Binders.Table) -> Constraints.Env {
 	env
 }
 
--- What `types` prints: the entry module's own bindings, under the names the
--- author wrote rather than the qualified ones resolution gave them -- the module
--- a name came from is not news to the person who wrote the file.
 -- A scheme with its family applications reduced at every level.
 --
 -- A field access has the type `Field.n r`, and once `r` is a known record that
@@ -3561,14 +3624,20 @@ fun reduced(classes : Classes.ClassTable, scheme : Ty.Scheme) -> Ty.Scheme {
 	out
 }
 
+-- The bindings and class methods `m` declares at the top level, in the order
+-- it declares them, each with where it is declared and its scheme. Each is
+-- under the name its author wrote rather than the qualified one resolution
+-- gave it: the module a name came from is not news to the person who wrote
+-- the file. A `fun` or a method is where its declaration starts, and a
+-- variable a `let` or `var` pattern binds is where the pattern writes it.
 fun signatures(
-	entry : Modules.Module,
+	m : Modules.Module,
 	env : Constraints.Env,
 	classes : Classes.ClassTable,
 	binders : Binders.Table,
-) -> Vec (String, Ty.Scheme) {
+) -> Vec (String, Source.Span, Ty.Scheme) {
 	let out = Vec.new(16)
-	for item in entry.program.decls {
+	for item in m.program.decls {
 		match item {
 			-- A method's scheme is stated by its class rather than inferred, but
 			-- it is still the thing a reader wants to see, and the class
@@ -3577,18 +3646,18 @@ fun signatures(
 				if let Some(info) = Map.get(classes.classes, c.name) {
 					for meth in c.methods {
 						if let Some(mi) = Map.get(info.methods, meth.name) {
-							Vec.push(out, (Classes.surfaceMember(meth.name), mi.scheme))
+							Vec.push(out, (Classes.surfaceMember(meth.name), meth.span, mi.scheme))
 						}
 					}
 				}
 			}
-			DStmt(s) -> for name in bindingNames(s) {
+			DStmt(s) -> for (name, span) in bindingNames(s) {
 				if let Some(binding) = Constraints.lookup_(env, name) {
 					let written = match Binders.named(binders, name) {
 						Some(id) -> Binders.binderAt(binders, id).name
 						None     -> name
 					}
-					Vec.push(out, (written, reduced(classes, binding.scheme)))
+					Vec.push(out, (written, span, reduced(classes, binding.scheme)))
 				}
 			}
 			_ -> {}
@@ -3597,11 +3666,21 @@ fun signatures(
 	out
 }
 
-fun bindingNames(s : Stmt) -> Vec String = match s.kind {
-	SFun(d)      -> [d.name]
-	SLet(pat, _) -> Vec.sort(patternVars(pat))
-	SVar(pat, _) -> Vec.sort(patternVars(pat))
+-- The names a top-level statement binds, each with where it is declared; a
+-- pattern's are sorted by name.
+fun bindingNames(s : Stmt) -> Vec (String, Source.Span) = match s.kind {
+	SFun(d)      -> [(d.name, d.span)]
+	SLet(pat, _) -> variablesOf(pat)
+	SVar(pat, _) -> variablesOf(pat)
 	_            -> []
+}
+
+fun variablesOf(pat : Pat) -> Vec (String, Source.Span) {
+	let out = Vec.new(4)
+	for v in varPatterns(pat) {
+		if let PVar(name) = v.kind { Vec.push(out, (name, v.span)) }
+	}
+	Vec.sortByKey(out, _.0)
 }
 
 -- The directory a path is in, as a search root. A path with no separator is in
@@ -3634,7 +3713,8 @@ fun usage() -> a =
 			+ "options: --target TARGET  --dump STAGE,...  --timings  --gc-verify"
 			+ "  --gc-stats  --export-runtime\n"
 			+ "         --allow CHECK,...  --warn CHECK,...  --deny CHECK,...  --deny-warnings\n"
-			+ "         --fix (check only)  --diagnostics=text|json\n"
+			+ "         --fix (check only)  --types=text|json (check only)\n"
+			+ "         --diagnostics=text|json\n"
 			+ "stages: "
 			+ String.join(stages, ", ")
 			+ "\n"
@@ -3644,7 +3724,12 @@ fun usage() -> a =
 			+ "note with its own file, positions and message. Lines and columns are\n"
 			+ "1-based and count code points, and a span ends before endLine:endColumn.\n"
 			+ "Positions are null for a diagnostic about a whole file. Other stderr lines\n"
-			+ "are not diagnostics.",
+			+ "are not diagnostics.\n"
+			+ "--types writes the type of each top-level binding and class method in the\n"
+			+ "program's own modules to stdout, once the program type-checks, a line\n"
+			+ "each: as FILE:LINE:COLUMN: NAME : TYPE, or under json as one object holding\n"
+			+ "file, line, column, name and type, where the line and column are where the\n"
+			+ "binding is declared.",
 	)
 
 fun die(message : String) -> a {

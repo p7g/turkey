@@ -1,6 +1,7 @@
 // The editor's diagnostic marks: a wavy underline under each span the checker
 // reported, red for an error and amber for a warning, and the message in a
-// tip beside it.
+// tip beside it. A binding's name carries its type the same way, in a mark
+// with no underline (`isProblem`).
 //
 // The underlines are drawn by a layer of their own, a `<pre>` over the
 // highlighted one and under the textarea, holding the same text in a
@@ -19,6 +20,12 @@
 // Escape hides the tip until the caret moves.
 
 import { shiftMarks } from "./diagnostics.js";
+
+// A mark of severity "type" is a binding's type over its name, as `types.js`
+// makes it. It is drawn without an underline and shown only to the pointer:
+// the caret and F8 go by the problems alone, so moving through the text
+// reads out nothing but them.
+const isProblem = (mark) => mark.severity !== "type";
 
 /**
  * Starts marking `textarea`, whose overlay `<pre>` is `overlay`. Returns `{
@@ -75,8 +82,8 @@ export function attachMarks(textarea, overlay) {
           nodes.push(document.createTextNode(piece));
         } else {
           const element = document.createElement("span");
-          const error = covering.some((i) => marks[i].severity === "error");
-          element.className = error ? "squiggle-error" : "squiggle-warning";
+          const worst = ["error", "warning"].find((s) => covering.some((i) => marks[i].severity === s));
+          element.className = worst === undefined ? "hint" : `squiggle-${worst}`;
           element.textContent = piece;
           nodes.push(element);
           stretches.push({ start: at, end: cut, element, covering });
@@ -208,7 +215,9 @@ export function attachMarks(textarea, overlay) {
       return;
     }
     dismissed = null;
-    const covering = marks.flatMap((m, i) => (m.start <= caret && caret <= m.end ? [i] : []));
+    const covering = marks.flatMap((m, i) =>
+      isProblem(m) && m.start <= caret && caret <= m.end ? [i] : [],
+    );
     const stretch = stretches.find(
       (s) => s.start <= caret && caret <= s.end && s.covering.some((i) => covering.includes(i)),
     );
@@ -227,7 +236,7 @@ export function attachMarks(textarea, overlay) {
     if (event.key === "Escape" && !tip.hidden) {
       hide();
       dismissed = textarea.selectionStart;
-    } else if (event.key === "F8" && plain && marks.length > 0) {
+    } else if (event.key === "F8" && plain && marks.some(isProblem)) {
       event.preventDefault();
       jump(event.shiftKey ? -1 : 1);
     }
@@ -236,7 +245,7 @@ export function attachMarks(textarea, overlay) {
   // Moves the caret to the start of the next mark after it, or with `-1` the
   // last one before it, wrapping around, and scrolls it into view.
   function jump(direction) {
-    const starts = [...new Set(marks.map((m) => m.start))].sort((a, b) => a - b);
+    const starts = [...new Set(marks.filter(isProblem).map((m) => m.start))].sort((a, b) => a - b);
     const caret = textarea.selectionStart;
     const to =
       direction > 0

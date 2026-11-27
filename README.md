@@ -131,7 +131,10 @@ make their certificates with that installation's `openssl`.
 `check` compiles as far as the last stage that can reject a program and
 writes nothing. Either command takes `--dump STAGE,...` to print what a stage
 produced: `build/stages/turkey check --dump types rectangles.gob` shows the
-inferred types, and running the compiler with no arguments lists the stages.
+inferred types of the entry module's bindings, and running the compiler with
+no arguments lists the stages. `check --types=text` lists the type of every
+top-level binding in every file of the program, each with where it is
+declared, and `--types=json` writes the same as JSON, a line each.
 `build --timings` reports on standard error how long each phase took, how the
 backend's time is spread over functions, and how much of the optimizer's work
 could run in parallel.

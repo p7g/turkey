@@ -1,4 +1,4 @@
-# `let ... else` and `while let`
+# `let ... else`
 
 `let ... else` is a pattern match that the rest of the block depends on.
 `let Some(number) = Int.parse(value) else { ... }` binds `number` for the rest
@@ -8,8 +8,6 @@ call that never returns, such as `error(...)`.
 
 Use it as a guard clause. `describe` handles each failure where it happens,
 and its main path stays unindented.
-
-`while let` loops for as long as a pattern matches.
 
 <!-- run -->
 ```kotlin
@@ -27,10 +25,6 @@ fun main() {
 	for setting in ["port=8080", "verbose", "port=eighty"] {
 		print(describe(setting))
 	}
-	let pending = ["deploy", "test", "build"]
-	while let Some(step) = Vec.pop(pending) {
-		print("running ${step}")
-	}
 }
 ```
 
@@ -38,14 +32,7 @@ fun main() {
 port is 8080
 'verbose' has no '='
 port is not a number
-running build
-running test
-running deploy
 ```
-
-In `main`, the loop ends when `Vec.pop` returns `None`, which it does once
-`pending` is empty. The program passes `pending` to `Vec.pop`, so it is a
-`Vec`.
 
 A plain `let` accepts only an irrefutable pattern: one that matches every
 value of its type, such as a tuple pattern or a record pattern. For any other
@@ -68,5 +55,4 @@ The compiler rejects the `else` block, because it can fall through.
 ## In the reference
 
 * [`let` and `var`](../ref/declarations.md#let-and-var)
-* [`while let` and `while var`](../ref/statements.md#while-let-and-while-var)
 * [Irrefutable patterns](../ref/patterns.md#irrefutable-patterns)

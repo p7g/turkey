@@ -1,8 +1,9 @@
-# Types you don't write
+# Type inference
 
 Turkey is statically typed, and yet the functions so far have no type
-annotations. The compiler infers the type of every variable and function, and
-type-checks the program with them.
+annotations. That is type inference: the compiler infers the type of every
+variable and function from how you use it, and type-checks the program with
+those types.
 
 The compiler infers the most general type that a function's body allows,
 called its *principal type*. When the body works for many types, the function

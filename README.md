@@ -594,3 +594,12 @@ are still needed to catch references omitted from those descriptions.
 collection and a summary at exit, on stderr. Counting sends every allocation
 through the runtime rather than the code compiled in line for it, so a stats
 build's times are slower than a plain one's.
+
+`TURKEY_GC_TARGET=BYTES` asks a program's collector to keep the memory its heap
+holds under that many bytes: it collects more often, and in full, as the heap
+nears the target. Once collecting has outrun the program by a second in
+total, the collector lets the heap pass the target until the program runs
+longer than a collection again. A target set too low then costs a program
+about one collection's time for each stretch it runs, rather than stalling
+it. A wasm32 program's heap is also held under its 4 GiB ceiling, which it
+cannot pass.

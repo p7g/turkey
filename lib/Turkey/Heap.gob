@@ -343,9 +343,9 @@ var statsIgnored : Bool = notCompiledIn(
 
 -- The most the young generation's budget may be, as a multiple of the bytes
 -- the last full collection kept, or of 64KB while that is smaller
--- (`schedule`): 2 natively and 1 on wasm32. The cap keeps a program whose
--- square-root budget is large from collecting less often than at this
--- scale, and it is what small heaps get. The live set here is the full
+-- (`schedule`): 2 natively and 1 on wasm32. This upper clamp keeps a
+-- program whose square-root budget is large from collecting less often
+-- than at this scale, and it is what small heaps get. The live set here is the full
 -- collection's, because a minor collection's count includes the old objects
 -- that have died since, and a budget sized from it grows with the garbage:
 -- the self-compile's peak memory by 41% over the full collector's, rather
@@ -363,9 +363,9 @@ var statsIgnored : Bool = notCompiledIn(
 -- takes the time. On wasm32, linear memory has a hard 4GiB ceiling and the
 -- smaller scale costs little time: the self-compile needs 3.3GiB of linear
 -- memory at 2 and 2.4GiB at 1, and takes about 2% longer at 1. The
--- square-root budget is under the cap for most of the native self-compile
--- and over it for most of the wasm32 one, so on wasm32 the scale still sets
--- most of the memory the compile needs.
+-- square-root budget is under this upper clamp for most of the native
+-- self-compile and over it for most of the wasm32 one, so on wasm32 the
+-- scale still sets most of the memory the compile needs.
 --
 -- TURKEY_GC_THRESHOLD_SCALE overrides it on either, for experiments.
 var thresholdScale : Float = scaleFrom(Os.getenv(Prim.cString("TURKEY_GC_THRESHOLD_SCALE")))
@@ -2210,36 +2210,40 @@ fun fullDue() -> Bool {
 -- 40000 takes 32% off the footprint for 9% more wall time, with 79 minor
 -- and 22 full collections against 44 and 21. The extra time is the marking
 -- of the young survivors that the more frequent minor collections promote.
--- On wasm32 the scale's cap binds for most of the compile: it needs 2336 MiB
--- of linear memory against 2432, in 2% more wall time. Programs with small
--- heaps, whose square-root budget is above the cap, collect as at the scale.
+-- On wasm32 the scale's upper clamp binds for most of the compile: it needs
+-- 2336 MiB of linear memory against 2432, in 2% more wall time. Programs
+-- with small heaps, whose square-root budget is above the upper clamp,
+-- collect as at the scale.
 --
--- Natively the rule's budget is capped at 512 MiB (`nativeCap`). The rule
--- gives the compiler's early phases, whose heaps are small, small budgets
--- that cost little, but its parallel optimizer, which allocates fast,
--- budgets of 300 MB and more, collected every few milliseconds; the peak
--- is set there. The self-compile, medians of interleaved runs against the
--- uncapped rule in the same sweep (7.11-7.22 s, 2.52-2.62 GB): 17 runs of
--- the 512 MiB cap, 5 of each other setting.
+-- Natively the rule's budget is limited to 512 MiB (`nativeLimit`). The
+-- limit applies before the clamps below, so a twentieth of the live bytes
+-- overrides it once more than 10 GiB is live. The rule gives the
+-- compiler's early phases, whose heaps are small, small budgets that cost
+-- little, but in the parallel optimizer, which allocates fast, it reaches
+-- 0.9-1.1 GB, with a collection every few milliseconds; the peak is set
+-- there. The self-compile, medians of interleaved runs against the rule
+-- without the limit in the same sweep (7.11-7.22 s, 2.52-2.62 GB): 17 runs
+-- of the 512 MiB limit, 5 of each other setting.
 --
 -- | native budget         | wall | footprint | minor / full |
 -- |-----------------------|------|-----------|--------------|
--- | rule, capped 512 MiB  | +1%  | 2.35 GB   | 87 / 23      |
--- | rule, capped 384 MiB  | +4%  | 2.11 GB   | 97 / 23      |
--- | rule, capped 256 MiB  | +8%  | 1.89 GB   | 131 / 25     |
+-- | rule, limit 512 MiB   | +1%  | 2.35 GB   | 87 / 23      |
+-- | rule, limit 384 MiB   | +4%  | 2.11 GB   | 97 / 23      |
+-- | rule, limit 256 MiB   | +8%  | 1.89 GB   | 131 / 25     |
 -- | rule, floor 256 MiB   | -3%  | 2.42 GB   | 79 / 22      |
 -- | fixed 512 MiB         | -3%  | 2.39 GB   | 72 / 22      |
 -- | fixed 384 MiB         | +1%  | 1.95 GB   | 90 / 24      |
 -- | factor 50000          | -4%  | 2.77 GB   | 67 / 22      |
 --
--- A 512 MiB cap takes 7% off the footprint for 1% more wall time, and
--- smaller caps trade more time for less memory. A floor under the rule
+-- A 512 MiB limit takes 7% off the footprint for 1% more wall time, and
+-- smaller limits trade more time for less memory. A floor under the rule
 -- does not help: with a floor of 256, 384 or 512 MiB the footprint is
 -- 2.42-2.62 GB. A fixed budget of 384 MiB takes a quarter off, but
 -- replaces the rule rather than bounding it. The footprint does not fall
 -- evenly with the budget, because the peak is set by where collections
--- fall against the compiler's phases. Small and mid-sized
--- programs, whose clamp below is under the cap, are unchanged by it:
+-- fall against the compiler's phases. Small and mid-sized programs are
+-- unchanged by the limit, because their upper clamp, `thresholdScale`
+-- times the bytes the last full collection kept, is under 512 MiB:
 -- `tests/programs/adt.gob`, a scaled map churn, a phase program and the
 -- compiler compiling `adt.gob` run at the same time and footprint.
 --
@@ -2299,8 +2303,9 @@ fun fullDue() -> Bool {
 -- The tuning factor of the square-root rule, in bytes^(1/2).
 let tuning : Float = 40000.0
 
--- The most the square-root rule's budget may be on native targets.
-let nativeCap : Int = 0x2000_0000
+-- The most the square-root rule's budget may be on native targets, before
+-- the clamps.
+let nativeLimit : Int = 0x2000_0000
 
 -- TURKEY_GC_TARGET, the bytes the regions in use should stay under, or 0
 -- for no target.
@@ -2357,11 +2362,11 @@ fun schedule(
 	let fewest = if liveBytes / 20 > smallest { liveBytes / 20 } else { smallest }
 	let least = if fewest < most { fewest } else { most }
 	var budget = squareRootBudget()
-	let cap = match Target.os {
+	let limit = match Target.os {
 		Wasi -> maxInt()
-		_    -> nativeCap
+		_    -> nativeLimit
 	}
-	if budget > cap { budget = cap }
+	if budget > limit { budget = limit }
 	if budget > most { budget = most }
 	if budget < least { budget = least }
 	let room = if guarding { maxInt() } else { roomUnderTarget() }

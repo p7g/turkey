@@ -2452,12 +2452,13 @@ fun applyNames[
 	-- A parameter of an inlined call is bound inside the call, where a
 	-- debugger shows the callee's variables, though its value is the
 	-- caller's: so its binding's span is the argument's, at the call's site.
-	let bindingSpan = fun(span : Option Span) -> Option Span = match how {
-		Inlined(callee, Some(call)) -> Option.map(
-			span,
-			fun(s) = inlinedAt(s, Some(InlineSite { callee = callee, call = call })),
-		)
-		_ -> span
+	let site = match how {
+		Inlined(callee, Some(call)) -> Some(newSite(fun() = mint(r), callee, call))
+		_                           -> None
+	}
+	let bindingSpan = fun(span : Option Span) -> Option Span = match site {
+		Some(_) -> Option.map(span, inlinedAt(_, site))
+		None    -> span
 	}
 	for var i = 0; i < len(names); i = i + 1 {
 		-- The argument's own `let`s keep their order, their ids and their
@@ -2500,10 +2501,10 @@ fun applyNames[
 			copyTerm(copier(minted, subst, scrutinees, Map.new(), False, None), body)
 		}
 		Copying -> copyTerm(copier(minted, subst, scrutinees, renamed, True, None), body)
-		Inlined(callee, span) -> {
-			let site = Option.map(span, fun(call) = InlineSite { callee = callee, call = call })
-			copyTerm(copier(minted, subst, scrutinees, renamed, True, Some(site)), body)
-		}
+		Inlined(_, _) -> copyTerm(
+			copier(minted, subst, scrutinees, renamed, True, Some(site)),
+			body,
+		)
 	}
 	for var i = len(lets) - 1; i >= 0; i = i - 1 {
 		let ((name, id), value, span) = lets[i]
@@ -2684,6 +2685,12 @@ type Copier = Copier {
 	-- The call every node copied is inlined through, if it is: with no span
 	-- for a call that has none (`inlinedThrough`).
 	rebase : Option (Option InlineSite)
+	-- What each site met in the copy becomes inlined through `rebase`, by the
+	-- id of the site met. The nodes of a body share a few sites, so each is
+	-- rebuilt once per copy and its rebuilt chain shared, where rebuilding it
+	-- at every node would cost a span and a site per node and per call in
+	-- the chain. Empty, and never written, when there is no `rebase`.
+	sites : Map Int InlineSite
 	-- How many variables `subst` has replaced so far.
 	var substituted : Int
 	-- How many binders and references `renamed` has renumbered so far, with
@@ -2706,6 +2713,7 @@ fun copier(
 	scrutinees  = scrutinees
 	freshen     = freshen
 	rebase      = rebase
+	sites       = if Option.isNone(rebase) { noSites } else { Map.new() }
 	substituted = 0
 	changed     = 0
 }
@@ -2714,6 +2722,18 @@ fun copier(
 -- reads the map, and most copies have none: a map for each would be a
 -- fifth of a percent of the self-compile's allocations.
 let noScrutinees : Map Int Core = Map.new()
+
+-- The `sites` of a copier with no `rebase`, which never writes it.
+let noSites : Map Int InlineSite = Map.new()
+
+-- Returns a site of its own for the call of `callee` at `call`.
+--
+-- Number it with a binder id from `mint`, not a counter of its own: the
+-- optimizer reduces components on several workers, and a body reduced on one
+-- worker, or in the other run, can be copied by another, so the copy meets
+-- sites made anywhere. Binder ids are already unique across all of them.
+fun newSite(mint : fun() -> Int, callee : String, call : Span) -> InlineSite =
+	InlineSite { callee = callee, call = call, id = mint() }
 
 -- Returns `body` with each variable `subst` maps replaced by a copy of its own
 -- of the term it maps to, and each binder renamed as `renamed` says. When
@@ -2829,7 +2849,7 @@ fun copyTerm(c : Copier, e : Core) -> Core {
 		return e
 	}
 	let span = match c.rebase {
-		Some(site) -> inlinedThrough(e.span, site)
+		Some(site) -> inlinedThrough(c, e.span, site)
 		None       -> e.span
 	}
 	let out = mkCore(typeIn(c, e.ty), span, kind)
@@ -2881,24 +2901,36 @@ fun replacement(c : Copier, value : Core) -> Core {
 -- inlined into the callee keeps the calls it came through. A node with no
 -- span of its own takes the call's, and every node takes none at a call with
 -- no span.
-fun inlinedThrough(span : Option Span, site : Option InlineSite) -> Option Span = match site {
-	None -> None
-	Some(call) -> match span {
-		None    -> Some(call.call)
-		Some(s) -> Some(atRoot(s, call))
+fun inlinedThrough(c : Copier, span : Option Span, site : Option InlineSite) -> Option Span =
+	match site {
+		None -> None
+		Some(call) -> match span {
+			None    -> Some(call.call)
+			Some(s) -> Some(atRoot(c, s, call))
+		}
 	}
-}
 
-fun atRoot(s : Span, site : InlineSite) -> Span =
+fun atRoot(c : Copier, s : Span, site : InlineSite) -> Span =
 	inlinedAt(
 		s,
 		Some(
 			match s.inlined {
 				None        -> site
-				Some(inner) -> InlineSite { callee = inner.callee, call = atRoot(inner.call, site) }
+				Some(inner) -> rootedSite(c, inner, site)
 			},
 		),
 	)
+
+-- Returns `inner` with `site` at the root of its chain, made once per copy.
+fun rootedSite(c : Copier, inner : InlineSite, site : InlineSite) -> InlineSite =
+	match Map.get(c.sites, inner.id) {
+		Some(made) -> made
+		None -> {
+			let made = newSite(c.mint, inner.callee, atRoot(c, inner.call, site))
+			Map.put(c.sites, inner.id, made)
+			made
+		}
+	}
 
 -- What the binder spelled `name` with the id `id` becomes in the copy.
 fun bindName(c : Copier, name : String, id : Int) -> (String, Int) {

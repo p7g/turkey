@@ -76,6 +76,11 @@ fun main() {
 `print([] : Array Int)` compiles, and prints `[]`. The reference lists the
 other places that need an annotation.
 
+**Try this:** annotate the parameter of `area`, as in
+`fun area(r : Room) = r.width * r.height`, and run the program. The compiler
+rejects the call with a `Poster`: an annotation can make a function less
+general than its body allows.
+
 ## In the reference
 
 * [Principal types](../ref/inference.md#principal-types)

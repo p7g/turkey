@@ -36,6 +36,10 @@ A call isn't in tail position when the function still uses its result. In
 Every call then needs its own stack frame, and the depth of the recursion is
 limited by the size of the stack.
 
+**Try this:** change `isEven(1000001)` to `isEven(100000000)`, and run the
+program. A hundred million calls between `isEven` and `isOdd` still run in
+constant stack space.
+
 ## In the reference
 
 * [Functions](../ref/declarations.md#functions)

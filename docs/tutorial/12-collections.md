@@ -56,6 +56,10 @@ None
 The program passes `long` to `Vec.push`, so `long` is a `Vec`. Nothing
 constrains `scores` or `words`, so they are `Array`s.
 
+**Try this:** annotate `long` as an array, with
+`let long : Array String = []`, and run the program. The compiler rejects the
+call to `Vec.push`, because an `Array` can't grow.
+
 ## In the reference
 
 * [`Array`](../ref/builtins.md#array)

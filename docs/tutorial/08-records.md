@@ -64,6 +64,9 @@ fun main() {
 A record with no `var` field is immutable: after you create it, it never
 changes.
 
+**Try this:** delete `var` from the declaration of `Player`, and run the
+program. The compiler rejects the assignment in `award`.
+
 ## In the reference
 
 * [Records](../ref/types.md#records)

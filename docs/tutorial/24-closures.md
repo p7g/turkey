@@ -47,6 +47,9 @@ follows it.
 
 `let _ = next()` calls `next` and discards the result.
 
+**Try this:** change `print(other())` to `print(next())`, and run the program.
+It prints `3` and then `4`, because every call to `next` shares one `count`.
+
 ## In the reference
 
 * [Anonymous functions](../ref/declarations.md#anonymous-functions)

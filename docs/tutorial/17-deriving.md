@@ -71,6 +71,9 @@ fun main() {
 }
 ```
 
+**Try this:** delete `: Ord` from `Suit`, and run the program. The compiler
+reports that `Card` can't derive `Ord`, and names the `suit` field.
+
 ## In the reference
 
 * [Derived instances](../ref/classes.md#derived-instances)

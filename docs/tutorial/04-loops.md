@@ -66,6 +66,9 @@ fun main() {
 8
 ```
 
+**Try this:** change `Int.range(1, 11)` to `Int.range(1, 101)`, and run the
+program. The sum is now `5050`.
+
 ## In the reference
 
 * [`for` over a collection](../ref/statements.md#for-over-a-collection)

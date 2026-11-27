@@ -62,6 +62,9 @@ fun main() {
 5
 ```
 
+**Try this:** add `print(len(item))` to `main`, and run the program. The
+compiler rejects it, because a string has no `len`.
+
 ## In the reference
 
 * [String interpolation](../ref/expressions.md#string-interpolation)

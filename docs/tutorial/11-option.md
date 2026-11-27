@@ -80,6 +80,10 @@ panic: unwrapped None
 Don't panic on a failure that the caller could handle. Return the failure
 instead. [Errors as values](18-errors.md) shows how `?` propagates it.
 
+**Try this:** delete the `None` arm of the `match` in `age`, and run the
+program. The compiler rejects the `match`, because it no longer handles
+`None`.
+
 ## In the reference
 
 * [`Option`](../ref/builtins.md#option)

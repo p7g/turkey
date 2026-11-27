@@ -72,6 +72,9 @@ fun main() {
 $15.00
 ```
 
+**Try this:** add `print(describe(42))` to `main`, and run the program. The
+compiler reports that there is no instance of `Describe` for `Int`.
+
 ## In the reference
 
 * [Classes](../ref/classes.md#classes)

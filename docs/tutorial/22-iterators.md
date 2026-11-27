@@ -81,6 +81,10 @@ body: a
 body: b
 ```
 
+**Try this:** copy the first `for` loop in `main` and paste it under itself,
+then run the program. Both loops print `3`, `2`, `1`, because a `Countdown`
+holds no position of its own.
+
 ## In the reference
 
 * [`Iterator`](../ref/builtins.md#iterator)

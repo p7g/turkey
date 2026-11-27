@@ -44,6 +44,9 @@ fun main() {
 [12, 40, 55]
 ```
 
+**Try this:** change `_ > 10` to `_ % 2 == 0`, and run the program. The last
+line now prints the even prices.
+
 ## In the reference
 
 * [Anonymous functions](../ref/declarations.md#anonymous-functions)

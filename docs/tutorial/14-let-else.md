@@ -62,6 +62,9 @@ fun main() {
 Function parameters are patterns too, and follow the same rule:
 `fun area((w, h)) = w * h` takes a tuple.
 
+**Try this:** delete the first `return` in `describe`, and run the program.
+The compiler rejects the `else` block, because it can fall through.
+
 ## In the reference
 
 * [`let` and `var`](../ref/declarations.md#let-and-var)

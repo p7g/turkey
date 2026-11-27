@@ -90,6 +90,11 @@ fun main() {
 in setting volume: not a number: loud
 ```
 
+**Try this:** in `percent`, change `throw(OutOfRange { value = n })` to
+`Left(OutOfRange { value = n })`, and run the program. The compiler rejects
+it: the function's errors are `SomeError`s, and an `OutOfRange` isn't one
+until `throw` wraps it.
+
 ## In the reference
 
 *

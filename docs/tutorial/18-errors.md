@@ -79,6 +79,10 @@ must have the same type. Here they are all `String`s.
 [`throw` and `SomeError`](19-error-types.md) shows what to do when they
 differ.
 
+**Try this:** change the last line of `percent` from `Right(n)` to `n`, and
+run the program. The compiler reports a type mismatch, because it expects an
+`Either`.
+
 ## In the reference
 
 *

@@ -59,6 +59,10 @@ Tasks share memory, so access to shared data must be synchronized.
 
 Scheduling is cooperative: a task runs until it waits or finishes.
 
+**Try this:** add `print(join(spawn(fun() = 1)))` to the end of `main`, and
+run the program. The compiler rejects it: outside `runScope`, `spawn` doesn't
+give you a task to join.
+
 ## In the library
 
 * [`System.Task`](https://p7g.github.io/turkey/System.Task.html)

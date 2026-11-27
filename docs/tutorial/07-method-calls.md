@@ -41,6 +41,9 @@ apples + pears + figs!
 The last two lines need the pipe to call `shout`. The program declares
 `shout`, and the `String` module doesn't, so method syntax can't find it.
 
+**Try this:** change `line |> String.trim |> shout` to `line.trim().shout()`,
+and run the program. The compiler reports that `String` has no method `shout`.
+
 ## In the reference
 
 * [Method calls](../ref/expressions.md#method-calls)

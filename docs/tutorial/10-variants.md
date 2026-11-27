@@ -63,6 +63,9 @@ You can nest patterns, and you can match literals and tuples: `Some(0)`,
 `"port"` and `(_, 'x')` are all patterns. A tuple, such as `(3, 'x')`, groups
 values without a type declaration.
 
+**Try this:** add a constructor to `Shape`, as in `| Triangle(Float, Float)`,
+and run the program. The compiler reports every `match` that needs a new arm.
+
 ## In the reference
 
 * [Data types](../ref/types.md#data-types)

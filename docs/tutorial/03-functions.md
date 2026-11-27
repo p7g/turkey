@@ -49,6 +49,9 @@ fun main() {
 3628800
 ```
 
+**Try this:** change `shipping(3, False)` to `shipping(3)`, and run the
+program. The compiler reports that the function takes two arguments.
+
 ## In the reference
 
 * [Functions](../ref/declarations.md#functions)

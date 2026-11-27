@@ -66,6 +66,10 @@ fun main() {
 2.4
 ```
 
+**Try this:** replace `Float.fromInt(total)` with `total`, and run the
+program. It still compiles, and `total` now prints as `40.0`. Nothing is
+converted: the compiler infers that `total` is a `Float` from its first line.
+
 ## In the reference
 
 * [Primitive types](../ref/types.md#primitive-types)

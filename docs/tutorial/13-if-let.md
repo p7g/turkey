@@ -40,6 +40,10 @@ In `portOf`, the first condition splits the setting at the `=` and binds `key`
 and `value`, and the second tests `key`. `String.splitOnce` returns an
 `Option` of a tuple, so the pattern is `Some((key, value))`.
 
+**Try this:** add `"size=3"` to the settings in `main`, delete
+`, key == "port"` from `portOf`, and run the program. Without the second
+condition, `size=3` counts as a port.
+
 ## In the reference
 
 * [`if let` and `if var`](../ref/statements.md#if-let-and-if-var)

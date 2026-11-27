@@ -68,6 +68,9 @@ compiler infers them: `smallest` gets the same constraint as `largest`.
 An instance's constraints follow a colon instead, as in
 `instance Describe (Array a) : Describe a` from [Type classes](15-classes.md).
 
+**Try this:** delete `[Ord a]` from `largest`, and run the program. The
+compiler rejects `x > best`, because nothing says that `a` implements `Ord`.
+
 ## In the reference
 
 * [Contexts](../ref/declarations.md#contexts)

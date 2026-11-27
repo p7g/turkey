@@ -98,6 +98,10 @@ height is 4
 12
 ```
 
+**Try this:** in `main`, change `Int.parse("23")` to `Int.parse("x")`, and run
+the program. `total` is `None`: the second `?` short-circuits, and the block's
+last line never runs.
+
 ## In the reference
 
 * [Every combination: `Array`](../ref/do-notation.md#every-combination-array)

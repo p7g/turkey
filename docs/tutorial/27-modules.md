@@ -59,6 +59,10 @@ fun main() {
 Every module imports the Prelude automatically. The Prelude provides `print`
 and `Option`, and the qualifiers `String`, `Vec` and `Map`.
 
+**Try this:** in `Geometry.gob`, change `Shape(..)` to `Shape` in the export
+list, and run the program. The compiler reports that `Geometry` doesn't export
+the constructors that `main.gob` uses.
+
 ## In the reference
 
 * [Modules and files](../ref/modules.md#modules-and-files)

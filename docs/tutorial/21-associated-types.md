@@ -46,6 +46,10 @@ None
 The library uses associated types the same way. The `Iterator` class, in the
 next lesson, has one for the type of a collection's elements.
 
+**Try this:** in the instance for `Pair a`, change `type Elem = a` to
+`type Elem = Int`, and run the program. The compiler rejects `first`, which
+returns an `a` where the class now promises an `Int`.
+
 ## In the reference
 
 * [Associated types](../ref/classes.md#associated-types)

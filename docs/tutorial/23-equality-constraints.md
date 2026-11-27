@@ -40,6 +40,9 @@ You can also require an associated type to implement a class.
 `[Iterator s, Show (Item s)]` accepts any iterable whose elements can be
 shown.
 
+**Try this:** delete `, Item s ~ Int` from the brackets, and run the program.
+The compiler rejects the function, and names the constraint to add.
+
 ## In the reference
 
 * [Equality constraints](../ref/classes.md#equality-constraints)

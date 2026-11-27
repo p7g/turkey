@@ -79,6 +79,9 @@ type Shown = Shown[Show a](a)
 fun unwrap(Shown(value)) = value
 ```
 
+**Try this:** add `Shown(cell)` to `row`, and run the program. The compiler
+rejects it, because a function doesn't implement `Show`.
+
 ## In the reference
 
 * [Existential types](../ref/types.md#existential-types)

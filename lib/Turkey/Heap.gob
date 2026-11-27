@@ -2171,8 +2171,7 @@ fun fullDue() -> Bool {
 -- the bytes the sweep kept plus that budget, so the budget is the trade of
 -- time for memory.
 --
--- Natively the budget is a fixed 512 MiB (`nativeBudget`); on wasm32 it
--- is the square-root rule of MemBalancer (Kirisame, Shenoy and
+-- The budget is the square-root rule of MemBalancer (Kirisame, Shenoy and
 -- Panchekha, "Optimal Heap Limits for Reducing Browser Memory Use", OOPSLA
 -- 2022): with L the bytes the sweep kept, g the allocation rate and s the
 -- collection rate, sqrt(L * g / s) times a tuning factor. The paper derives
@@ -2215,29 +2214,32 @@ fun fullDue() -> Bool {
 -- of linear memory against 2432, in 2% more wall time. Programs with small
 -- heaps, whose square-root budget is above the cap, collect as at the scale.
 --
--- Natively a fixed budget does better on both counts. The rule gives the
--- compiler's early phases, whose heaps are small, small budgets that cost
--- little, but its parallel optimizer, which allocates fast, budgets of
--- 300 MB and more, collected every few milliseconds. A fixed budget spends
--- its memory evenly instead. The self-compile, medians of 7 interleaved
--- runs:
+-- Natively the rule's budget is capped at 512 MiB (`nativeCap`). The rule
+-- gives the compiler's early phases, whose heaps are small, small budgets
+-- that cost little, but its parallel optimizer, which allocates fast,
+-- budgets of 300 MB and more, collected every few milliseconds; the peak
+-- is set there. The self-compile, medians of 5 interleaved runs, each
+-- against the uncapped rule in the same sweep (7.16-7.22 s, 2.56-2.62 GB):
 --
--- | budget         | wall   | user    | footprint | minor / full |
--- |----------------|--------|---------|-----------|--------------|
--- | rule, 40000    | 7.07 s | 19.7 s  | 2.68 GB   | 78 / 23      |
--- | fixed 384 MiB  | 7.27 s | 20.0 s  | 1.95 GB   | 90 / 24      |
--- | fixed 448 MiB  | 7.14 s | 19.9 s  | 2.45 GB   | 79 / 23      |
--- | fixed 512 MiB  | 7.03 s | 19.4 s  | 2.43 GB   | 72 / 22      |
+-- | native budget         | wall | footprint | minor / full |
+-- |-----------------------|------|-----------|--------------|
+-- | rule, capped 512 MiB  | -1%  | 2.31 GB   | 88 / 23      |
+-- | rule, capped 384 MiB  | +4%  | 2.11 GB   | 97 / 23      |
+-- | rule, capped 256 MiB  | +8%  | 1.89 GB   | 131 / 25     |
+-- | rule, floor 256 MiB   | -3%  | 2.42 GB   | 79 / 22      |
+-- | fixed 512 MiB         | -3%  | 2.39 GB   | 72 / 22      |
+-- | fixed 384 MiB         | +1%  | 1.95 GB   | 90 / 24      |
+-- | factor 50000          | -4%  | 2.77 GB   | 67 / 22      |
 --
--- 512 MiB takes 9% off the rule's footprint at no cost in time, and 384 MiB
--- takes 27% for 3% more wall time. The footprint does not fall evenly with
--- the budget, because the peak is set by where collections fall against the
--- compiler's phases. A floor under the rule without the cap does not help:
--- with a floor of 256, 384 or 512 MiB the footprint is 2.42-2.62 GB.
--- The clamps below keep the fixed budget from changing small and mid-sized
--- programs, whose cap is below it: `tests/programs/adt.gob`, a scaled map
--- churn, a phase program and the compiler compiling `adt.gob` run at the
--- same time and footprint as under the rule.
+-- A 512 MiB cap takes a tenth off the footprint at no cost in time. A
+-- floor under the rule does not help: with a floor of 256, 384 or 512 MiB
+-- the footprint is 2.42-2.62 GB. A fixed budget of 384 MiB takes a quarter
+-- off, but replaces the rule rather than bounding it. The footprint does
+-- not fall evenly with the budget, because the peak is set by where
+-- collections fall against the compiler's phases. Small and mid-sized
+-- programs, whose clamp below is under the cap, are unchanged by it:
+-- `tests/programs/adt.gob`, a scaled map churn, a phase program and the
+-- compiler compiling `adt.gob` run at the same time and footprint.
 --
 -- The budget is clamped:
 -- * Below by a twentieth of L, Julia's floor, so that a heap whose
@@ -2295,10 +2297,8 @@ fun fullDue() -> Bool {
 -- The tuning factor of the square-root rule, in bytes^(1/2).
 let tuning : Float = 40000.0
 
--- The young generation's budget on native targets, before the clamps.
--- The square-root rule's rates are still smoothed there, but only wasm32
--- reads them.
-let nativeBudget : Int = 0x2000_0000
+-- The most the square-root rule's budget may be on native targets.
+let nativeCap : Int = 0x2000_0000
 
 -- TURKEY_GC_TARGET, the bytes the regions in use should stay under, or 0
 -- for no target.
@@ -2354,10 +2354,12 @@ fun schedule(
 	let most = saturated(Float.fromInt(atLeast64K(liveBytesAfterFull)) * thresholdScale)
 	let fewest = if liveBytes / 20 > smallest { liveBytes / 20 } else { smallest }
 	let least = if fewest < most { fewest } else { most }
-	var budget = match Target.os {
-		Wasi -> squareRootBudget()
-		_    -> nativeBudget
+	var budget = squareRootBudget()
+	let cap = match Target.os {
+		Wasi -> maxInt()
+		_    -> nativeCap
 	}
+	if budget > cap { budget = cap }
 	if budget > most { budget = most }
 	if budget < least { budget = least }
 	let room = if guarding { maxInt() } else { roomUnderTarget() }

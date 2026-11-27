@@ -1,19 +1,14 @@
-# Errors as values: `throw` and `?`
+# `throw` and `SomeError`
 
-Errors in Turkey are values. A function that can fail returns an `Either`: a
-`Right` with its result, or a `Left` with an error.
+A string is enough for an error message, but a caller can't tell one kind of
+failure from another by its text. So programs declare a type for each kind of
+error. That raises a problem: `?` doesn't convert errors, so every error that
+a function propagates must have the same type.
 
-The `?` operator propagates errors. `e?` evaluates to the value in a `Right`.
-If `e` is a `Left`, the rest of the function doesn't run, and the function
-returns that `Left`. With `?`, a sequence of calls that can fail reads as
-straight-line code.
-
-`?` doesn't convert errors, so every error that a function propagates must
-have the same type. When a function can fail with errors of different types,
-use `SomeError`. A `SomeError` holds a value of any type that implements the
-`Error` class. To implement `Error` for a type, define `message` in an
-`instance` declaration, as the program does for `NotANumber` and `OutOfRange`.
-[Type classes](13-classes.md) explains classes and instances.
+`SomeError` is that type. A `SomeError` holds a value of any type that
+implements the `Error` class. To make a type an error, implement `Error` for
+it by defining `message`, as the program does for `NotANumber` and
+`OutOfRange`.
 
 `throw(e)` wraps `e` in a `SomeError` and returns it in a `Left`. `throw` is
 an ordinary function and doesn't exit its caller, which is why `percent`
@@ -56,8 +51,9 @@ error: out of range: 140
 error: not a number: loud
 ```
 
-`?` doesn't wrap the result for you. A function that uses `?` must still end
-with an `Either`: `percent` ends with `Right(n)`, not `n`.
+`parse` fails with a `NotANumber` and `percent` with an `OutOfRange`. Both
+functions return an `Either SomeError Int`, so the `?` in `percent` can
+propagate the error from `parse`.
 
 You can add context to an error as it propagates. `Error.context(err, e)`
 wraps `err` in the new error `e` without discarding it, and `Error.describe`
@@ -94,9 +90,13 @@ fun main() {
 in setting volume: not a number: loud
 ```
 
+**Try this:** in `percent`, change `throw(OutOfRange { value = n })` to
+`Left(OutOfRange { value = n })`, and run the program. The compiler rejects
+it: the function's errors are `SomeError`s, and an `OutOfRange` isn't one
+until `throw` wraps it.
+
 ## In the reference
 
-* [Stopping with a reason: `Either`](../ref/do-notation.md#stopping-with-a-reason-either)
-* [Errors from different sources: `SomeError`](../ref/do-notation.md#errors-from-different-sources-someerror)
-* [Control flow with `?`](../ref/do-notation.md#control-flow-with-)
-* [No implicit `pure`](../ref/do-notation.md#no-implicit-pure)
+*
+  [Errors from different sources: `SomeError`](../ref/do-notation.md#errors-from-different-sources-someerror)
+* [`Either`](../ref/builtins.md#either)

@@ -31,8 +31,10 @@ built.
   keeps your edits to each lesson.
 * **Share** copies a link that opens the program in the playground.
 
-Change the greeting, or print an expression such as `print(6 * 7)`, and run
-the program again.
+Every lesson ends with a change to try.
+
+**Try this:** change the greeting, or print an expression such as
+`print(6 * 7)`, and run the program again.
 
 ## In the reference
 

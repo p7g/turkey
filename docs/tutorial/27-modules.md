@@ -16,7 +16,7 @@ To use a module, import it:
 * `import Geometry as Geo` gives the module an alias, so you write `Geo.area`.
 * `import Geometry (Shape(..))` also imports the listed names unqualified.
 
-The program combines the last two.
+The program has two files, and combines the last two forms.
 
 <!-- module: Geometry.gob -->
 ```kotlin
@@ -58,6 +58,10 @@ fun main() {
 
 Every module imports the Prelude automatically. The Prelude provides `print`
 and `Option`, and the qualifiers `String`, `Vec` and `Map`.
+
+**Try this:** in `Geometry.gob`, change `Shape(..)` to `Shape` in the export
+list, and run the program. The compiler reports that `Geometry` doesn't export
+the constructors that `main.gob` uses.
 
 ## In the reference
 

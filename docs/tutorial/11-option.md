@@ -20,7 +20,8 @@ the result of `age`.
 The `!` operator unwraps an `Option` without a `match`. `x!` evaluates to the
 value in a `Some`, and panics on `None`. A panic stops the program, so use `!`
 only when you know the value is there. `!` also unwraps the `Right` of an
-`Either` whose `Left` is an error type ([Errors as values](11-errors.md)).
+`Either` whose `Left` is an error type
+([`throw` and `SomeError`](19-error-types.md)).
 
 <!-- run -->
 ```kotlin
@@ -53,21 +54,18 @@ no age: 'old' is not a number
 2027
 ```
 
-When `!` panics, the stack trace gives the line and column of the `!`. Here
-`Map.get` returns `None`, because the map has no `"gopher"` key:
+When `!` panics, the stack trace gives the line and column of the `!`:
 
 <!-- panic: unwrapped None -->
 ```kotlin
 fun main() {
-	let ports = Map.new()
-	ports["http"] = 80
-	print(ports["http"])
-	print(Map.get(ports, "gopher")!)
+	print(Int.parse("2026")! + 1)
+	print(Int.parse("next year")! + 1)
 }
 ```
 
 ```text
-80
+2027
 ```
 
 The panic message and the stack trace go to standard error:
@@ -76,11 +74,15 @@ The panic message and the stack trace go to standard error:
 ```text
 panic: unwrapped None
   at error (Control/Panic.gob:8:36)
-  at main (Main.gob:5:32)
+  at main (Main.gob:3:30)
 ```
 
 Don't panic on a failure that the caller could handle. Return the failure
-instead. [Errors as values](11-errors.md) shows how `?` propagates it.
+instead. [Errors as values](18-errors.md) shows how `?` propagates it.
+
+**Try this:** delete the `None` arm of the `match` in `age`, and run the
+program. The compiler rejects the `match`, because it no longer handles
+`None`.
 
 ## In the reference
 

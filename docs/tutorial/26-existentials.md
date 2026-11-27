@@ -1,13 +1,14 @@
-# Existential types
+# Hiding a type
 
 An existential type hides a type parameter. Values of different types can then
 share one type, as long as they implement the same classes. Use one to build a
 heterogeneous collection.
 
 `type Shown = Shown[Show a](a)` declares a constructor that accepts a value of
-any type `a` that implements `Show`. The type `Shown` has no parameter, so `a`
-is hidden: `Shown(42)` and `Shown("text")` have the same type, and you can put
-them in one array.
+any type `a` that implements `Show`. The brackets hold a constraint, as a
+function's do. The type `Shown` has no parameter, so `a` is hidden:
+`Shown(42)` and `Shown("text")` have the same type, and you can put them in
+one array.
 
 To use the value, match on the constructor, in a parameter pattern or a
 `match` arm. You know only that the hidden type implements the classes in the
@@ -77,6 +78,9 @@ type Shown = Shown[Show a](a)
 
 fun unwrap(Shown(value)) = value
 ```
+
+**Try this:** add `Shown(cell)` to `row`, and run the program. The compiler
+rejects it, because a function doesn't implement `Show`.
 
 ## In the reference
 

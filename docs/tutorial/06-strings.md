@@ -1,37 +1,40 @@
-# Strings and method calls
+# Strings
 
-String literals support interpolation. `"${n} items"` evaluates `n`, converts
-it to a string with `show`, and inserts the result. You can interpolate any
-value that you can `print`. A string is inserted as it is, without quotes.
+A string literal is written in double quotes, and `+` concatenates two
+strings.
+
+String literals support interpolation. `"${price} dollars"` evaluates `price`,
+converts it to a string, and inserts the result. You can interpolate any
+expression whose value you can `print`. A string is inserted as it is, without
+quotes.
 
 To write a multi-line string, start it with `"""` at the end of a line and end
 it with `"""` on a line of its own. The indentation of the closing `"""` is
 stripped from every line, so you can indent the string with the code around
 it.
 
-You can call a function with method syntax. `x.f(args)` calls the function `f`
-from the module that declares the type of `x`, and passes `x` as the first
-argument. So `item.trim()` is the same call as `String.trim(item)`. Method
-calls chain from left to right.
-
 <!-- run -->
 ```kotlin
 fun main() {
-	let item = "  Turkey sandwich  "
+	let item = "notebook"
 	let price = 7
-	print("${item.trim()} costs ${price} dollars")
-	let fruits = "apples, pears, figs".split(", ")
+	print(item + "s")
+	print("One ${item} costs ${price} dollars")
+	print("Two cost ${price * 2}")
+	let fruits = ["apples", "pears", "figs"]
 	print(fruits)
 	print("${len(fruits)} fruits, and the first is ${fruits[0]}")
 	print("""
-		Order:
-		  ${String.join(fruits, " + ")}
-		""")
+	    Order:
+	      ${String.join(fruits, " + ")}
+	    """)
 }
 ```
 
 ```text
-Turkey sandwich costs 7 dollars
+notebooks
+One notebook costs 7 dollars
+Two cost 14
 ["apples", "pears", "figs"]
 3 fruits, and the first is apples
 Order:
@@ -51,19 +54,19 @@ fun main() {
 	let word = "crème"
 	print(String.byteLength(word))
 	print(String.codePointCount(word))
-	print(String.padStart("42", 5, '0'))
 }
 ```
 
 ```text
 6
 5
-00042
 ```
+
+**Try this:** add `print(len(item))` to `main`, and run the program. The
+compiler rejects it, because a string has no `len`.
 
 ## In the reference
 
 * [String interpolation](../ref/expressions.md#string-interpolation)
-* [Method calls](../ref/expressions.md#method-calls)
 * [Multi-line strings](../ref/lexical.md#multi-line-strings)
 * [String](../ref/types.md#string)

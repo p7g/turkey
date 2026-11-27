@@ -47,8 +47,7 @@ a point has area 0.0 and 0 corners
 ```
 
 A `match` must be exhaustive: its patterns must cover every possible value. If
-you miss a constructor, the compiler reports which one. So when you add a
-constructor to `Shape`, the compiler finds every `match` that needs a new arm.
+you miss a constructor, the compiler reports which one.
 
 <!-- error: this match is not exhaustive; 'Point' is not handled -->
 ```kotlin
@@ -60,8 +59,12 @@ fun area(shape) = match shape {
 }
 ```
 
-You can nest patterns, and you can match literals: `Some(0)`, `"port"` and
-`(_, 'x')` are all patterns.
+You can nest patterns, and you can match literals and tuples: `Some(0)`,
+`"port"` and `(_, 'x')` are all patterns. A tuple, such as `(3, 'x')`, groups
+values without a type declaration.
+
+**Try this:** add a constructor to `Shape`, as in `| Triangle(Float, Float)`,
+and run the program. The compiler reports every `match` that needs a new arm.
 
 ## In the reference
 

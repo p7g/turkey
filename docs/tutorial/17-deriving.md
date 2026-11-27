@@ -15,11 +15,6 @@ by field, first field first. That is why `Ord` is opt-in: if it were
 automatic, reordering a type's constructors would silently change the result
 of every sort.
 
-`Debug` is derived automatically for every type whose fields implement it.
-`debug(x)` formats a value as the expression that constructs it, and `print`
-formats the elements of a collection the same way. `dbg(x)` writes `debug(x)`
-to standard error and returns `x`, so you can wrap it around any expression.
-
 <!-- run -->
 ```kotlin
 type Suit : Ord = Hearts | Diamonds | Clubs | Spades
@@ -49,7 +44,14 @@ Some("origin")
 3
 ```
 
-`dbg` wrote the `Point` to standard error:
+`Debug` is derived automatically for every type whose fields implement it.
+`debug(x)` formats a value as the expression that constructs it, and `print`
+formats the elements of a collection the same way, as it does for the sorted
+cards.
+
+`dbg(x)` writes `debug(x)` to standard error and returns `x`, so you can wrap
+it around any expression. On the last line of `main`, it wrote the `Point` to
+standard error:
 
 <!-- stderr -->
 ```text
@@ -68,6 +70,9 @@ fun main() {
 	print(job == job)
 }
 ```
+
+**Try this:** delete `: Ord` from `Suit`, and run the program. The compiler
+reports that `Card` can't derive `Ord`, and names the `suit` field.
 
 ## In the reference
 

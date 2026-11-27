@@ -72,15 +72,13 @@ fun main() {
 $15.00
 ```
 
-A generic function can require its type parameters to implement a class. Write
-the constraint in brackets after the function's name:
-`fun total[Add a](xs : Array a, zero : a) -> a` accepts an array of any type
-`a` that implements `Add`. If you leave out the annotations, the compiler
-infers the constraint.
+**Try this:** add `print(describe(42))` to `main`, and run the program. The
+compiler reports that there is no instance of `Describe` for `Int`.
 
 ## In the reference
 
 * [Classes](../ref/classes.md#classes)
 * [Instances](../ref/classes.md#instances)
 * [Using a class](../ref/classes.md#using-a-class)
-* [Operators are class methods](../ref/expressions.md#operators-are-class-methods)
+*
+  [Operators are class methods](../ref/expressions.md#operators-are-class-methods)

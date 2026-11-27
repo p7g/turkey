@@ -1,22 +1,13 @@
-# Types you don't write
+# Type inference
 
-Turkey is statically typed, and yet the programs so far have no type
-annotations. The compiler infers the type of every variable and function, and
-type-checks the program with them.
+Turkey is statically typed, and yet the functions so far have no type
+annotations. That is type inference: the compiler infers the type of every
+variable and function from how you use it, and type-checks the program with
+those types.
 
 The compiler infers the most general type that a function's body allows,
-called its *principal type*. `twice` calls `f` on `x` and again on the result,
-so `f` must return the type it takes. The body requires nothing else, so
-`twice` is generic: the program calls it with a function on `Int`s and with a
-function on `String`s.
-
-Field access is generic too. `area` multiplies the fields `width` and
-`height`, so it accepts any record type that has both, as long as they have
-the same type and that type supports `*`. `Room` has `Int` fields and `Poster`
-has `Float` fields, and `area` accepts both.
-
-Records are still nominally typed. `Room` and `Poster` are distinct types, and
-`area` accepts each one because its declaration has the two fields.
+called its *principal type*. When the body works for many types, the function
+is generic, and you don't have to say so.
 
 <!-- run -->
 ```kotlin
@@ -41,6 +32,18 @@ fun main() {
 16
 hey!!
 ```
+
+`twice` calls `f` on `x` and again on the result, so `f` must return the type
+it takes. The body requires nothing else, so `twice` is generic: `main` calls
+it with a function on `Int`s and with a function on `String`s.
+
+Field access is generic too. `area` multiplies the fields `width` and
+`height`, so it accepts any record type that has both, as long as they have
+the same type and that type supports `*`. `Room` has `Int` fields and `Poster`
+has `Float` fields, and `area` accepts both.
+
+Records are still nominally typed. `Room` and `Poster` are distinct types, and
+`area` accepts each one because its declaration has the two fields.
 
 You can annotate a parameter with `: Type` and a function's result with
 `-> Type`. Annotations are almost always optional. Add them where they
@@ -74,8 +77,15 @@ fun main() {
 `print([] : Array Int)` compiles, and prints `[]`. The reference lists the
 other places that need an annotation.
 
+**Try this:** annotate the parameter of `area`, as in
+`fun area(r : Room) = r.width * r.height`, and run the program. The compiler
+rejects the call with a `Poster`: an annotation can make a function less
+general than its body allows.
+
 ## In the reference
 
 * [Principal types](../ref/inference.md#principal-types)
-* [Field and projection constraints](../ref/inference.md#field-and-projection-constraints)
-* [Where annotations are needed](../ref/inference.md#where-annotations-are-needed)
+*
+  [Field and projection constraints](../ref/inference.md#field-and-projection-constraints)
+*
+  [Where annotations are needed](../ref/inference.md#where-annotations-are-needed)

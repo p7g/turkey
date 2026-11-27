@@ -5,7 +5,8 @@ A record is a collection of named fields.
 Create a record with `Name { field = value }`, and access a field with a dot,
 as in `player.score`. To destructure a record, use a record pattern:
 `Player { name, score }` binds the variables `name` and `score` to the two
-fields.
+fields. The same shorthand works when you create a record:
+`Player { name, score }` is short for `Player { name = name, score = score }`.
 
 Fields are immutable unless you declare them with `var`. In a `Player`, you
 can assign to `score` but not to `name`.
@@ -62,6 +63,9 @@ fun main() {
 
 A record with no `var` field is immutable: after you create it, it never
 changes.
+
+**Try this:** delete `var` from the declaration of `Player`, and run the
+program. The compiler rejects the assignment in `award`.
 
 ## In the reference
 

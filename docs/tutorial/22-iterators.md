@@ -16,8 +16,6 @@ second loop over the same collection starts from the beginning. Neither method
 needs a length, so you can iterate over a type that can't be indexed, such as
 a linked list or a generated sequence.
 
-`Countdown` uses an `Int` as its cursor: the number it will yield next.
-
 <!-- run -->
 ```kotlin
 type Countdown = Countdown { from : Int }
@@ -52,6 +50,7 @@ fun main() {
 2 then 1
 ```
 
+`Countdown` uses an `Int` as its cursor: the number it will yield next.
 `Iter.sum` and `Iter.pairwise` accept any iterable, so they work on a
 `Countdown` with no more code.
 
@@ -81,6 +80,10 @@ header: title
 body: a
 body: b
 ```
+
+**Try this:** copy the first `for` loop in `main` and paste it under itself,
+then run the program. Both loops print `3`, `2`, `1`, because a `Countdown`
+holds no position of its own.
 
 ## In the reference
 

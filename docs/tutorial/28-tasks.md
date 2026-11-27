@@ -15,11 +15,6 @@ Pass `runScope` a `do` block. Inside the block, write `?` after each `spawn`
 to get the task it started, and end with `pure(x)` to make `x` the result of
 `runScope`. `runScope` returns once every task in the scope has finished.
 
-Tasks share memory, so access to shared data must be synchronized.
-`System.Sync` provides the primitives, such as the mutex in the program.
-
-Scheduling is cooperative: a task runs until it waits or finishes.
-
 <!-- run -->
 ```kotlin
 import System.Parallel as Parallel
@@ -58,6 +53,15 @@ fun main() {
 [10, 20, 30, 40]
 11
 ```
+
+Tasks share memory, so access to shared data must be synchronized.
+`System.Sync` provides the primitives, such as the mutex in the program.
+
+Scheduling is cooperative: a task runs until it waits or finishes.
+
+**Try this:** add `print(join(spawn(fun() = 1)))` to the end of `main`, and
+run the program. The compiler rejects it: outside `runScope`, `spawn` doesn't
+give you a task to join.
 
 ## In the library
 

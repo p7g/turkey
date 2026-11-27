@@ -1,6 +1,7 @@
 // A lesson of the tour, as `src/TourSite.gob` writes it: the lesson's prose
-// beside its program, in an editor with Run, Stop, Format, Reset and Share,
-// and a tab for each file of a program that has several.
+// beside its program, in an editor with Run (which is Stop while the program
+// runs), Format, Reset and Share, and a tab for each file of a program that
+// has several.
 //
 // The compiler loads on the first edit or Run, not with the page, so reading
 // a lesson costs no download; until then the output pane shows the output
@@ -81,7 +82,6 @@ function start() {
     {
       files: filesElement,
       run: $("run"),
-      stop: $("stop"),
       format: $("format"),
       output,
       formatError,

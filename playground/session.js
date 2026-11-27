@@ -22,8 +22,12 @@ const OUTPUT_CAP = 1 << 20;
 /**
  * Starts a session over `elements`, an object holding the page's `files`,
  * the element holding the program's editors as `attachFiles` takes it, the
- * `run`, `stop` and `format` buttons, the `output` pane, the `formatError`
- * element beside the editor, and the `state` and `note` status elements.
+ * `run` and `format` buttons, the `output` pane, the `formatError` element
+ * beside the editor, and the `state` and `note` status elements.
+ *
+ * The `run` button is also Stop: while a program compiles or runs, its
+ * label, icon and accessible name are Stop's, and pressing it stops the
+ * program. It keeps one width throughout. Its own content is replaced.
  *
  * Without `lazy`, the compiler loads at once and Run waits for it. With
  * `lazy`, nothing loads until `load()` is called, or the source is edited,
@@ -37,8 +41,9 @@ const OUTPUT_CAP = 1 << 20;
  *
  * With `editable`, the files can be added, renamed and removed, as
  * `attachFiles` says. Run compiles them all, and Format lays out the file
- * shown. Ctrl+Enter (Cmd+Enter on a Mac) presses Run and Shift+Alt+F presses
- * Format, from anywhere on the page, as `shortcuts.js` says.
+ * shown. Ctrl+Enter (Cmd+Enter on a Mac) presses Run, or Stop while a
+ * program runs, and Shift+Alt+F presses Format, from anywhere on the page,
+ * as `shortcuts.js` says.
  *
  * The output pane gets tabs (`attachPanes`): Output, and Types, which lists
  * each top-level binding's type as the last check found it, by file, each
@@ -55,8 +60,26 @@ const OUTPUT_CAP = 1 << 20;
 export function startSession(elements, { lazy = false, editable = false, timeLimit = () => 10 } = {}) {
   const { output, formatError, state, note } = elements;
   const runButton = elements.run;
-  const stopButton = elements.stop;
   const formatButton = elements.format;
+  const mac = /mac|iphone|ipad/i.test(navigator.userAgentData?.platform ?? navigator.platform);
+  const runKeys = shortcutText("run", mac);
+
+  // The button holds both labels in one grid cell, Stop's hidden while it
+  // is Run and Run's while it is Stop, so it is as wide as the wider label
+  // in either state and the toolbar does not move when it changes. A hidden
+  // label is out of the accessible name too, which `aria-label` also sets.
+  // The icons carry U+FE0E so that no platform draws them as emoji.
+  const buttonLabel = (className, icon, text) => {
+    const element = document.createElement("span");
+    element.className = className;
+    const glyph = document.createElement("span");
+    glyph.className = "icon";
+    glyph.setAttribute("aria-hidden", "true");
+    glyph.textContent = `${icon}︎`;
+    element.append(glyph, text);
+    return element;
+  };
+  runButton.replaceChildren(buttonLabel("when-run", "▶", "Run"), buttonLabel("when-stop", "■", "Stop"));
 
   // `turkey.wasm`, compiled by the first compile Worker and handed to every
   // Worker started after it, or null until then.
@@ -229,15 +252,15 @@ export function startSession(elements, { lazy = false, editable = false, timeLim
   function setPhase(next, text) {
     phase = next;
     state.textContent = text;
-    runButton.disabled = phase !== "idle" && phase !== "unloaded";
-    stopButton.disabled = phase !== "compiling" && phase !== "running";
-    // A button that disables itself drops keyboard focus; hand it to the other.
-    const active = document.activeElement;
-    if (active === runButton && runButton.disabled && !stopButton.disabled) {
-      stopButton.focus();
-    } else if (active === stopButton && stopButton.disabled && !runButton.disabled) {
-      runButton.focus();
-    }
+    // The button is Stop while there is something to stop, and Run when
+    // there is nothing in the way of a run. While the compiler loads it is
+    // neither, and disabled.
+    const stopping = phase === "compiling" || phase === "running";
+    const name = stopping ? "Stop" : "Run";
+    runButton.disabled = !stopping && phase !== "idle" && phase !== "unloaded";
+    runButton.dataset.mode = stopping ? "stop" : "run";
+    runButton.setAttribute("aria-label", name);
+    runButton.title = `${name} (${runKeys.text})`;
   }
 
   // Each part of the output is its own element, so stdout, stderr and the
@@ -547,9 +570,10 @@ export function startSession(elements, { lazy = false, editable = false, timeLim
       load();
     } else if (phase === "idle") {
       startRun();
+    } else if (phase === "compiling" || phase === "running") {
+      stop();
     }
   });
-  stopButton.addEventListener("click", stop);
 
   // -- Highlighting, checking and Format ---------------------------------------
 
@@ -656,19 +680,15 @@ export function startSession(elements, { lazy = false, editable = false, timeLim
   // -- Keyboard shortcuts --------------------------------------------------------
 
   // Caught before the editor sees the key, so that none types a character,
-  // even held down; a held key presses its button once. A press of a
-  // disabled button does nothing, so a shortcut does what its button would.
-  // On a link, Ctrl+Enter and Cmd+Enter open it in a new tab, so there they
-  // are left to the browser.
-  const mac = /Mac|iPhone|iPad/.test(navigator.userAgentData?.platform ?? navigator.platform);
-  for (const [action, button, label] of [
-    ["run", runButton, "Run"],
-    ["format", formatButton, "Format"],
-  ]) {
-    const { text, aria } = shortcutText(action, mac);
-    button.title = `${label} (${text})`;
-    button.setAttribute("aria-keyshortcuts", aria);
-  }
+  // even held down; a held key presses its button once. A shortcut presses
+  // its button, so it does what the button would: Ctrl+Enter stops a running
+  // program, as the button does then, and a press of a disabled button does
+  // nothing. On a link, Ctrl+Enter and Cmd+Enter open it in a new tab, so
+  // there they are left to the browser. `setPhase` keeps Run's title.
+  const formatKeys = shortcutText("format", mac);
+  formatButton.title = `Format (${formatKeys.text})`;
+  formatButton.setAttribute("aria-keyshortcuts", formatKeys.aria);
+  runButton.setAttribute("aria-keyshortcuts", runKeys.aria);
   document.addEventListener(
     "keydown",
     (event) => {

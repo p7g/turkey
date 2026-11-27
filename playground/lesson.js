@@ -127,6 +127,8 @@ function start() {
       files.replace(original, { undoable: true });
     }
     formatError.hidden = true;
+    // `show` selects the Output tab, which the recorded output then fills.
+    session.show([]);
     output.replaceChildren(...recorded.map((node) => node.cloneNode(true)));
     note.textContent = "This is the lesson's program again. Undo brings back your edits.";
   });

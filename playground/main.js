@@ -1,7 +1,10 @@
-// The page: a highlighted source editor with a tab per file, Run and Stop,
-// Format and Share, and an output pane. `session.js` compiles, runs,
-// highlights and formats; this keeps the files across visits, makes and opens
-// share links, and fills the picker of example programs.
+// The page: a toolbar, a highlighted source editor with a tab per file, and
+// the output pane with its Types tab. The toolbar holds the program's group,
+// Run and Stop; the tools' group, Format and Share; the picker of example
+// programs; and the Options menu, which holds the settings, the time limit
+// so far. `session.js` compiles, runs, checks, highlights and formats; this
+// keeps the files across visits, makes and opens share links, fills the
+// picker, and opens and closes the menu.
 
 import { startSession } from "./session.js";
 import { ENTRY, filesProblem } from "./files.js";
@@ -197,6 +200,25 @@ picker.addEventListener("change", async () => {
   formatError.hidden = true;
   note.textContent = `Loaded "${picker.selectedOptions[0].textContent}". Undo brings back the previous text.`;
   picker.value = "";
+});
+
+// -- The Options menu ------------------------------------------------------------
+
+// A `<details>`, so it opens and closes with no script. Its body floats over
+// the page, so it also closes on a click outside it, and on Escape, which
+// gives the focus back to its summary.
+const options = $("options");
+document.addEventListener("click", (event) => {
+  if (options.open && !options.contains(event.target)) {
+    options.open = false;
+  }
+});
+options.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && options.open) {
+    event.preventDefault();
+    options.open = false;
+    options.querySelector("summary").focus();
+  }
 });
 
 loadLink();

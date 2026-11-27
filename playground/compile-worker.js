@@ -29,12 +29,12 @@
 //               { type: "ready", module }           the compiler is loaded
 //               { type: "failed", text }            loading failed for good
 //               { type: "compiled", id, bytes, status, diagnostics, ms }
-//               { type: "checked", id, files, diagnostics, ms }
+//               { type: "checked", id, files, diagnostics, types, ms }
 //               { type: "highlighted", id, source, html }
 //               { type: "formatted", id, source, text, status, diagnostics }
 // where `html` and `text` are null if the command failed, and a `checked`
-// message's `diagnostics` is what `check` returns as `diagnostics`, or null
-// if the check failed.
+// message's `diagnostics` and `types` are what `check` returns as those, or
+// both null if the check failed.
 
 import { loadCompiler, compile, check, highlight, format } from "./host.js";
 
@@ -123,10 +123,11 @@ const handlers = {
   async check(compiler, { id, files }) {
     const started = performance.now();
     let diagnostics = null;
+    let types = null;
     try {
-      diagnostics = (await check(compiler, files)).diagnostics;
+      ({ diagnostics, types } = await check(compiler, files));
     } catch {}
-    postMessage({ type: "checked", id, files, diagnostics, ms: performance.now() - started });
+    postMessage({ type: "checked", id, files, diagnostics, types, ms: performance.now() - started });
   },
   async highlight(compiler, { id, source }) {
     let html = null;

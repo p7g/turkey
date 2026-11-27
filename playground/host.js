@@ -11,7 +11,7 @@
 //     if (built.bytes) { const ran = await run(built.bytes); }
 //     const { html } = await highlight(compiler, source);
 //     const { text } = await format(compiler, source);
-//     const { diagnostics } = await check(compiler, [["main.gob", source]]);
+//     const { diagnostics, types } = await check(compiler, [["main.gob", source]]);
 
 import {
   WASI,
@@ -120,15 +120,17 @@ export async function format(compiler, source, name = "main.gob") {
 }
 
 /**
- * Checks a program as `turkey check --diagnostics=json` does, which writes
- * no program. `files` is as `compile` takes it. Returns `{ diagnostics,
- * status, text }`: `diagnostics` is an array of the objects the compiler
- * wrote, one per diagnostic, whose members `turkey`'s usage text lists and
- * whose `file` is a name in `files`, or a library file's under `lib/`;
- * `status` is its exit status, or null if it trapped; and `text` is the rest
- * of what it wrote, such as a panic's report, with a trap's message last.
- * Positions are the compiler's: 1-based lines and columns counted in code
- * points. Throws as `compile` does.
+ * Checks a program as `turkey check --diagnostics=json --types=json` does,
+ * which writes no program. `files` is as `compile` takes it. Returns `{
+ * diagnostics, types, status, text }`: `diagnostics` is an array of the
+ * objects the compiler wrote, one per diagnostic, whose members `turkey`'s
+ * usage text lists and whose `file` is a name in `files`, or a library
+ * file's under `lib/`; `types` is an array of `{ file, line, column, name,
+ * type }`, one for each top-level binding of each file in `files`, and empty
+ * when the program does not type-check; `status` is its exit status, or null
+ * if it trapped; and `text` is the rest of what it wrote, such as a panic's
+ * report, with a trap's message last. Positions are the compiler's: 1-based
+ * lines and columns counted in code points. Throws as `compile` does.
  */
 export async function check(compiler, files) {
   if (compiler.lib === null) {
@@ -150,9 +152,12 @@ export async function check(compiler, files) {
     new PreopenDirectory("lib", entriesOf(compiler.lib, { readonly: true })),
     work,
   ];
-  const argv = ["turkey", "check", "--diagnostics=json", pairs[0][0]];
+  // The types come from the same run, so they cost the Types view no check
+  // of its own.
+  const argv = ["turkey", "check", "--diagnostics=json", "--types=json", pairs[0][0]];
   const result = await start(compiler.module, argv, ["TURKEY_LIB=lib"], fds, { merged: false });
   const diagnostics = [];
+  const types = [];
   let text = "";
   for (const line of result.stderr.split("\n")) {
     if (line.startsWith("{")) {
@@ -161,8 +166,16 @@ export async function check(compiler, files) {
       text += line + "\n";
     }
   }
+  for (const line of result.stdout.split("\n")) {
+    if (line.startsWith("{")) {
+      types.push(JSON.parse(line));
+    } else if (line !== "") {
+      text += line + "\n";
+    }
+  }
   return {
     diagnostics,
+    types,
     status: result.status,
     text: text + (result.trap === null ? "" : result.trap + "\n"),
   };

@@ -4,8 +4,10 @@ The host is the layer the playground's page calls. It runs `turkey.wasm` over
 browser_wasi_shim with `lib/` unpacked from `lib.tar.gz`, and runs the module
 the compiler writes, and checks, highlights and formats source for the
 editor. The page's pure modules, the share links and the editor's overlay
-patch, are checked by `tests/playground_share.test.mjs`, and the marks made
-from `check`'s diagnostics by `tests/playground_diagnostics.test.mjs`.
+patch, are checked by `tests/playground_share.test.mjs`, the marks made
+from `check`'s diagnostics by `tests/playground_diagnostics.test.mjs`, and
+the Types view and the keyboard shortcuts by
+`tests/playground_types.test.mjs`.
 `tests/playground_host.mjs` drives the host under node; the
 same module runs in a browser's Worker. These tests need node
 (`toolchain.needs_node`), and skip without it unless `$TURKEY_REQUIRE_NODE`
@@ -88,6 +90,15 @@ def test_share_links_and_the_editor_patch():
     the editor's overlay patch finds the stretch an edit changed."""
     node = toolchain.needs_node()
     result = subprocess.run([node, str(REPO_ROOT / "tests" / "playground_share.test.mjs")],
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr[-4000:]
+
+
+def test_the_types_view_and_the_shortcuts():
+    """The Types view lists a program's bindings by file and finds each name
+    in its text, and the shortcuts ask for Run and Format."""
+    node = toolchain.needs_node()
+    result = subprocess.run([node, str(REPO_ROOT / "tests" / "playground_types.test.mjs")],
                             capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr[-4000:]
 
@@ -231,6 +242,8 @@ def test_check_returns_the_diagnostics_as_objects(inputs, tmp_path):
             "notes": [{"file": "main.gob", "line": 1, "column": 14, "endLine": 1,
                        "endColumn": 15, "message": "'a' is declared here"}],
         }],
+        # A program that does not type-check has no types.
+        "types": [],
         "status": 1,
         "text": "",
     }
@@ -253,6 +266,12 @@ def test_the_tools_worker_checks_every_file_with_the_library(inputs, tmp_path):
     assert sorted(found) == [
         ("Shapes.gob", "irrefutable-match", 4, 6),
         ("main.gob", "unused-variable", 4, 4),
+    ]
+    # The same check gives the types of every file's bindings, warnings and
+    # all.
+    assert checked["types"] == [
+        {"file": "Shapes.gob", "line": 3, "column": 1, "name": "area", "type": "fun(Int) -> Int"},
+        {"file": "main.gob", "line": 3, "column": 1, "name": "main", "type": "fun() -> Unit"},
     ]
 
 

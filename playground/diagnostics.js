@@ -35,24 +35,7 @@ export function diagnosticsFor(diagnostics, trapped) {
  * past the end of the text as the text's end.
  */
 export function marksFor(text, diagnostics, file = "main.gob") {
-  // Where each line starts, as a UTF-16 offset.
-  const lines = [0];
-  for (let i = 0; i < text.length; i++) {
-    if (text.charCodeAt(i) === NEWLINE) {
-      lines.push(i + 1);
-    }
-  }
-  const offset = (line, column) => {
-    if (line > lines.length) {
-      return text.length;
-    }
-    let at = lines[line - 1];
-    const lineEnd = line < lines.length ? lines[line] - 1 : text.length;
-    for (let left = column - 1; left > 0 && at < lineEnd; left--) {
-      at += unitsAt(text, at);
-    }
-    return at;
-  };
+  const offset = offsetsIn(text);
   const marks = [];
   for (const d of diagnostics) {
     if (d.file !== file || d.line === null) {
@@ -81,6 +64,33 @@ export function marksFor(text, diagnostics, file = "main.gob") {
 }
 
 const NEWLINE = 10;
+
+/**
+ * Returns a function from a position the compiler writes in `text`, a
+ * 1-based line and column counted in code points, to its UTF-16 offset, as a
+ * textarea counts. A column past the end of its line is taken as the line's
+ * end, and a line past the end of the text as the text's end.
+ */
+export function offsetsIn(text) {
+  // Where each line starts, as a UTF-16 offset.
+  const lines = [0];
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) === NEWLINE) {
+      lines.push(i + 1);
+    }
+  }
+  return (line, column) => {
+    if (line > lines.length) {
+      return text.length;
+    }
+    let at = lines[line - 1];
+    const lineEnd = line < lines.length ? lines[line] - 1 : text.length;
+    for (let left = column - 1; left > 0 && at < lineEnd; left--) {
+      at += unitsAt(text, at);
+    }
+    return at;
+  };
+}
 
 // Returns where a note is, for its text: its line in the diagnostic's own
 // file, and its file and line in any other.

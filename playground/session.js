@@ -1,15 +1,19 @@
 // A compile-and-run session for one program on a page: its files' editors,
-// their highlighting and diagnostic marks, Run and Stop, Format, and the
-// output pane. Compiling happens in one Worker, checking, highlighting and
-// formatting in a second, and running in a third, so the page itself never
-// waits. The playground and each lesson of the tour start one.
+// their highlighting and diagnostic marks, Run and Stop, Format, their
+// keyboard shortcuts, and the output pane with a tab beside it for the
+// program's types. Compiling happens in one Worker, checking, highlighting
+// and formatting in a second, and running in a third, so the page itself
+// never waits. The playground and each lesson of the tour start one.
 //
 // The Workers are found beside this module, and each fetches `turkey.wasm`
 // relative to itself, so a page in another directory starts the same ones.
 
-import { diagnosticsFor, marksFor } from "./diagnostics.js";
+import { diagnosticsFor, marksFor, offsetsIn } from "./diagnostics.js";
 import { replaceText } from "./editor.js";
 import { attachFiles } from "./files.js";
+import { attachPanes } from "./panes.js";
+import { shortcutFor, shortcutText } from "./shortcuts.js";
+import { nameRange, renderTypes, typeMarksFor, typesFor } from "./types.js";
 
 // The most characters the output pane keeps of a run's output. A program that
 // prints without end would otherwise grow the page until the tab hangs.
@@ -33,7 +37,14 @@ const OUTPUT_CAP = 1 << 20;
  *
  * With `editable`, the files can be added, renamed and removed, as
  * `attachFiles` says. Run compiles them all, and Format lays out the file
- * shown.
+ * shown. Ctrl+Enter (Cmd+Enter on a Mac) presses Run and Shift+Alt+F presses
+ * Format, from anywhere on the page, as `shortcuts.js` says.
+ *
+ * The output pane gets tabs (`attachPanes`): Output, and Types, which lists
+ * each top-level binding's type as the last check found it, by file, each
+ * name a button that selects it in its editor. The editors show a binding's
+ * type in a tip when the pointer is over its name. Run and `show` select
+ * the Output tab.
  *
  * Returns `{ files, load, show, cancel }`: the file set `attachFiles`
  * returned, `load()`, `show(parts)`, which fills the output pane with `[kind,
@@ -79,7 +90,9 @@ export function startSession(elements, { lazy = false, editable = false, timeLim
   // keystrokes. One check is in flight at a time, files already checked are
   // not checked again, and a reply for files since edited, added, renamed
   // or removed is dropped. A check that failed leaves the marks as they
-  // were. Marking changes no file's text, so it saves nothing.
+  // were. Marking changes no file's text, so it saves nothing. The same
+  // check gives the types, so the Types tab and the editors' type tips are
+  // as fresh as the marks, and cost nothing more.
   const IDLE_MS = 500;
   let checking = false;
   let checkAgain = false; // a check was asked for while one was in flight
@@ -111,10 +124,13 @@ export function startSession(elements, { lazy = false, editable = false, timeLim
     const key = keyOf(data.files);
     if (data.diagnostics !== null && key === keyOf(files.all())) {
       checked = key;
+      const view = typesFor(data.diagnostics, data.types, files.list().map((f) => f.name));
+      showTypes(view);
       for (const file of files.list()) {
-        const marks = marksFor(file.textarea.value, data.diagnostics, file.name);
-        file.editor.mark(marks);
-        markTab(file, marks);
+        const problems = marksFor(file.textarea.value, data.diagnostics, file.name);
+        const bindings = view.files.find((f) => f.file === file.name)?.bindings ?? [];
+        file.editor.mark([...problems, ...typeMarksFor(file.textarea.value, bindings)]);
+        markTab(file, problems);
       }
     }
     if (checkAgain) {
@@ -150,6 +166,45 @@ export function startSession(elements, { lazy = false, editable = false, timeLim
     },
   });
 
+  // -- The Types tab -----------------------------------------------------------
+
+  const panes = attachPanes(output, [["types", "Types"]]);
+  const typesPanel = panes.panel("types");
+  // The last view that was current, which a check that finds errors shows
+  // again, marked as out of date, rather than leaving the tab empty for
+  // every typo.
+  let lastTypes = null;
+  renderTypes(typesPanel, null, {
+    message: lazy
+      ? "The types appear once the compiler has loaded: edit the program, or press Run."
+      : "The types appear once the compiler has loaded.",
+  });
+  function showTypes(view) {
+    if (view.current) {
+      lastTypes = view;
+    }
+    if (lastTypes === null) {
+      renderTypes(typesPanel, null, {
+        message: "The program has errors, so it has no types yet. The underlined problems say why.",
+      });
+      return;
+    }
+    renderTypes(typesPanel, view.current ? view : { ...lastTypes, current: false }, { onPick: reveal });
+  }
+  // Shows the file `name` and selects the binding's name in it.
+  function reveal(name, binding) {
+    const file = files.list().find((f) => f.name === name);
+    if (file === undefined) {
+      note.textContent = `There is no file named ${name} now.`;
+      return;
+    }
+    files.show(file);
+    const text = file.textarea.value;
+    const [start, end] = nameRange(text, offsetsIn(text)(binding.line, binding.column), binding.name);
+    file.textarea.focus();
+    file.textarea.setSelectionRange(start, end);
+  }
+
   let compiler = null; // the compile Worker
   let runner = null; // the run Worker, idle or running
   let phase = "unloaded"; // unloaded | loading | idle | compiling | running
@@ -175,6 +230,7 @@ export function startSession(elements, { lazy = false, editable = false, timeLim
   // Each part of the output is its own element, so stdout, stderr and the
   // status are told apart by style and not only by their text.
   function show(parts) {
+    panes.select(output.id);
     output.replaceChildren(
       ...parts
         .filter(([, text]) => text !== "")
@@ -502,7 +558,8 @@ export function startSession(elements, { lazy = false, editable = false, timeLim
       checking = false;
       formatting = null;
       formatButton.disabled = true;
-      note.textContent = `Highlighting and Format are unavailable: ${text}`;
+      note.textContent = `Highlighting, Format and Types are unavailable: ${text}`;
+      renderTypes(typesPanel, null, { message: `Types are unavailable: ${text}` });
     };
     worker.onmessage = ({ data }) => {
       if (data.type === "ready") {
@@ -582,6 +639,32 @@ export function startSession(elements, { lazy = false, editable = false, timeLim
     startTools();
     startRunner();
   }
+
+  // -- Keyboard shortcuts --------------------------------------------------------
+
+  // Caught before the editor sees the key, so that none types a character.
+  // A press of a disabled button does nothing, so a shortcut does what its
+  // button would.
+  const mac = /Mac|iPhone|iPad/.test(navigator.userAgentData?.platform ?? navigator.platform);
+  for (const [action, button, label] of [
+    ["run", runButton, "Run"],
+    ["format", formatButton, "Format"],
+  ]) {
+    const { text, aria } = shortcutText(action, mac);
+    button.title = `${label} (${text})`;
+    button.setAttribute("aria-keyshortcuts", aria);
+  }
+  document.addEventListener(
+    "keydown",
+    (event) => {
+      const action = shortcutFor(event);
+      if (action !== null) {
+        event.preventDefault();
+        (action === "run" ? runButton : formatButton).click();
+      }
+    },
+    { capture: true },
+  );
 
   formatButton.disabled = true;
   if (lazy) {

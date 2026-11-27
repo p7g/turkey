@@ -95,7 +95,8 @@ export function filesProblem(pairs) {
  *
  * Returns the file set: `all()` returns the files as `[name, text]` pairs,
  * the entry first; `list()` returns the files themselves, in that order;
- * `active()` returns the file shown; `byId(id)` returns a
+ * `active()` returns the file shown; `show(file)` shows `file`, as its tab
+ * does; `byId(id)` returns a
  * file by its `id`, or null once it is removed; `replace(pairs, { undoable,
  * quiet })` makes the files `pairs`, which `filesProblem` accepts, and shows
  * the entry; `onChange(callback)` calls `callback()` after every edit, after
@@ -402,6 +403,7 @@ export function attachFiles(container, { editable = false, say = () => {}, reque
     all: () => files.map((f) => [f.name, f.textarea.value]),
     list: () => [...files],
     active: () => active,
+    show,
     byId: (id) => files.find((f) => f.id === id) ?? null,
     replace,
     onChange(callback) {

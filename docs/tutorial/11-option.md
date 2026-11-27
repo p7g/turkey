@@ -20,7 +20,7 @@ the result of `age`.
 The `!` operator unwraps an `Option` without a `match`. `x!` evaluates to the
 value in a `Some`, and panics on `None`. A panic stops the program, so use `!`
 only when you know the value is there. `!` also unwraps the `Right` of an
-`Either` whose `Left` is an error type ([Errors as values](11-errors.md)).
+`Either` whose `Left` is an error type ([Errors as values](19-error-types.md)).
 
 <!-- run -->
 ```kotlin
@@ -80,7 +80,7 @@ panic: unwrapped None
 ```
 
 Don't panic on a failure that the caller could handle. Return the failure
-instead. [Errors as values](11-errors.md) shows how `?` propagates it.
+instead. [Errors as values](19-error-types.md) shows how `?` propagates it.
 
 ## In the reference
 

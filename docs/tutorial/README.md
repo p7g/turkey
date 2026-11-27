@@ -99,7 +99,7 @@ an index loop, and `[]` instead of `Array.new`. Annotate only where the
 annotation documents an interface.
 
 **Link to a heading in `docs/ref/`** (`../ref/types.md#records`), to
-another lesson (`06-records.md`), or to a library module's page
+another lesson (`08-records.md`), or to a library module's page
 (`https://p7g.github.io/turkey/System.Task.html`). The site's build checks
 every link, by GitHub's rule for a heading's anchor, and fails on a link to
 a heading or a module that doesn't exist. Don't use tables, because the

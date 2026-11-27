@@ -56,7 +56,7 @@ running deploy
 
 In `main`, the loop ends when `Vec.pop` returns `None`, which it does once
 `pending` is empty. `pending` is a `Vec`, a growable array that
-[Loops and collections](10-loops.md) explains.
+[Loops and collections](12-collections.md) explains.
 
 A plain `let` accepts only an irrefutable pattern: one that matches every
 value of its type, such as a tuple pattern or a record pattern. For any other

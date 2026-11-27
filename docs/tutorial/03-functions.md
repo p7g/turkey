@@ -56,7 +56,7 @@ Mars has 2 moons
 ["Earth", "Mars"]
 ```
 
-`Planet` is a record type, which [Records](06-records.md) explains.
+`Planet` is a record type, which [Records](08-records.md) explains.
 
 You can declare top-level functions in any order: a function can call one that
 is declared below it. You can also declare a function inside a block. It is in

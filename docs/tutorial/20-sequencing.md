@@ -52,7 +52,7 @@ Some(42)
 ```
 
 To make your own type a monad, implement the classes `Functor`, `Applicative`
-and `Monad` for it. [Type classes](13-classes.md) explains instances. `Logged`
+and `Monad` for it. [Type classes](15-classes.md) explains instances. `Logged`
 pairs a value with log lines. Its `bind` runs the rest of the block and
 appends the lines that the rest logged. `pure(x)` wraps a plain value in the
 monad: for `Logged`, that is `x` with an empty log.

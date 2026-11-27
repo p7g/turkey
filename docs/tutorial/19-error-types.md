@@ -13,7 +13,7 @@ have the same type. When a function can fail with errors of different types,
 use `SomeError`. A `SomeError` holds a value of any type that implements the
 `Error` class. To implement `Error` for a type, define `message` in an
 `instance` declaration, as the program does for `NotANumber` and `OutOfRange`.
-[Type classes](13-classes.md) explains classes and instances.
+[Type classes](15-classes.md) explains classes and instances.
 
 `throw(e)` wraps `e` in a `SomeError` and returns it in a `Left`. `throw` is
 an ordinary function and doesn't exit its caller, which is why `percent`

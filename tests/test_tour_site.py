@@ -211,4 +211,4 @@ def test_the_tour_builds(tmp_path):
             assert fence in lesson
             assert (out / module["file"]).read_text() == lesson.split(fence, 1)[1].split("```\n")[0]
     # The Modules lesson, whose program has a module file, runs in the browser.
-    assert "19-modules" in [entry["name"] for entry in picker]
+    assert "27-modules" in [entry["name"] for entry in picker]

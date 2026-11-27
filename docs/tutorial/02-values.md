@@ -67,7 +67,7 @@ Some(42)
 ```
 
 `Int.parse` returns an `Option Int`, because parsing can fail.
-[Option, Either and `!`](08-option.md) explains `Option`.
+[Option, Either and `!`](11-option.md) explains `Option`.
 
 ## In the reference
 

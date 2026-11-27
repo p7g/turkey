@@ -53,6 +53,11 @@ don't write "unlike Java" or add a "Coming from Rust" note.
 that first uses it. If a lesson needs a term from a later lesson, link to
 that lesson.
 
+**Use only what the reader has seen.** A program can use the features of
+earlier lessons and the one its own lesson teaches. If it needs something
+from a later lesson, change the program or move the lesson. A library
+function that the program calls in passing needs no lesson.
+
 **Name the code you mean.** The program is beside the prose on a wide
 screen. On a narrow one it stands where the lesson has it, between the prose
 above its fence and the prose below. So put the concept before the program

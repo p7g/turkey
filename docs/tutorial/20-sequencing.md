@@ -1,7 +1,7 @@
 # `?` beyond errors
 
-In the last lesson, `?` looked like an early return. It is more general than
-that: `?` works on any monad, and `Either` is one of several.
+In the last two lessons, `?` looked like an early return. It is more general
+than that: `?` works on any monad, and `Either` is one of several.
 
 A monad is a type with a `bind` method. `bind` takes a value of the type and a
 function, and decides how to apply the function to what the value holds. `e?`
@@ -13,14 +13,9 @@ calls `bind` with `e` and, as the function, the rest of the block:
 * `Array` iterates. Its `bind` runs the rest of the block once for each
   element, and concatenates the results.
 
-`outfits` uses `?` on two arrays, so its last line runs once for each
-combination of a shirt and a pair of trousers, as it would inside two nested
-loops.
-
 A block that uses `?` evaluates to what `bind` returns, so it must end with a
-value of the same monad. `outfits` ends with an array, and returns an array.
-To use `?` in a function that returns something else, put it in a `do` block,
-as `main` does with two `Option`s.
+value of the same monad. To use `?` in a function that returns something else,
+put it in a `do` block.
 
 <!-- run -->
 ```kotlin
@@ -51,11 +46,15 @@ blue with shorts
 Some(42)
 ```
 
+`outfits` uses `?` on two arrays, so its last line runs once for each
+combination of a shirt and a pair of trousers, as it would inside two nested
+loops. It ends with an array, and returns an array. `main` returns nothing, so
+its two `?` on `Option`s go in a `do` block.
+
 To make your own type a monad, implement the classes `Functor`, `Applicative`
-and `Monad` for it. [Type classes](15-classes.md) explains instances. `Logged`
-pairs a value with log lines. Its `bind` runs the rest of the block and
-appends the lines that the rest logged. `pure(x)` wraps a plain value in the
-monad: for `Logged`, that is `x` with an empty log.
+and `Monad` for it. `Logged` pairs a value with log lines. Its `bind` runs the
+rest of the block and appends the lines that the rest logged. `pure(x)` wraps
+a plain value in the monad: for `Logged`, that is `x` with an empty log.
 
 <!-- run -->
 ```kotlin
@@ -102,6 +101,8 @@ height is 4
 ## In the reference
 
 * [Every combination: `Array`](../ref/do-notation.md#every-combination-array)
-* [Accumulating: a monad of your own](../ref/do-notation.md#accumulating-a-monad-of-your-own)
+*
+  [Accumulating: a monad of your own](../ref/do-notation.md#accumulating-a-monad-of-your-own)
 * [Do-contexts](../ref/do-notation.md#do-contexts)
-* [`Functor`, `Applicative` and `Monad`](../ref/builtins.md#functor-applicative-and-monad)
+*
+  [`Functor`, `Applicative` and `Monad`](../ref/builtins.md#functor-applicative-and-monad)

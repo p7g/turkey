@@ -56,18 +56,15 @@ the old one, and it can have a different type:
 <!-- run -->
 ```kotlin
 fun main() {
-	let input = "42"
-	let input = Int.parse(input)
-	print(input)
+	let width = 12
+	let width = Float.fromInt(width) / 5.0
+	print(width)
 }
 ```
 
 ```text
-Some(42)
+2.4
 ```
-
-`Int.parse` returns an `Option Int`, because parsing can fail.
-[Option, Either and `!`](11-option.md) explains `Option`.
 
 ## In the reference
 

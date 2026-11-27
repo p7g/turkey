@@ -16,7 +16,7 @@ To use a module, import it:
 * `import Geometry as Geo` gives the module an alias, so you write `Geo.area`.
 * `import Geometry (Shape(..))` also imports the listed names unqualified.
 
-The program combines the last two.
+The program has two files, and combines the last two forms.
 
 <!-- module: Geometry.gob -->
 ```kotlin

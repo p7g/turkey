@@ -43,37 +43,9 @@ Some("left")
 None
 ```
 
-A constraint can require an associated type to equal another type. Write the
-equality with `~`. The library's `Iterator` class has an associated type
-`Item`, the type of the elements. The constraints `[Iterator s, Item s ~ Int]`
-require `s` to be iterable and its elements to be `Int`s. So `total` accepts
-any iterable collection of `Int`s: an array, a range, or an `Option`.
-
-<!-- run -->
-```kotlin
-fun total[Iterator s, Item s ~ Int](numbers : s) -> Int {
-	var sum = 0
-	for n in numbers {
-		sum = sum + n
-	}
-	sum
-}
-
-fun main() {
-	print(total([1, 2, 3]))
-	print(total(Int.range(1, 101)))
-	print(total(Some(7)))
-}
-```
-
-```text
-6
-5050
-7
-```
+The library uses associated types the same way. The `Iterator` class, in the
+next lesson, has one for the type of a collection's elements.
 
 ## In the reference
 
 * [Associated types](../ref/classes.md#associated-types)
-* [Equality constraints](../ref/classes.md#equality-constraints)
-* [`Iterator`](../ref/builtins.md#iterator)

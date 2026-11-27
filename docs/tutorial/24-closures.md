@@ -1,20 +1,11 @@
-# Closures and tail calls
+# Closures
 
 A closure is a function that captures variables from the scope around it.
-Every lambda is a closure. A closure captures variables by reference, not by
-value, so it sees assignments to them and can assign to them itself.
+Every lambda is a closure.
 
-`makeCounter` returns a closure that increments `count`. `count` lives as long
-as the closure does, so each call continues from the previous one. Every call
-to `makeCounter` creates a new `count`, so `next` and `other` count
-separately.
-
-Turkey eliminates tail calls. A call is in tail position when its result is
-the function's result, with nothing left to do after it. A tail call reuses
-the caller's stack frame, so a function that recurses through tail calls runs
-in constant stack space, as a loop does. This holds for mutually recursive
-functions too, such as `isEven` and `isOdd`. `sumTo` recurses a hundred
-million times without overflowing the stack.
+A closure captures variables by reference, not by value. It sees later
+assignments to them, and it can assign to them itself. A captured variable
+lives as long as the closure does.
 
 <!-- run -->
 ```kotlin
@@ -26,11 +17,6 @@ fun makeCounter() {
 	}
 }
 
-fun sumTo(n, total) = if n == 0 { total } else { sumTo(n - 1, total + n) }
-
-fun isEven(n) = if n == 0 { True } else { isOdd(n - 1) }
-fun isOdd(n) = if n == 0 { False } else { isEven(n - 1) }
-
 fun main() {
 	let next = makeCounter()
 	let other = makeCounter()
@@ -38,27 +24,30 @@ fun main() {
 	let _ = next()
 	print(next())
 	print(other())
-	print(sumTo(100000000, 0))
-	print(isEven(1000001))
+	var greeting = "hello"
+	let greet = fun(name) = "${greeting}, ${name}"
+	greeting = "goodbye"
+	print(greet("Ada"))
 }
 ```
 
 ```text
 3
 1
-5000000050000000
-False
+goodbye, Ada
 ```
 
-`let _ = next()` calls `next` and discards the result.
+`makeCounter` returns a closure that increments `count`. Each call to the
+closure continues from the previous one, because `count` outlives the call to
+`makeCounter` that declared it. Every call to `makeCounter` declares a new
+`count`, so `next` and `other` count separately.
 
-A call isn't in tail position when the function still uses its result.
-`n * factorial(n - 1)` multiplies after the call returns, so every call needs
-its own stack frame, and the depth of the recursion is limited by the size of
-the stack.
+`greet` captures `greeting` by reference, so it sees the assignment that
+follows it.
+
+`let _ = next()` calls `next` and discards the result.
 
 ## In the reference
 
 * [Anonymous functions](../ref/declarations.md#anonymous-functions)
-* [Functions](../ref/declarations.md#functions)
 * [Discarded values](../ref/statements.md#discarded-values)

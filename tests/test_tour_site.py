@@ -61,7 +61,7 @@ def test_a_lesson_page_holds_its_program_examples_and_links(tmp_path):
     assert "<!--" not in page
     assert "<h1>First <code>steps</code></h1>" in page
     assert "<title>First steps - A tour of Turkey</title>" in page
-    links = re.findall(r'<a href="([^"]*)"', page.split("<article", 1)[1].split("</article>")[0])
+    links = re.findall(r'<a href="([^"]*)"', page.split("<main", 1)[1])
     assert links == [
         "https://github.com/p7g/turkey/blob/main/docs/ref/chapter.md#unwrapping-with-",
         "https://github.com/p7g/turkey/blob/main/docs/ref/chapter.md#notes-1",
@@ -71,6 +71,32 @@ def test_a_lesson_page_holds_its_program_examples_and_links(tmp_path):
         "https://example.com/a?b=1&amp;c=2",
         "https://github.com/p7g/turkey/blob/main/docs/ref/chapter.md#notes",
     ]
+
+
+def test_the_program_stands_where_the_lesson_has_it(tmp_path):
+    """The prose above the program's fence, the workspace, then the prose
+    below it, so a narrow screen shows them in the lesson's own order."""
+    page = (_built(FIXTURE, tmp_path / "out") / "01-first.html").read_text()
+    above = page.index('<div class="prose above">')
+    workspace = page.index('<section class="workspace"')
+    below = page.index('<div class="prose below">')
+    assert above < page.index("another lesson") < workspace < below
+    assert below < page.index("The compiler rejects it") < page.index('<nav class="pager"')
+
+
+def test_a_lesson_is_named_without_its_number(tmp_path):
+    """The page's script keeps the reader's edits under `data-lesson`, which
+    renumbering the lessons must not change."""
+    out = _built(FIXTURE, tmp_path / "out")
+    assert '<main class="lesson" data-lesson="first">' in (out / "01-first.html").read_text()
+    root = tmp_path / "root"
+    shutil.copytree(FIXTURE, root)
+    tutorial = root / "docs" / "tutorial"
+    shutil.copy(tutorial / "03-third.md", tutorial / "04-third.md")
+    result = _build(root, tmp_path / "twice")
+    assert result.code == 1
+    assert ("docs/tutorial/04-third.md: the lesson '03-third' has the same name after its "
+            "number, 'third'") in result.stderr
 
 
 def test_a_program_of_several_files_gets_an_editor_for_each(tmp_path):

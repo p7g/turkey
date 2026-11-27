@@ -53,9 +53,11 @@ don't write "unlike Java" or add a "Coming from Rust" note.
 that first uses it. If a lesson needs a term from a later lesson, link to
 that lesson.
 
-**Name the code you mean.** The program is beside the prose on a wide screen
-and below it on a narrow one. Name the function, or quote the line, that a
-sentence is about.
+**Name the code you mean.** The program is beside the prose on a wide
+screen. On a narrow one it stands where the lesson has it, between the prose
+above its fence and the prose below. So put the concept before the program
+and the notes on the program after it, and name the function, or quote the
+line, that a sentence is about.
 
 ### The page
 
@@ -64,6 +66,11 @@ and at most two or three more examples. Start the lesson with `# Title`. End
 it with `## In the reference`, a list of links to headings in `docs/ref/`.
 For a lesson about the library, end it with `## In the library` instead, a
 list of links to the pages of its modules.
+
+**Name the file `NN-slug.md`.** The number orders the lessons. The slug names
+the lesson in the reader's browser, where the page keeps their edits to its
+program, so you can renumber a lesson freely, but renaming it drops those
+edits. Two lessons can't share a slug.
 
 **Make the first `run` example the program.** The page puts it in the
 editor, and shows the `text` fence after it as the output until the reader

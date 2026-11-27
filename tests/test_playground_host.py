@@ -50,11 +50,20 @@ def inputs(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path]:
     return bootc.written_compiler("turkey-wasm", "--target", "wasm32-wasi"), archive
 
 
-def _host(inputs: tuple[Path, Path], tmp_path: Path, source: str, stdin: str | None = None) -> dict:
+def _host(inputs: tuple[Path, Path], tmp_path: Path, source: str | dict[str, str],
+          stdin: str | None = None) -> dict:
+    """Compiles `source`, one file or several by name with `main.gob` the
+    entry, and runs what the compiler writes."""
     node = toolchain.needs_node()
     compiler, archive = inputs
-    entry = tmp_path / "main.gob"
-    entry.write_text(source)
+    if isinstance(source, str):
+        entry = tmp_path / "main.gob"
+        entry.write_text(source)
+    else:
+        entry = tmp_path / "program"
+        for name, text in source.items():
+            (entry / name).parent.mkdir(parents=True, exist_ok=True)
+            (entry / name).write_text(text)
     argv = [node, f"--stack-size={STACK_KIB}", str(DRIVER), str(compiler), str(archive), str(entry)]
     if stdin is not None:
         (tmp_path / "stdin").write_text(stdin)
@@ -133,6 +142,29 @@ def test_a_program_reads_its_standard_input(inputs, tmp_path):
     result = _host(inputs, tmp_path, source, stdin="quack\nhonk\n")
     assert result["compiled"]["status"] == 0, result["compiled"]["diagnostics"]
     assert result["ran"]["stdout"] == "read quack\nread honk\n"
+
+
+def test_a_program_of_several_files_compiles_and_runs(inputs, tmp_path):
+    """Each file is written beside the entry, a subdirectory for a dotted
+    module name, and the compiler finds them by their imports."""
+    result = _host(inputs, tmp_path, {
+        "main.gob": ("import Geometry as Geo\nimport Shapes.Circle (area)\n\n"
+                     "fun main() {\n\tprint(Geo.double(21))\n\tprint(area(2))\n}\n"),
+        "Geometry.gob": "export (double)\n\nfun double(n : Int) -> Int = n * 2\n",
+        "Shapes/Circle.gob": "export (area)\n\nfun area(r : Int) -> Int = 3 * r * r\n",
+    })
+    assert result["compiled"]["status"] == 0, result["compiled"]["diagnostics"]
+    assert result["ran"]["stdout"] == "42\n12\n"
+
+
+def test_an_error_in_a_module_names_its_file(inputs, tmp_path):
+    result = _host(inputs, tmp_path, {
+        "main.gob": "import Geometry\n\nfun main() {\n\tprint(Geometry.double(21))\n}\n",
+        "Geometry.gob": 'export (double)\n\nfun double(n : Int) -> Int = n + "a"\n',
+    })
+    assert result["compiled"]["status"] == 1
+    assert result["compiled"]["diagnostics"].startswith("Geometry.gob:3:")
+    assert result["ran"] is None
 
 
 def test_streamed_writes_concatenate_to_the_output(inputs, tmp_path):

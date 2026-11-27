@@ -276,8 +276,6 @@ fun method(p : P, s : Span, name : String) -> Expr =
 
 -- -- tables -------------------------------------------------------------------------
 
-let literalKinds = ["INT", "FLOAT", "STRING", "CHAR"]
-
 let exprStart = [
 	"INT", "FLOAT", "STRING", "STRING_START", "CHAR", "IDENT", "CONID", "(", "[", "{", "-", "!",
 	"fun", "if", "match", "while", "for", "loop", "return", "break", "continue", "do", "\\",
@@ -622,9 +620,8 @@ fun parseInfixDecl(p : P) -> InfixDecl {
 		oops(p, "expected an operator, found " + describe(opTok), opTok.span)
 	}
 	step(p)
-	match Fixity.declarable(text(opTok), group) {
-		Some(why) -> oops(p, why, opTok.span)
-		None      -> {}
+	if let Some(why) = Fixity.declarable(text(opTok), group) {
+		oops(p, why, opTok.span)
 	}
 	skipWhat(p, ")", "')' after the operator")
 	skipToken(p, "=")
@@ -1823,15 +1820,7 @@ fun parsePostfix(p : P) -> Expr {
 	var e = parseAtom(p)
 	loop {
 		if at(p, "(") {
-			step(p)
-			let saved = setNoRecord(p, False)
-			let args = Vec.new(4)
-			while !at(p, ")") {
-				Vec.push(args, closePart(p, parseExpr(p)))
-				if !eat(p, ",") { break }
-			}
-			skipToken(p, ")")
-			p.noRecord = saved
+			let args = parseArguments(p)
 			e = closeAround(p, mkExpr(p, e.span, ECall(e, args)), args)
 		} else if at(p, "[") {
 			step(p)
@@ -1845,7 +1834,16 @@ fun parsePostfix(p : P) -> Expr {
 			let member = advance(p)
 			match member.kind {
 				KInt -> { e = mkExpr(p, e.span, EProject(e, intOf(member))) }
-				_    -> { e = mkExpr(p, e.span, EField(e, text(member))) }
+				_ -> if at(p, "(") {
+					-- A method call. The receiver is not one of the parts a
+					-- `_` closes at, so `_.trim().len()` is one function, as
+					-- `_.name.len()` is.
+					let args = parseArguments(p)
+					let call = mkExpr(p, e.span, EMethod(text(member), Vec.append([e], args)))
+					e = closeAround(p, call, args)
+				} else {
+					e = mkExpr(p, e.span, EField(e, text(member)))
+				}
 			}
 		} else if at(p, "?") {
 			-- A suffix like the other three, so it binds tighter
@@ -1854,11 +1852,31 @@ fun parsePostfix(p : P) -> Expr {
 			-- means.
 			step(p)
 			e = mkExpr(p, e.span, EQuestion(e, Some(method(p, e.span, "bind"))))
+		} else if at(p, "!") {
+			-- A suffix too, so `!x!` is `!(x!)`. The lexer reads `!=` as one
+			-- token, so `x!=y` never reaches here. `tryUnwrap` is marked and
+			-- spanned at the `!`, where its panic is raised.
+			let bang = advance(p)
+			e = mkExpr(p, e.span, EUnwrap(e, Some(method(p, bang.span, "tryUnwrap"))))
 		} else {
 			break
 		}
 	}
 	e
+}
+
+-- Parses `(a, b, ...)`, each argument closed as a part.
+fun parseArguments(p : P) -> Vec Expr {
+	skipToken(p, "(")
+	let saved = setNoRecord(p, False)
+	let args = Vec.new(4)
+	while !at(p, ")") {
+		Vec.push(args, closePart(p, parseExpr(p)))
+		if !eat(p, ",") { break }
+	}
+	skipToken(p, ")")
+	p.noRecord = saved
+	args
 }
 
 fun memberFollows(p : P) -> Bool = match Token.kindName(peek(p, 1).kind) {
@@ -2310,14 +2328,11 @@ fun placeholders(e : Expr) -> Vec Expr {
 }
 
 fun collectPlaceholders(c : Child, out : Vec Expr) -> Unit {
-	match c {
-		ChExpr(e) -> {
-			if isUnderscore(e) {
-				Vec.push(out, e)
-				return
-			}
+	if let ChExpr(e) = c {
+		if isUnderscore(e) {
+			Vec.push(out, e)
+			return
 		}
-		_ -> {}
 	}
 	for child in children(c) { collectPlaceholders(child, out) }
 }
@@ -2362,9 +2377,8 @@ fun refusePlaceholder(p : P, e : Expr, what : String) -> Unit {
 	-- A bare part has made its node a function before the condition is read,
 	-- so `if Array.contains(_, 2)` leaves no `_` pending: the function is here.
 	let bare = unparen(e)
-	match bare.kind {
-		ELambda(params, _, _, _) -> if isShorthand(bare) { oops(p, message, params[0].span) }
-		_                        -> {}
+	if let ELambda(params, _, _, _) = bare.kind {
+		if isShorthand(bare) { oops(p, message, params[0].span) }
 	}
 	if p.pending == 0 || p.explicit > 0 { return }
 	let found = placeholders(e)

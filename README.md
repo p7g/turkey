@@ -370,6 +370,8 @@ directory to `runtimepath`, or point a plugin manager at it
 * It sets the formatter's layout: tabs, a tab counting as 4 columns, and
   comments wrapped at 100. Set `g:turkey_recommended_style = 0` to keep your
   own settings.
+* Reindenting leaves a multi-line string's lines as they are, spaces
+  included, since their indentation is part of the string.
 * `:TurkeyFormat` formats the buffer, saved or not, and with or without a
   file, as one undoable change. A buffer that does not parse is left alone
   and the error is shown.
@@ -434,6 +436,12 @@ sh scripts/docs.sh
 That writes `build/docs/index.html`, which opens in a browser as a file,
 alongside one page per module and the JSON. The same site is published to
 <https://p7g.github.io/turkey/> from `main` by `.github/workflows/docs.yml`.
+
+`turkey highlight FILE` writes the file as an HTML fragment, every token and
+comment in a `<span>` whose class names its group, as the site's code is
+marked up. `turkey highlight -` reads standard input. It does not parse the
+text, so it marks up a file with errors in it as far as the file lexes. The
+browser playground highlights its editor this way.
 
 ### Formatting
 
@@ -586,3 +594,12 @@ are still needed to catch references omitted from those descriptions.
 collection and a summary at exit, on stderr. Counting sends every allocation
 through the runtime rather than the code compiled in line for it, so a stats
 build's times are slower than a plain one's.
+
+`TURKEY_GC_TARGET=BYTES` asks a program's collector to keep the memory its heap
+holds under that many bytes: it collects more often, and in full, as the heap
+nears the target. Once collecting has outrun the program by a second in
+total, the collector lets the heap pass the target until the program runs
+longer than a collection again. A target set too low then costs a program
+about one collection's time for each stretch it runs, rather than stalling
+it. A wasm32 program's heap is also held under its 4 GiB ceiling, which it
+cannot pass.

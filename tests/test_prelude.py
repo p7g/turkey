@@ -18,20 +18,16 @@ from tests.lang import CompileError
 # indexed `for` over it would be quadratic even if it could be written.
 LIST = """
 type List a = Nil | Cons(a, List a)
-type Cur a = Cur { var rest : List a }
 
 instance Iterator (List a) {
     type Item = a
-    type Cursor = Cur a
+    type Cursor = List a
 
-    fun iter(xs) = Cur { rest = xs }
+    fun iter(xs) = xs
 
-    fun next(xs, cur) = match cur.rest {
-        Nil -> None
-        Cons(h, t) -> {
-            cur.rest = t
-            Some(h)
-        }
+    fun next(_, rest) = match rest {
+        Nil        -> Iter.Done
+        Cons(h, t) -> Iter.Yield(h, t)
     }
 }
 """
@@ -174,23 +170,19 @@ def test_the_cursor_is_made_once_and_advanced_per_element(capsys):
     """`iter` runs once, `next` once per element plus the one that ends it."""
     src = """
 type Two = Two { unused : Int }
-type TwoCur = TwoCur { var taken : Int }
 
 instance Iterator Two {
     type Item = Int
-    type Cursor = TwoCur
+    type Cursor = Int
 
     fun iter(t) {
         print("iter")
-        TwoCur { taken = 0 }
+        0
     }
 
-    fun next(t, cur) {
+    fun next(t, k) {
         print("next")
-        let k = cur.taken
-        cur.taken = k + 1
-        if k >= 2 { return None }
-        Some(k)
+        if k < 2 { Iter.Yield(k, k + 1) } else { Iter.Done }
     }
 }
 
@@ -208,20 +200,18 @@ fun main() {
 # pulled is in the output.
 NOISY = """
 type Noisy = Noisy { stop : Int }
-type NoisyCur = NoisyCur { var at : Int }
 
 instance Iterator Noisy {
     type Item = Int
-    type Cursor = NoisyCur
+    type Cursor = Int
 
-    fun iter(n) = NoisyCur { at = 0 }
+    fun iter(n) = 0
 
-    fun next(n, cur) {
-        if cur.at >= n.stop { return None }
-        let k = cur.at
+    fun next(n, k) = if k < n.stop {
         print("next " + show(k))
-        cur.at = k + 1
-        Some(k)
+        Iter.Yield(k, k + 1)
+    } else {
+        Iter.Done
     }
 }
 """
@@ -251,19 +241,14 @@ def test_nothing_asks_the_container_for_a_length(capsys):
     """
     src = """
 type Naturals = Naturals { unused : Int }
-type Counter = Counter { var at : Int }
 
 instance Iterator Naturals {
     type Item = Int
-    type Cursor = Counter
+    type Cursor = Int
 
-    fun iter(n) = Counter { at = 0 }
+    fun iter(n) = 0
 
-    fun next(n, cur) {
-        let k = cur.at
-        cur.at = k + 1
-        Some(k)
-    }
+    fun next(n, k) = Iter.Yield(k, k + 1)
 }
 
 fun main() {
@@ -297,7 +282,7 @@ instance Iterator (Bag a) {
     type Item = a
 
     fun iter(b) = b
-    fun next(b, cur) = None
+    fun next(b, cur) = Iter.Done
 }
 """
     assert fails(src) == "instance 'Iterator (Bag a)' does not define 'Cursor'"
@@ -306,7 +291,7 @@ instance Iterator (Bag a) {
 def test_the_methods_are_ordinary_and_callable_by_name():
     src = "fun head(xs) { let cur = iter(xs)\n next(xs, cur) }"
     assert scheme(src, "head") == \
-        "[Iterator a] fun(a) -> Option (Iterator.Item a)"
+        "[Iterator a] fun(a) -> Step (Iterator.Item a) (Iterator.Cursor a)"
 
 
 # -- min, max, Option.or, Either.left and Either.right --------------------------

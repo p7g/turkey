@@ -114,10 +114,11 @@ def test_an_unannotated_numeric_function_carries_both_predicates():
         "[OneOf a {Int, Float}, Add a] fun(a) -> a"
 
 
-def test_int_division_still_truncates_toward_zero(capsys):
-    # Carried by `instance Div Int`, whose primitive truncates.
+def test_int_division_floors(capsys):
+    # Carried by `instance Div Int` and `instance Mod Int`, whose primitives
+    # round toward negative infinity.
     src = "fun main() { print(Int.toString(-7 / 2) + \" \" + Int.toString(-7 % 2)) }"
-    assert output(src, capsys) == ["-3 -1"]
+    assert output(src, capsys) == ["-4 1"]
 
 
 def test_division_by_zero_still_panics():
@@ -142,21 +143,17 @@ def test_a_user_iterator_runs(capsys):
     src = """
 type Two a = Two(a, a)
 
-type TwoCursor = TwoCursor { var taken : Int }
 
 instance Iterator (Two a) {
     type Item = a
-    type Cursor = TwoCursor
+    type Cursor = Int
 
-    fun iter(p) = TwoCursor { taken = 0 }
+    fun iter(p) = 0
 
-    fun next(p, cur) {
-        let k = cur.taken
-        cur.taken = k + 1
-        if k >= 2 { return None }
-        match p {
-            Two(x, y) -> if k == 0 { Some(x) } else { Some(y) }
-        }
+    fun next(Two(x, y), k) = match k {
+        0 -> Iter.Yield(x, 1)
+        1 -> Iter.Yield(y, 2)
+        _ -> Iter.Done
     }
 }
 

@@ -33,6 +33,10 @@ export (
 --- returns, and generated code tests the flag after every call and returns
 --- too, all the way out. An exit is the same flag with a status beside it, so
 --- that there is one mechanism to get right at every call site and not two.
+--- On wasm32-wasi a switch of stacks unwinds the same way, with the bit above
+--- the flag (`Turkey.Wasm.Select.swapStack`). It is up only while generated
+--- code unwinds, which calls nothing here, so the code here only ever sees
+--- the flag.
 ---
 --- A giblet module: the collector and the allocator panic through here, and
 --- they may not allocate; and `Turkey.Entry` calls it before early
@@ -64,12 +68,10 @@ export (
 import Prelude ()
 import Data.Int (Int)
 import Data.Tuple (Unit)
-import Data.Eq (Eq(..), (==), (!=))
-import Data.Ord (Ord(..), (<), (<=), (>), (>=))
-import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
-import Bits (BitAnd(..), (&))
-import Data.Error (Error(..))
-import Data.Int ()
+import Data.Eq ((==), (!=))
+import Data.Ord ((<), (<=), (>=))
+import Data.Num ((+), (-), (*), (/), (%))
+import Bits ((&))
 import Data.Bool (Bool(..))
 import Target (OS(..))
 import Target as Target
@@ -316,7 +318,8 @@ fun raise() -> Unit = Ptr.store(workerRecord(), flagAt(), 1)
 -- is none; how many frames there were; then `traceInner()` addresses, the
 -- innermost frames' in order; then `traceOuter()` more, those of the frames
 -- after them written round and round, so that they end up holding the
--- outermost.
+-- outermost; and last, on wasm, a word that is not 0 once the trace is
+-- closed (`traceClose`).
 let traceWords : Ptr = traceState()
 
 -- Functions for the reason the offsets above are.
@@ -325,7 +328,9 @@ let traceWords : Ptr = traceState()
 fun traceInner() -> Int = 48
 
 fun traceOuter() -> Int = 16
-fun traceBytes() -> Int = 16 + 8 * (traceInner() + traceOuter())
+fun traceBytes() -> Int = traceClosedAt() + 8
+
+fun traceClosedAt() -> Int = 16 + 8 * (traceInner() + traceOuter())
 
 fun traceState() -> Ptr {
 	let words = Os.malloc(traceBytes())
@@ -351,9 +356,10 @@ fun capture(frame : Ptr) -> Unit {
 	if Ptr.isNull(words) { return }
 	if Ptr.atomicCas(words, 0, 0, Ptr.toInt(workerRecord())) != 0 { return }
 	-- Wasm code cannot read its stack, and its trace is built as the panic
-	-- returns, by `tracePush`, so it starts empty.
+	-- returns, by `tracePush`, so it starts empty, and open.
 	if let Wasi = Target.os {
 		Ptr.store(words, 8, 0)
+		Ptr.store(words, traceClosedAt(), 0)
 		return
 	}
 	let stack : Ptr = Ptr.load(workerRecord(), 280)
@@ -401,11 +407,40 @@ foreign "turkey_trace_push" fun tracePush(site : Int) -> Unit {
 	if Ptr.toInt(words) == 0 { return }
 	let owner : Int = Ptr.load(words, 0)
 	if owner != Ptr.toInt(Prim.processState()) { return }
+	-- `traceClosedAt()`, written out.
+	let closed : Int = Ptr.load(words, 528)
+	if closed != 0 { return }
 	let count : Int = Ptr.load(words, 8)
 	-- `traceInner()` and `traceOuter()`, written out, since each is a call.
 	let slot = if count < 48 { count } else { 48 + (count - 48) % 16 }
 	Ptr.store(words, 16 + 8 * slot, site)
 	Ptr.store(words, 8, Prim.intAddWrapping(count, 1))
+}
+
+-- On wasm, the trace of the running worker's panic ends here: two frames
+-- that print nothing are added, and every later `tracePush` is ignored. The
+-- entry (`Turkey.Wasm.Program.drive`) calls it when a coroutine's start
+-- returns with the flag up, before it hands the panic to the stack that
+-- resumed the coroutine, whose frames go on returning through the way out.
+-- On arm64 a trace is the panicking stack's frame records, and under the
+-- coroutine's start there are two with no position: the start's own, which
+-- returns into `turkey_stack_start`, and the stack's outermost. This makes
+-- wasm's the same. It runs with the flag up, so it calls nothing, as
+-- `tracePush` does.
+foreign "turkey_trace_close" fun traceClose() -> Unit {
+	let words = traceWords
+	if Ptr.toInt(words) == 0 { return }
+	let owner : Int = Ptr.load(words, 0)
+	if owner != Ptr.toInt(Prim.processState()) { return }
+	let closed : Int = Ptr.load(words, 528)
+	if closed != 0 { return }
+	for var k = 0; k < 2; k = Prim.intAddWrapping(k, 1) {
+		let count : Int = Ptr.load(words, 8)
+		let slot = if count < 48 { count } else { 48 + (count - 48) % 16 }
+		Ptr.store(words, 16 + 8 * slot, 0)
+		Ptr.store(words, 8, Prim.intAddWrapping(count, 1))
+	}
+	Ptr.store(words, 528, 1)
 }
 
 -- Whether the trace is of the running worker's panic.

@@ -295,7 +295,34 @@ fun name(n) = match n {
 
 The arms are tried in order and the first one that matches is taken, so an arm
 after one that already matches everything it could is never reached. The
-compiler does not report such arms.
+`unreachable-arm` check ([Warnings](README.md#warnings)) reports such an arm,
+and an alternative of `|` that the alternatives before it already cover:
+
+<!-- run -->
+```kotlin
+fun describe(o : Option Int) -> String = match o {
+    Some(0) -> "zero"
+    Some(_) | None -> "other"
+    Some(1) -> "one"
+}
+
+fun main() {
+    print(describe(Some(1)))
+}
+```
+
+```text
+other
+```
+
+<!-- stderr -->
+```text
+Main.gob:4:5: warning: this arm is never taken, since the arms before it match every value it does; remove it, or move it above the arm that takes its values [unreachable-arm]
+1 warning
+```
+
+A variable pattern binds a new variable and matches every value, even when a
+variable of the same name is in scope; it does not compare with that one.
 
 ## Irrefutable patterns
 

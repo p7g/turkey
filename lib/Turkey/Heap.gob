@@ -42,13 +42,10 @@ import Data.Int (Int)
 import Data.Float (Float)
 import Data.Option (Option(..))
 import Data.Tuple (Unit)
-import Data.Eq (Eq(..), (==), (!=))
-import Data.Ord (Ord(..), (<), (<=), (>), (>=))
-import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
-import Bits (BitAnd(..), BitOr(..), BitXor(..), Shift(..), (&), (|), (^), (<<), (>>))
-import Data.Error (Error(..))
-import Iter (Iterator(..))
-import Data.Int ()
+import Data.Eq ((==), (!=))
+import Data.Ord ((<), (<=), (>), (>=))
+import Data.Num (Neg(..), (+), (-), (*), (/), (%))
+import Bits ((&), (|), (^), (<<), (>>))
 import Data.Bool (Bool(..))
 import Turkey.HeapCheck as Check
 import Turkey.Memory as Memory
@@ -89,7 +86,7 @@ let headerGeneration : Int = 0
 -- remembered, once, by the write barrier (`writeBarrier`), which `Turkey.Select`
 -- emits: the compiler reads these values too, as does every frame object's
 -- header, which is young.
-let young : Int = 0
+let _young : Int = 0
 let old : Int = 1
 let rememberedOld : Int = 2
 
@@ -371,25 +368,33 @@ var statsIgnored : Bool = notCompiledIn(
 	Prim.cString("--gc-stats"),
 )
 
--- The collector runs again once this many times the live set's bytes have
--- been allocated, or 64KB times it while the live set is smaller than that.
--- The live set is what the last full collection kept: sized from a minor
--- collection's count, which includes the old objects that have died since,
--- the young generation grew with the garbage, and the self-compile's peak
--- memory with it, by 41% over the full collector's rather than 1%.
+-- The most the young generation's budget may be, as a multiple of the bytes
+-- the last full collection kept, or of 64KB while that is smaller
+-- (`schedule`): 2 natively and 1 on wasm32. The cap keeps a program whose
+-- square-root budget is large from collecting less often than at this
+-- scale, and it is what small heaps get. The live set here is the full
+-- collection's, because a minor collection's count includes the old objects
+-- that have died since, and a budget sized from it grows with the garbage:
+-- the self-compile's peak memory by 41% over the full collector's, rather
+-- than 1%.
 --
--- Bytes rather than objects, because the threshold is what bounds the heap:
+-- Bytes rather than objects, because the budget is what bounds the heap:
 -- counted in objects, a program allocating large arrays grows its heap by the
 -- array's size for each one it counts as one. On the compiler's own run the
--- two cost the same at equal peak memory, so that is what decided it.
+-- two cost the same at equal peak memory.
 --
--- 2 is measured. The compiler compiling itself, whose heap is a slowly growing
--- long-lived program under a stream of short-lived trees, marks every live
--- object again at each collection, so the objects traced fall as 1/scale and
--- the peak heap grows by about a live set per step: 1.85G objects traced at
--- 3.1GB of regions at 2, 1.24G at 4.1GB at 3, 0.93G at 5.2GB at 4. The test
--- suite runs several of those compiles at once, which is what holds it at 2.
--- TURKEY_GC_THRESHOLD_SCALE overrides it for experiments.
+-- The scale was measured with the budget at the scale alone, minor
+-- collections on. Natively, the compiler compiling itself peaks at a 3.2GB
+-- footprint in 5.6s at 2, 2.9GB in 5.8s at 1.5, and 2.5GB in 6.2s at 1, and
+-- a compile of a small program takes 5% and 7% longer at 1.5 and 1, so 2
+-- takes the time. On wasm32, linear memory has a hard 4GiB ceiling and the
+-- smaller scale costs little time: the self-compile needs 3.3GiB of linear
+-- memory at 2 and 2.4GiB at 1, and takes about 2% longer at 1. The
+-- square-root budget is under the cap for most of the native self-compile
+-- and over it for most of the wasm32 one, so on wasm32 the scale still sets
+-- most of the memory the compile needs.
+--
+-- TURKEY_GC_THRESHOLD_SCALE overrides it on either, for experiments.
 var thresholdScale : Float = scaleFrom(Os.getenv(Prim.cString("TURKEY_GC_THRESHOLD_SCALE")))
 
 -- The counts every worker adds to as it allocates, by atomic adds: objects
@@ -480,11 +485,6 @@ fun bitWord(offset : Int, index : Int) -> Int = plus(offset, times8(index >> 6))
 
 fun testBit(p : Ptr, offset : Int, index : Int) -> Bool =
 	Ptr.load(p, bitWord(offset, index)) & bit(index) != 0
-
-fun setBit(p : Ptr, offset : Int, index : Int) -> Unit {
-	let word = bitWord(offset, index)
-	Ptr.store(p, word, Ptr.load(p, word) | bit(index))
-}
 
 fun maxInt() -> Int = 0x7FFF_FFFF_FFFF_FFFF
 
@@ -594,7 +594,7 @@ let cursorBase : Int = 8
 let cursorSlot : Int = 16
 let cursorRegion : Int = 24
 let cursorWord : Int = 32
-let cursorBytes : Int = 64
+let _cursorBytes : Int = 64
 
 -- The cursors are the running worker's, one per class from 320 bytes into its
 -- record (`Process.workerRecord`), where `Turkey.Runtime` puts them and generated
@@ -1232,11 +1232,12 @@ fun allocateSlow(size : Int, kind : Int, frame : Ptr) -> Ptr {
 	let object = slotFor(size)
 	if !Ptr.isNull(object) { return taken(object, size, kind) }
 	-- No memory for a region, though the threshold was not reached: the heap
-	-- grows by up to a threshold between collections, set from the live set,
-	-- which can be more than the memory left. So collect everything and try
-	-- once more before giving up. On wasm32, `belowCeiling` keeps the
-	-- threshold under the 4 GiB a 32-bit memory has, and this is what is left
-	-- under an engine that allows less.
+	-- grows by up to a budget between collections, which can be more than
+	-- the memory left. So collect everything and try once more before giving
+	-- up. On wasm32, the schedule keeps the budget under the 4 GiB a 32-bit
+	-- memory has, less the collector's reserve, but its floor may take half
+	-- of that reserve, and an engine may allow less: this is what is left
+	-- then.
 	collectFrom(frame, Full)
 	if Process.pending() { return Ptr.null() }
 	let again = slotFor(size)
@@ -1423,11 +1424,11 @@ fun isStatic(value : Ptr) -> Bool =
 	below(Int.subWrapping(Ptr.toInt(value), staticStart), staticBytes)
 
 -- The emitter writes a flat array of four-byte fields -- count, then per
--- entry its return address's distance from `base`, n, and n offsets --
--- because it cannot sort by an address the linker has not assigned yet. The
--- distances keep the table free of relocations, so it is read-only and the
--- loader never writes it. Adding `base` back and sorting once here is what
--- makes the lookup a binary search on the address itself.
+-- entry its return address's distance from `base`, n, and n offsets -- in
+-- ascending order of return address. The distances keep the table free of
+-- relocations, so it is read-only and the loader never writes it. Adding
+-- `base` back here, into entries of a fixed size, is what makes the lookup a
+-- binary search on the address itself.
 foreign "turkey_frame_table_set" fun frameTableSet(table : Ptr, base : Ptr) -> Unit {
 	if Ptr.isNull(table) { return }
 	let count = Ptr.load32(table, 0)
@@ -1438,14 +1439,41 @@ foreign "turkey_frame_table_set" fun frameTableSet(table : Ptr, base : Ptr) -> U
 		return
 	}
 	var p = Ptr.add(table, 4)
+	var sorted = True
+	var previous = 0
 	for var i = 0; i < count; i = i + 1 {
 		let n = Ptr.load32(p, 4)
-		Ptr.store(entries, entryBytes * i, plus(Ptr.toInt(base), signed32(Ptr.load32(p, 0))))
+		let key = plus(Ptr.toInt(base), signed32(Ptr.load32(p, 0)))
+		-- Every emitter writes its entries ascending: the native ones in the
+		-- order the code is placed, the wasm one by site. Checking costs one
+		-- comparison per entry, where sorting costs n log n over tens of
+		-- thousands of entries at every start. The sort below stays for a
+		-- table that is not ascending, which a compiler older than this
+		-- runtime writes natively.
+		if i > 0 && below(key, previous) { sorted = False }
+		previous = key
+		Ptr.store(entries, entryBytes * i, key)
 		Ptr.store(entries, entryBytes * i + 8, n)
 		Ptr.store(entries, entryBytes * i + 16, Ptr.add(p, 8))
 		p = Ptr.add(p, 8 + 4 * n)
 	}
-	sortEntries(entries, count)
+	if !sorted {
+		-- Under `--gc-verify` we assume the table's emitter is as new as this
+		-- runtime, so a table out of order is that emitter's mistake, and one
+		-- the sort would hide. Read `Prim.gcVerify`, the constant itself,
+		-- because this runs before the program's globals are initialized.
+		--
+		-- End the process as the heap verifier does, rather than raise a
+		-- panic: the entry tests for one only after early initialization, so
+		-- the globals' initializer and `main` would run with it pending and
+		-- read globals it left unset.
+		if Prim.gcVerify {
+			let message = Prim.cString("heap verifier: the frame table is not in ascending order\n")
+			let _ = Os.write(2, message, Os.strlen(message))
+			Os.exit(1)
+		}
+		sortEntries(entries, count)
+	}
 	Os.free(frameEntries)
 	frameEntries = entries
 	frameEntryCount = count
@@ -2389,7 +2417,7 @@ fun collectStopped(frame : Ptr, asked : Asked) -> Unit {
 	-- collection is responding to.
 	let allocsSince = allocationsSince
 	let wanted = statsWanted
-	let started = if wanted { nanoseconds() } else { 0 }
+	let started = nanoseconds()
 	if !minor {
 		-- Everything is traced again, and every live object marked again,
 		-- which makes it old and forgets that it was remembered.
@@ -2398,21 +2426,24 @@ fun collectStopped(frame : Ptr, asked : Asked) -> Unit {
 	}
 	markFrom(frame)
 	if Process.pending() { return }
-	let marked = if wanted { nanoseconds() } else { 0 }
+	let marked = nanoseconds()
 	if verify { verifyAt(Check.BeforeSweeping, frame) }
+	-- What the heap held before the sweep: what the last sweep kept, and
+	-- what has been allocated since.
+	let held = plus(liveBytes, bytesSince)
+	let allocated = bytesSince
+	let sweeping = nanoseconds()
 	sweep()
+	let swept = nanoseconds()
 	if verify { verifyAt(Check.AfterSweeping, frame) }
 	allocationsSince = 0
 	bytesSince = 0
 	if !minor { liveBytesAfterFull = liveBytes }
-	let floor = if liveBytesAfterFull > 65536 { liveBytesAfterFull } else { 65536 }
-	let next = Float.fromInt(floor) * thresholdScale
-	-- Saturate where the product no longer fits.
-	threshold = match Float.truncate(next) {
-		Some(n) -> n
-		None    -> maxInt()
+	let sampled = match asked {
+		Due -> True
+		_   -> False
 	}
-	if let Wasi = Target.os { threshold = belowCeiling(threshold) }
+	schedule(sampled, started, marked - started, swept - sweeping, allocated, held - liveBytes)
 	if minor { statsMinor = statsMinor + 1 }
 	collections = collections + 1
 	if wanted {
@@ -2421,10 +2452,12 @@ fun collectStopped(frame : Ptr, asked : Asked) -> Unit {
 	}
 }
 
--- Whether this collection must be full: when the live bytes, old objects
--- that died since included, have grown by half since the last full collection
--- kept them. Under GC stress every eighth is, so that a stressed run
--- exercises both.
+-- Whether this collection must be full: when the last sweep set `fullNext`,
+-- having found more bytes promoted since the last full collection than the
+-- room left under the memory target or wasm32's ceiling allows
+-- (`schedule`), or when the live bytes, old objects that died since
+-- included, have grown by half since the last full collection kept them.
+-- Under GC stress every eighth is, so that a stressed run exercises both.
 --
 -- Half is measured, on the self-compile against the full collector (17.7 s,
 -- 2.60 GB max RSS): 14.3 s at 2.63 GB. Waiting for the live bytes to double
@@ -2432,36 +2465,279 @@ fun collectStopped(frame : Ptr, asked : Asked) -> Unit {
 -- from them, 13.5 s at 3.67 GB.
 fun fullDue() -> Bool {
 	if stress { return collections % 8 == 0 }
-	-- Near wasm32's ceiling, since a minor collection frees no old object
-	-- that has died, and the next must free everything it can.
-	if let Wasi = Target.os { if roomUnderCeiling() < threshold { return True } }
+	if fullNext { return True }
 	let floor = if liveBytesAfterFull > 65536 { liveBytesAfterFull } else { 65536 }
 	Float.fromInt(liveBytes) >= Float.fromInt(floor) * 1.5
 }
+
+-- -- the schedule -----------------------------------------------------------------------
+--
+-- After each collection, `schedule` sets how many bytes may be allocated
+-- before the next one: the young generation's budget. Peak memory is about
+-- the bytes the sweep kept plus that budget, so the budget is the trade of
+-- time for memory.
+--
+-- The budget is the square-root rule of MemBalancer (Kirisame, Shenoy and
+-- Panchekha, "Optimal Heap Limits for Reducing Browser Memory Use", OOPSLA
+-- 2022): with L the bytes the sweep kept, g the allocation rate and s the
+-- collection rate, sqrt(L * g / s) times a tuning factor. The paper derives
+-- it as the budget that minimizes the heap's size plus the time spent
+-- collecting, the tuning factor weighing one against the other.
+--
+-- * g is the bytes allocated per nanosecond of mutator wall time, every
+--   worker's together.
+-- * s is the bytes a collection freed per nanosecond of its marking,
+--   clearing the marks included; the sweep is not counted. Julia
+--   (`gc-stock.c`), whose collector is also non-moving with sticky marks,
+--   measures both the same way, and a minor collection's s is its own: it
+--   frees much for little marking, so a program whose garbage dies young
+--   collects often and cheaply.
+-- * Each of the four quantities is smoothed on its own, numerator and
+--   denominator, as the paper, V8 and Julia all do: allocation by 0.95 per
+--   collection, collection by 0.5, the paper's and Julia's weights. The
+--   allocation rate is a program's phase and should move slowly; one
+--   collection's speed is noisy and should not decide the next alone.
+--   Julia tried other moving averages and measured them a regression.
+--
+-- The tuning factor is twice Julia's 2e4. The paper's own constant was
+-- chosen for interactive programs, and its authors expect a batch program
+-- to want a larger one. The compiler compiling itself, natively, medians
+-- of interleaved runs against a young generation of twice the live set
+-- (6.2-6.5 s, a 3.1-3.6 GB footprint):
+--
+-- | factor | wall  | footprint |
+-- |--------|-------|-----------|
+-- | 20000  | +19%  | 1.87 GB   |
+-- | 30000  | +11%  | 2.26 GB   |
+-- | 40000  | +9%   | 2.40 GB   |
+-- | 50000  | +7%   | 2.53 GB   |
+-- | 60000  | +6%   | 2.75 GB   |
+--
+-- 40000 takes 32% off the footprint for 9% more wall time, with 79 minor
+-- and 22 full collections against 44 and 21. The extra time is the marking
+-- of the young survivors that the more frequent minor collections promote.
+-- On wasm32 the scale's cap binds for most of the compile: it needs 2336 MiB
+-- of linear memory against 2432, in 2% more wall time. Programs with small
+-- heaps, whose square-root budget is above the cap, collect as at the scale.
+--
+-- The budget is clamped:
+-- * Below by a twentieth of L, Julia's floor, so that a heap whose
+--   collections are cheap is not collected at every few allocations, and
+--   never below `thresholdScale` times 64KB, so that a program with almost
+--   nothing live does not collect more often than that.
+-- * Above by `thresholdScale` times the bytes the last full collection
+--   kept, so that no program collects less often than at that scale.
+--
+-- A memory target caps the budget at the room under it, with the same
+-- floor. Natively there is a target only if TURKEY_GC_TARGET sets one, in
+-- bytes (`roomUnderTarget`); it bounds the regions in use, which is most of
+-- a program's footprint, not all of it. On wasm32 the 4 GiB ceiling of
+-- linear memory, less the collector's own reserve (`roomUnderCeiling`), caps
+-- the budget too, and there the floor is at most 32 MiB, half the reserve,
+-- less whatever of the reserve the heap already holds, and never below
+-- 64KB: a heap living in the reserve collects every so often rather than at
+-- every few allocations, and leaves the marking at least half.
+--
+-- The next collection is full (`fullNext`) when the bytes promoted since the
+-- last full collection are more than the room left after the sweep, and,
+-- under a target, more than the floor. Under wasm32's ceiling there is no
+-- floor to wait for: past the room is the reserve, and promoted bytes that
+-- stay there leave the marking nothing. A minor collection frees no old object that has
+-- died. A full one frees those promoted since and those it kept itself;
+-- nothing counts the dead ones, and the promoted bytes stand in for them.
+-- Right after a full collection nothing has been promoted, so a heap held
+-- near its target collects in full only once a floor's worth has been, and
+-- one whose garbage dies young stays minor. The test is made after the
+-- sweep and not when the next collection starts, because by then the
+-- budget has used up the room, and every collection would be full.
+--
+-- A target can be set below what the program needs, and then every
+-- collection is full and frees little, which is the spiral to guard
+-- against: a heap that keeps choosing full collections as it grows, and
+-- spends most of the run collecting. So a guard lets the heap pass
+-- TURKEY_GC_TARGET while collecting takes over half the time: Go's leaky
+-- bucket (`runtime/mgclimit.go`). Each collection the budget triggered adds
+-- its marking and sweeping to the bucket and drains the mutator time
+-- before it, between empty and one second; when it fills, the guard is on,
+-- and the budget ignores the target until a collection drains it again.
+-- With every worker stopped while it collects, wall time is CPU time on
+-- every core, so one second of wall time is Go's one CPU-second per
+-- processor. Once the bucket has filled, a program held at the target
+-- collects for about as long as it runs, not arbitrarily long. One that
+-- keeps 128 MB live under a 100 MB target while the lists it builds die old
+-- takes 1.4 s, against 2.6 s with no guard and 0.3 s with no target; most
+-- of the 1.4 s is the second the bucket takes to fill. One whose garbage
+-- dies young, but for an array kept every 100,000 allocations, needs no
+-- guard: under a 100 MB target with 256 MB live it takes 1.4 s at a 308 MB
+-- footprint, against 1.5 s at 717 MB with no target. The guard never
+-- lifts wasm32's ceiling, past which there is no memory to grow into.
+
+-- The tuning factor of the square-root rule, in bytes^(1/2).
+let tuning : Float = 40000.0
+
+-- TURKEY_GC_TARGET, the bytes the regions in use should stay under, or 0
+-- for no target.
+var target : Int = targetFrom(Os.getenv(Prim.cString("TURKEY_GC_TARGET")))
+
+-- Whether the next collection is to be full, set after each sweep.
+var fullNext : Bool = False
+
+-- When the last collection ended, in nanoseconds of the monotonic clock.
+var collectedAt : Int = nanoseconds()
+
+-- The smoothed bytes allocated and mutator nanoseconds between collections,
+-- and the smoothed bytes freed and nanoseconds marked per collection. They
+-- start at zero, so the first collection's ratios are its own.
+var allocatedSmoothed : Float = 0.0
+var mutatorSmoothed : Float = 0.0
+var freedSmoothed : Float = 0.0
+var markingSmoothed : Float = 0.0
+
+-- The leaky bucket, in nanoseconds, and whether it has filled. The
+-- capacity is a second, or TURKEY_GC_GUARD_NANOSECONDS, for tests that must
+-- see the guard turn on without running for a second of collecting. It is
+-- not a tuning knob: a program should leave it unset.
+var bucketCapacity : Int = bucketFrom(Os.getenv(Prim.cString("TURKEY_GC_GUARD_NANOSECONDS")))
+var bucket : Int = 0
+var guarding : Bool = False
+
+-- Set the next collection's budget and whether it is full, from this one:
+-- it began at `started`, marked for `marking` nanoseconds and swept for
+-- `sweeping`, and freed `freed` bytes, and `allocated` bytes had been
+-- allocated since the last one. Only a collection the budget triggered,
+-- `sampled`, updates the rates and the guard: one asked for by name says
+-- nothing about the program's allocation rate.
+fun schedule(
+	sampled : Bool,
+	started : Int,
+	marking : Int,
+	sweeping : Int,
+	allocated : Int,
+	freed : Int,
+) -> Unit {
+	let ended = nanoseconds()
+	let mutator = started - collectedAt
+	collectedAt = ended
+	if sampled {
+		allocatedSmoothed = smoothed(allocatedSmoothed, allocated, 0.95)
+		mutatorSmoothed = smoothed(mutatorSmoothed, mutator, 0.95)
+		freedSmoothed = smoothed(freedSmoothed, freed, 0.5)
+		markingSmoothed = smoothed(markingSmoothed, marking, 0.5)
+		guard(marking + sweeping, mutator)
+	}
+	let smallest = saturated(65536.0 * thresholdScale)
+	let most = saturated(Float.fromInt(atLeast64K(liveBytesAfterFull)) * thresholdScale)
+	let fewest = if liveBytes / 20 > smallest { liveBytes / 20 } else { smallest }
+	let least = if fewest < most { fewest } else { most }
+	var budget = squareRootBudget()
+	if budget > most { budget = most }
+	if budget < least { budget = least }
+	let room = if guarding { maxInt() } else { roomUnderTarget() }
+	if room < budget { budget = if room > least { room } else { least } }
+	-- Past the ceiling's room is the collector's own reserve, of which the
+	-- floor may take at most half, less what the heap already holds of it.
+	let ceiling = roomUnderCeiling()
+	let half = 0x200_0000 + (if ceiling < 0 { ceiling } else { 0 })
+	let nearest = if least < half { least } else { half }
+	let nearCeiling = if nearest > 65536 { nearest } else { 65536 }
+	if ceiling < budget { budget = if ceiling > nearCeiling { ceiling } else { nearCeiling } }
+	-- Under the ceiling, wait for no floor's worth of promotion: the floor
+	-- is a twentieth of the live bytes, far more than the reserve.
+	let promoted = liveBytes - liveBytesAfterFull
+	fullNext = if ceiling <= room {
+		promoted > (if ceiling > 0 { ceiling } else { 0 })
+	} else {
+		promoted > (if room > least { room } else { least })
+	}
+	threshold = budget
+}
+
+-- The square-root rule's budget, or the most an `Int` holds before any
+-- collection has measured a rate.
+fun squareRootBudget() -> Int {
+	if mutatorSmoothed <= 0.0 || freedSmoothed <= 0.0 || markingSmoothed <= 0.0 {
+		return maxInt()
+	}
+	let allocationRate = allocatedSmoothed / mutatorSmoothed
+	let collectionRate = freedSmoothed / markingSmoothed
+	saturated(tuning * squareRoot(Float.fromInt(liveBytes) * allocationRate / collectionRate))
+}
+
+-- The leaky bucket after a collection that paused for `pause` nanoseconds
+-- after `mutator` nanoseconds of the program running. The guard turns on
+-- when the bucket fills, and off at the first collection that drains it.
+fun guard(pause : Int, mutator : Int) -> Unit {
+	let change = pause - mutator
+	let level = bucket + change
+	bucket = if level < 0 { 0 } else if level > bucketCapacity { bucketCapacity } else { level }
+	if guarding {
+		if change < 0 { guarding = False }
+	} else if bucket == bucketCapacity {
+		guarding = True
+	}
+}
+
+-- The bytes the regions in use may still grow by under TURKEY_GC_TARGET, or
+-- the most an `Int` holds if it sets none. Negative past the target.
+fun roomUnderTarget() -> Int =
+	if target > 0 { target - regionBytesInUse } else { maxInt() }
 
 -- The memory left under wasm32's 4 GiB ceiling, which no `memory.grow`
 -- passes, less 64 MiB kept for what the collector itself allocates while it
 -- marks: chiefly the mark stack, which doubles as the heap deepens, and which
 -- a collection that runs with nothing left cannot grow. The compiler compiling
--- itself, with a 1 GB live set, peaks at an 8 MiB mark stack. Spares count as
--- left, since a region takes one before it asks for memory.
-fun roomUnderCeiling() -> Int =
-	Wasi.memoryLeft() + spareCount * regionBytes - 0x400_0000
+-- itself, with a 1 GB live set, peaks at an 8 MiB mark stack. The remembered
+-- set draws on the reserve too, since `remember` reallocates it as it grows
+-- during marking. Spares count as left, since a region takes one before it
+-- asks for memory.
+-- The most an `Int` holds on any other target, which has no ceiling.
+fun roomUnderCeiling() -> Int = match Target.os {
+	Wasi -> Wasi.memoryLeft() + spareCount * regionBytes - 0x400_0000
+	_    -> maxInt()
+}
 
--- `wanted`, or the room under wasm32's ceiling where that is smaller: a
--- threshold of twice the live set can be more than is left, and the
--- collection the failed allocation then forces in `allocateSlow` has no memory
--- for its own marking. The regions grow by at most what is allocated, since
--- an allocation takes a free slot of its class before it takes a region, so
--- the cap keeps them under the ceiling.
---
--- No lower than an eighth of the live set, so that a heap whose live set
--- crowds the ceiling collects every so often and not at every allocation.
-fun belowCeiling(wanted : Int) -> Int {
-	let room = roomUnderCeiling()
-	if room >= wanted { return wanted }
-	let least = liveBytesAfterFull / 8
-	if room > least { room } else { least }
+-- `weight` of `old` and the rest of `sample`.
+fun smoothed(old : Float, sample : Int, weight : Float) -> Float =
+	weight * old + (1.0 - weight) * Float.fromInt(sample)
+
+fun atLeast64K(bytes : Int) -> Int = if bytes > 65536 { bytes } else { 65536 }
+
+-- `x` truncated, or the most an `Int` holds where it does not fit.
+fun saturated(x : Float) -> Int = match Float.truncate(x) {
+	Some(n) -> n
+	None    -> maxInt()
+}
+
+-- The square root of `x`: 0 if `x` is not positive, and `x` if it is not
+-- finite. By Newton's iteration rather than `Float.sqrt`, which is libc's,
+-- and wasm32 has no libc. Started at or above the root, the iteration falls
+-- to it monotonically, so it ends at the first step that does not fall.
+fun squareRoot(x : Float) -> Float {
+	if !Float.isFinite(x) { return x }
+	if !(x > 0.0) { return 0.0 }
+	var root = if x > 1.0 { x } else { 1.0 }
+	while True {
+		let next = (root + x / root) * 0.5
+		if !(next < root) { return root }
+		root = next
+	}
+	root
+}
+
+-- TURKEY_GC_GUARD_NANOSECONDS: a decimal number of at least 1, or a second
+-- if it is unset or anything else.
+fun bucketFrom(s : Ptr) -> Int {
+	if Ptr.isNull(s) { return 1000000000 }
+	let n = decimalFrom(s)
+	if n < 1 { 1000000000 } else { n }
+}
+
+-- TURKEY_GC_TARGET: a decimal number of bytes, with optional surrounding
+-- whitespace; 0, no target, if it is unset or anything else.
+fun targetFrom(s : Ptr) -> Int {
+	if Ptr.isNull(s) { return 0 }
+	let n = decimalFrom(s)
+	if n < 1 { 0 } else { n }
 }
 
 -- Before a full collection's marking: no object is marked.
@@ -2710,6 +2986,8 @@ fun logCollection(started : Int, liveBefore : Int, allocsSince : Int) -> Unit {
 	putInt(regionBytesInUse)
 	put(Prim.cString(", live bytes "))
 	putInt(liveBytes)
+	if guarding { put(Prim.cString(", guard")) }
+	if fullNext { put(Prim.cString(", next full")) }
 	put(Prim.cString(", "))
 	putFixed(nanos, 1000000, 3)
 	put(Prim.cString(" ms\n"))
@@ -2864,10 +3142,11 @@ fun putInt(n : Int) -> Unit {
 }
 
 -- The digits of `-n`, for `n <= 0`: the most negative `Int` has no positive
--- twin, and division truncates toward zero, so each remainder is in `-9..0`.
+-- twin, and `Int.rem` takes the dividend's sign, so each remainder is in
+-- `-9..0`.
 fun putMagnitude(n : Int) -> Unit {
-	if n <= -10 { putMagnitude(n / 10) }
-	putByte(48 - n % 10)
+	if n <= -10 { putMagnitude(Int.quot(n, 10)) }
+	putByte(48 - Int.rem(n, 10))
 }
 
 -- `n / unit` rounded to `places` decimal places, for `n` and `unit`
@@ -2905,15 +3184,19 @@ fun writeLine() -> Unit {
 
 -- -- the threshold scale ----------------------------------------------------------------
 
--- TURKEY_GC_THRESHOLD_SCALE, or 2 if it is unset or is not a finite decimal
--- number of at least 1, with optional surrounding whitespace.
+-- TURKEY_GC_THRESHOLD_SCALE, or the target's default (1 on wasm32, 2
+-- elsewhere) if it is unset or is not a finite decimal number of at least 1,
+-- with optional surrounding whitespace.
 --
 -- Parsed by hand: the collector cannot build the `String` the library's parser
 -- takes. Digits past the eighteenth are counted but not accumulated, and the
 -- value is the mantissa scaled by powers of ten. That is not correctly
 -- rounded, which a scale factor for a threshold has no use for.
 fun scaleFrom(s : Ptr) -> Float {
-	let fallback = 2.0
+	let fallback = match Target.os {
+		Wasi -> 1.0
+		_    -> 2.0
+	}
 	if Ptr.isNull(s) { return fallback }
 	var i = skipSpace(s, 0)
 	var negative = False
@@ -3012,7 +3295,11 @@ fun decimalFrom(s : Ptr) -> Int {
 	if !isDigit(byteAt(s, at)) { return -1 }
 	var total = 0
 	while isDigit(byteAt(s, at)) {
-		if total < 0x1000_0000_0000_0000 { total = total * 10 + byteAt(s, at) - 48 }
+		total = if total > 0x1000_0000_0000_0000 / 10 {
+			0x1000_0000_0000_0000
+		} else {
+			total * 10 + byteAt(s, at) - 48
+		}
 		at = at + 1
 	}
 	if byteAt(s, skipSpace(s, at)) != 0 { return -1 }

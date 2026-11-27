@@ -95,3 +95,17 @@ panic: no
   at error (Control/Panic.gob:8:36)
   at main (Main.gob:2:5)
 ```
+
+A program that a target skips, with the reason. The host runs it:
+
+<!-- skip: wasm32-wasi: shows that the directive is read -->
+<!-- run -->
+```kotlin
+fun main() {
+    print("skipped on wasm32-wasi")
+}
+```
+
+```text
+skipped on wasm32-wasi
+```

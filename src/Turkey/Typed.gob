@@ -1,5 +1,6 @@
 export (
 	TypeTable(..),
+	ArmCoverage(..),
 	newTypeTable,
 	observe,
 	record,
@@ -37,7 +38,6 @@ export (
 --- The table is keyed by the `id` the parser stamps on every node, which is what
 --- that id exists for: there is no identity to key on.
 
-import Data.Set as Set
 import Turkey.Ast (..)
 import Turkey.Source (Span(..))
 import Turkey.Diag as Diag
@@ -45,7 +45,7 @@ import Turkey.Classes (ClassTable(..))
 import Turkey.Inert as Inert
 import Turkey.Solved (Abstraction(..), Use(..))
 import Turkey.Types as Ty
-import Turkey.Types (TVar, TCon, TApp, TFam, TFun, TTuple, TSet, TBottom)
+import Turkey.Types (TVar, TApp, TFam, TFun, TTuple, TSet)
 
 type TypeTable = TypeTable {
 	exprs     : Map Int Ty.Type
@@ -58,9 +58,27 @@ type TypeTable = TypeTable {
 	--- by node id here, beside the types, and shared across modules.
 	abstractions : Map Int Abstraction
 	uses         : Map Int Use
+	--- What the exhaustiveness check found about each arm of a `match` in
+	--- own code (`Turkey.Lint`), keyed by the `match`'s id, for checks to
+	--- read. A `match` elsewhere has no entry.
+	coverage : Map Int (Vec ArmCoverage)
 	--- Every expression whose value is thrown away, by the file it is in
 	--- (`discard`).
 	discards : Map String (Vec Expr)
+}
+
+--- What the exhaustiveness check found about one arm of a `match`.
+type ArmCoverage = ArmCoverage {
+	--- Whether some value reaches the arm past the arms before it.
+	reached : Bool
+	--- The alternatives in the arm's patterns that no value reaches, though
+	--- one reaches the arm.
+	unreached : Vec Pat
+	--- Whether the arm's patterns together match every value.
+	irrefutable : Bool
+	--- For each of the arm's guards, whether it is a `let` whose patterns
+	--- together match every value.
+	irrefutableGuards : Vec Bool
 }
 
 fun newTypeTable() -> TypeTable = TypeTable {
@@ -70,6 +88,7 @@ fun newTypeTable() -> TypeTable = TypeTable {
 	inert        = None
 	abstractions = Map.new()
 	uses         = Map.new()
+	coverage     = Map.new()
 	discards     = Map.new()
 }
 
@@ -207,9 +226,8 @@ fun unresolved(t : TypeTable) -> Vec Ty.Type {
 
 -- Whether a resolved type still contains an undecided literal set.
 fun stuck(ty : Ty.Type) -> Bool {
-	match Ty.prune(ty) {
-		TSet(_) -> return True
-		_       -> {}
+	if let TSet(_) = Ty.prune(ty) {
+		return True
 	}
 	for c in typeChildren(Ty.prune(ty)) {
 		if stuck(c) { return True }

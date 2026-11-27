@@ -102,6 +102,15 @@ call s:Probe('escapes', -1, 'turkeyString')
 call s:Probe('u{1F600}', 0, 'turkeyEscape')    " the string's escape this time
 call s:Probe('}{', 0, 'turkeyString')          " braces inside a string
 call s:Probe('not a comment', -6, 'turkeyString')
+call s:Probe('usage: greet', 0, 'turkeyMultiString')
+call s:Probe('not a comment', 0, 'turkeyMultiString')
+call s:Probe('\${len(tricky', 0, 'turkeyHoleDelimiter')
+call s:Probe('len(tricky)', 0, 'turkeyIdentifier') " code in a hole
+call s:Probe('names {-', 6, 'turkeyMultiString') " text after it, not a comment
+call s:Probe('"quoted"', 0, 'turkeyMultiString') " a quote does not close it
+call s:Probe('u{1F600} at', 0, 'turkeyEscape')
+call s:Probe('length \\$', 7, 'turkeyMultiString') " a trailing \ is no error
+call s:Probe('^\s*"""', 8, 'turkeyMultiString')
 call s:Probe('sum ', 0, 'turkeyString')
 call s:Probe('\${tricky', 0, 'turkeyHoleDelimiter')
 call s:Probe('+ "in', 0, 'turkeyOperator')      " code inside a hole

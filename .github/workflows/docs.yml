@@ -1,11 +1,26 @@
-# Publishes the standard library's API documentation to GitHub Pages.
+# Publishes the standard library's API documentation, the browser playground
+# and the tour to GitHub Pages, one site: the documentation at the root, the
+# playground under `playground/` and the tour under `tour/`.
 #
 # `scripts/docs.sh` builds `turkey` from the committed bootstrap if it is not
 # there and runs `turkey doc --html` over the library, which writes the static
-# site and `docs.json`, the same description as JSON. Both are published. No
-# test runs here: the suite has its own workflow, and this one runs only on
-# `main`, and only when a path the output depends on changes, so that neither a
-# pull request nor an unrelated push costs a build.
+# site and `docs.json`, the same description as JSON. Both are published. The
+# playground is `turkey.wasm` (the compiler written for `wasm32-wasi`) and
+# `lib.tar.gz` (the library) built from the same checkout and assembled by
+# `scripts/playground-assemble.sh`, with the commit in the URLs of those two
+# files so that a cache cannot pair one deploy's compiler with another's
+# library. The tour is the lessons of `docs/tutorial/`, which
+# `src/TourSite.gob` writes as pages that load the playground's scripts, and
+# whose programs fill the playground's picker. No test runs here: the suite
+# has its own workflow, and this one runs only on `main`, and only when a path
+# the output depends on changes, so that neither a pull request nor an
+# unrelated push costs a build. The tour's build does fail on a broken lesson
+# or link, which `tests/test_tour_site.py` checks first in the suite.
+#
+# Pages cannot set response headers, so the playground cannot be
+# cross-origin isolated (COOP and COEP). It is single-threaded and needs no
+# isolation; shared memory and threads would, through coi-serviceworker or
+# another host.
 #
 # Needs Settings > Pages > Source set to "GitHub Actions" once.
 name: docs
@@ -15,12 +30,17 @@ on:
     branches: [main]
     # What `scripts/docs.sh` reads: the library and the compiler it builds
     # (`src/`, from `bootstrap/` by `scripts/build.sh`), which generates the
-    # site.
+    # site; and the lessons, with the reference whose headings they link.
     paths:
       - lib/**
       - src/**
       - bootstrap/**
+      - playground/**
+      - docs/tutorial/**
+      - docs/ref/**
       - scripts/docs.sh
+      - scripts/lib-tar.sh
+      - scripts/playground-assemble.sh
       - scripts/build.sh
       - .github/workflows/docs.yml
   workflow_dispatch:
@@ -47,6 +67,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sh scripts/docs.sh site
+      # `docs.sh` built `turkey` into build/stages. The wasm, the tar and the
+      # assembly come last, from this checkout, so the three agree.
+      - run: |
+          mkdir -p build
+          build/stages/turkey build --target wasm32-wasi -o build/turkey.wasm src/Main.gob
+          sh scripts/lib-tar.sh build/lib.tar.gz
+          sh scripts/playground-assemble.sh build/turkey.wasm build/lib.tar.gz site/playground "$(git rev-parse --short=12 HEAD)"
+      - run: |
+          build/stages/turkey build -o build/toursite src/TourSite.gob
+          build/toursite . site/tour
+      # The library's index links the tour and the playground. `turkey doc`
+      # writes a site for any library, so the link is added here, after the
+      # heading it follows, and the step fails if that heading has moved.
+      - run: |
+          awk '{ print } $0 == "<h1>Turkey library</h1>" { print "<p>New to Turkey? Take the <a href=\"tour/\">tour</a>, or try the <a href=\"playground/\">playground</a>.</p>"; found = 1 } END { exit !found }' \
+            site/index.html > build/index.html
+          mv build/index.html site/index.html
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site

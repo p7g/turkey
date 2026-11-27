@@ -1,5 +1,7 @@
 export (
 	oneOf,
+	methodCall,
+	methodCell,
 	Constraint(..),
 	Instantiates(..),
 	PredCell(..),
@@ -156,6 +158,10 @@ import Turkey.Classes (ClassTable(..), InstInfo(..), MethodInfo(..), Leftover(..
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..))
 import Turkey.Diag as Diag
+import Turkey.Ast as Ast
+import Turkey.Ast (Expr(..), ExprKind(..))
+import Turkey.MethodCalls as MethodCalls
+import Turkey.MethodCalls (MethodCall(..), Homes(..), newHomes)
 import Turkey.Inert as Inert
 import Turkey.Inert (Given(..), Refusal(..))
 import Turkey.Solved (
@@ -170,7 +176,7 @@ import Turkey.Solved (
 	newHole,
 	newUse,
 )
-import Turkey.Source (Span(..), showSpan)
+import Turkey.Source (Span(..))
 import Turkey.Typed as Typed
 import Turkey.Types as Ty
 import Turkey.Types (
@@ -189,6 +195,10 @@ import Turkey.Types (
 )
 
 let oneOf = "OneOf"
+
+--- The name of a method call's demand (`methodCell`). It is not a class:
+--- nothing discharges it but deciding the call, and no scheme carries it.
+let methodCall = "%Method"
 
 -- -- the tree ----------------------------------------------------------------------
 
@@ -261,6 +271,10 @@ type Constraint
 	--- first error, the rest of what it reports is dropped. The generator puts
 	--- one around each top-level binding group's definition.
 	| CUnit(Constraint)
+	--- Solves the constraint, and if solving it reported an error, reports
+	--- the advice too, at the span: what may be its cause, which the error
+	--- itself cannot see.
+	| CAdvise(String, Option Span, Constraint)
 	--- Check that a use of a declared scheme can be solved, and report the
 	--- scheme as ambiguous otherwise (`checkAmbiguity`). Solving it binds
 	--- nothing and leaves nothing behind.
@@ -340,6 +354,8 @@ type PredCell = PredCell {
 	--- or one it reduced to, what a diagnostic says needs it: "'f' needs
 	--- from its recursive group". Otherwise "".
 	var exported : String
+	--- The call, if this is a method call's demand (`methodCall`).
+	method : Option MethodCall
 }
 
 --- Where a wanted is in the solver.
@@ -376,6 +392,7 @@ fun newCell(p : Pred, where : Option Span, context : String, hole : Hole) -> Pre
 		belowSuper = False
 		posed      = p
 		exported   = ""
+		method     = None
 	}
 }
 
@@ -400,6 +417,7 @@ fun nakedCell(p : Pred, where : Option Span, context : String, hole : Hole) -> P
 		belowSuper = False
 		posed      = p
 		exported   = ""
+		method     = None
 	}
 }
 
@@ -431,6 +449,7 @@ fun subgoal(
 		belowSuper = parent.naked || parent.belowSuper
 		posed      = p
 		exported   = parent.exported
+		method     = None
 	}
 }
 
@@ -455,7 +474,40 @@ fun superclassOf(parent : PredCell, p : Pred) -> PredCell {
 		belowSuper = parent.naked || parent.belowSuper
 		posed      = p
 		exported   = parent.exported
+		method     = None
 	}
+}
+
+--- Returns the demand that the method call `m` be decided, over its
+--- receiver's type `receiver`. `mark` is a fresh variable nothing else
+--- mentions, so that two calls on one receiver are two demands.
+fun methodCell(
+	m : MethodCall,
+	receiver : Ty.Type,
+	mark : Ty.Type,
+	where : Option Span,
+) -> Constraint {
+	serials.next = serials.next + 1
+	let p = Ty.pred(methodCall, [receiver, mark])
+	CPred(PredCell {
+		pred       = p
+		span       = where
+		context    = "the call of '." + m.label + "'"
+		hole       = newHole()
+		at         = None
+		stage      = Queued
+		serial     = serials.next
+		stuck      = 0
+		depth      = 0
+		root       = p
+		superclass = False
+		expanded   = False
+		naked      = False
+		belowSuper = False
+		posed      = p
+		exported   = ""
+		method     = Some(m)
+	})
 }
 
 -- How deep below a wanted the program demanded its instances may go: GHC's
@@ -500,6 +552,10 @@ type Implication = Implication {
 	untouchable : Int
 	--- The skolems this implication binds: GHC's `ic_skols`.
 	skolems : Vec ConCell
+	--- The rank of its body: GHC's `ic_tclvl`. A wanted of it that a
+	--- unification wakes from outside is solved with the variables it invents
+	--- born at this rank, wherever the solver is (`decideMethod`).
+	level : Int
 	--- Whether its own givens make outer variables untouchable: GHC's
 	--- `ic_given_eqs` being `MaybeGivenEqs`.
 	givenEqs : Bool
@@ -538,6 +594,7 @@ fun implication(
 	checks : Option Pred,
 	inert : Inert.Inert,
 	untouchable : Int,
+	level : Int,
 ) -> Implication =
 	nested(
 		classes,
@@ -546,6 +603,7 @@ fun implication(
 		checks,
 		inert,
 		untouchable,
+		level,
 		[],
 		False,
 		None,
@@ -564,6 +622,7 @@ fun nested(
 	checks : Option Pred,
 	inert : Inert.Inert,
 	untouchable : Int,
+	level : Int,
 	skolems : Vec ConCell,
 	givenEqs : Bool,
 	made : Option Inert.Inert,
@@ -586,6 +645,7 @@ fun nested(
 		inert       = inert
 		untouchable = untouchable
 		skolems     = skolems
+		level       = level
 		givenEqs    = givenEqs
 		made        = made
 		muted       = muted
@@ -804,6 +864,8 @@ type Solver = Solver {
 	--- [ei_suppress: suppressing confusing errors]), reported only where no
 	--- other error says the same (`unsuppress`, `blame`).
 	var suppressed : Vec (Diag.Diag, Pred)
+	--- Where method calls find their functions (`methodRule`).
+	var homes : Homes
 }
 
 -- A local binder that its group did not generalize, though the group's type
@@ -846,7 +908,7 @@ fun newSolver(
 	classes : ClassTable,
 	visibleCons : fun(Option Span) -> Set.Set String,
 ) -> Solver {
-	let top = implication(classes, 0, [], None, Inert.empty(classes), Ty.noScope)
+	let top = implication(classes, 0, [], None, Inert.empty(classes), Ty.noScope, 0)
 	let s = Solver {
 		decls       = decls
 		classes     = classes
@@ -866,6 +928,7 @@ fun newSolver(
 		unchecked   = Vec.new(4)
 		solving     = Set.new()
 		suppressed  = Vec.new(0)
+		homes       = newHomes()
 	}
 	classes.simplify = fun(givens, wanteds, skolems) = simplifyDerived(s, givens, wanteds, skolems)
 	s
@@ -889,6 +952,15 @@ fun rank(s : Solver) -> Int = len(s.pools) - 1
 fun fresh(s : Solver) -> VarCell {
 	let v = Ty.freshVar(rank(s))
 	Vec.push(s.pools[len(s.pools) - 1], v)
+	v
+}
+
+--- Returns a fresh variable born at `level`, which is at most the current
+--- rank unless the pool for it is gone: the rank of a wanted's implication
+--- that is solved again after its `CLet` was left (`methodRule`).
+fun freshAt(s : Solver, level : Int) -> VarCell {
+	let v = Ty.freshVar(level)
+	Vec.push(s.pools[min(level, len(s.pools) - 1)], v)
 	v
 }
 
@@ -937,8 +1009,8 @@ fun defer(s : Solver, a : Ty.Type, b : Ty.Type, where : Option Span, context : S
 	let right0 = Inert.rewrite(s.here.inert, b)
 	if Ty.sameType(left0, right0) { return }
 	for t in [left0, right0] {
-		match t {
-			TFam(name, arg, _) -> match Classes.uncovered(s.classes, name, arg) {
+		if let TFam(name, arg, _) = t {
+			if let Some(missing) = Classes.uncovered(s.classes, name, arg) {
 				-- A skolem is a nullary constructor, so a family over one looks
 				-- exactly like a family over a type whose instance is missing.
 				-- It is not: the declaration assumed that instance, and which
@@ -946,26 +1018,23 @@ fun defer(s : Solver, a : Ty.Type, b : Ty.Type, where : Option Span, context : S
 				-- merely stuck, and is reported as stuck.
 				-- In a derivation's implication the equation is queued
 				-- anyway, to stay in its residual (`Implication.reports`).
-				Some(missing) ->
-					if s.here.reports
-							&& Option.isNone(
-								granted(
-									s,
-									Ty.pred(missing.name, Array.map(missing.args, rewriteW(s, _))),
-								),
-							) {
-						return Ty.typeError(
-							"no instance for '"
-								+ Ty.showPred(missing)
-								+ "', which '"
-								+ Ty.show(t)
-								+ "' needs",
-							where,
-						)
-					}
-				None -> {}
+				if s.here.reports
+						&& Option.isNone(
+							granted(
+								s,
+								Ty.pred(missing.name, Array.map(missing.args, rewriteW(s, _))),
+							),
+						) {
+					return Ty.typeError(
+						"no instance for '"
+							+ Ty.showPred(missing)
+							+ "', which '"
+							+ Ty.show(t)
+							+ "' needs",
+						where,
+					)
+				}
 			}
-			_ -> {}
 		}
 	}
 	-- Oriented family-first, so a carried equality reads the way a written one
@@ -1023,6 +1092,10 @@ fun solveRefusals(s : Solver) -> Unit {
 --- an importer's uses fix them.
 fun defaultOnce(s : Solver) -> Bool {
 	let open = everywhere(s.here)
+	if narrowStranded(s, open, True) {
+		solveWanteds(s)
+		return True
+	}
 	-- Equalities are defaulted before literals, as GHC's `tryDefaulting` runs
 	-- `tryConstraintDefaulting` before `tryTypeClassDefaulting`: a literal
 	-- whose type an equality decides takes that type, not the default.
@@ -1110,6 +1183,11 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
 		solve(s, body)
 		discard(Diag.endUnit())
 	}
+	CAdvise(advice, where, body) -> {
+		Diag.beginUnit()
+		solve(s, body)
+		if Diag.endUnit() { Ty.typeError(advice, where) }
+	}
 	CAmbiguity(a) -> checkAmbiguity(s, a)
 }
 
@@ -1182,6 +1260,7 @@ fun assume(
 		checks,
 		inert,
 		untouchable,
+		rank(s) + 1,
 		skolems,
 		givenEqs,
 		made,
@@ -1207,9 +1286,8 @@ fun assume(
 		Diag.endMuted()
 		for var i = firstUse; i < len(s.uses); i = i + 1 { s.uses[i].inaccessible = True }
 	}
-	match made {
-		Some(i) -> Inert.close(i)
-		None    -> {}
+	if let Some(i) = made {
+		Inert.close(i)
 	}
 	s.here = outside
 	discard(Vec.pop(s.scopes))
@@ -1322,6 +1400,17 @@ fun solveInstance(
 	where : Option Span,
 	use : Option Use,
 	of : Instantiates,
+) -> Unit = solveInstanceAt(s, rank(s), name, ty, where, use, of)
+
+-- `solveInstance`, with the variables instantiation invents born at `level`.
+fun solveInstanceAt(
+	s : Solver,
+	level : Int,
+	name : String,
+	ty : Ty.Type,
+	where : Option Span,
+	use : Option Use,
+	of : Instantiates,
 ) -> Unit {
 	let scheme = match of {
 		OfScheme(sc) -> sc
@@ -1330,7 +1419,10 @@ fun solveInstance(
 			None    -> bug("generation let '" + name + "' through unbound", where)
 		}
 	}
-	let (preds, monoOrInstantiated, typeArgs) = Ty.instantiateQual(scheme, fun() = fresh(s))
+	let (preds, monoOrInstantiated, typeArgs) = Ty.instantiateQual(
+		scheme,
+		fun() = freshAt(s, level),
+	)
 	let instantiated = match of {
 		OfBinder(id) -> match Map.get(s.refusals, id) {
 			Some(r) -> refusedUse(s, r, monoOrInstantiated, where)
@@ -1339,32 +1431,29 @@ fun solveInstance(
 		OfScheme(_) -> monoOrInstantiated
 	}
 	Ty.unify(instantiated, ty, where, "", families(s))
-	match use {
-		Some(u) -> {
-			-- Only the class predicates: `HasField` and `OneOf` are discharged
-			-- by a lookup and a decision, and leave nothing behind to pass.
-			let kept = Vec.new(len(preds))
-			let holes = Vec.new(len(preds))
-			for p in preds {
-				if Classes.isClass(s.classes, p.name) {
-					Vec.push(kept, p)
-					Vec.push(holes, newHole())
-				}
+	if let Some(u) = use {
+		-- Only the class predicates: `HasField` and `OneOf` are discharged
+		-- by a lookup and a decision, and leave nothing behind to pass.
+		let kept = Vec.new(len(preds))
+		let holes = Vec.new(len(preds))
+		for p in preds {
+			if Classes.isClass(s.classes, p.name) {
+				Vec.push(kept, p)
+				Vec.push(holes, newHole())
 			}
-			u.preds = kept
-			u.holes = holes
-			u.equalities = Vec.filter(preds, fun(p) = p.name == Ty.equals)
-			-- Every type argument, though, and unfiltered: a type application
-			-- has to name one per quantified variable or it is not the scheme's
-			-- instantiation. They are recorded before unification has run to
-			-- completion and are variables at this point, which is correct --
-			-- what they turn out to be is read back after solving.
-			u.typeArgs = typeArgs
-			u.neverReturns = resultIsUnconstrained(scheme)
-			u.scopes = Vec.slice(s.scopes, 0, len(s.scopes))
-			Vec.push(s.uses, u)
 		}
-		None -> {}
+		u.preds = kept
+		u.holes = holes
+		u.equalities = Vec.filter(preds, fun(p) = p.name == Ty.equals)
+		-- Every type argument, though, and unfiltered: a type application
+		-- has to name one per quantified variable or it is not the scheme's
+		-- instantiation. They are recorded before unification has run to
+		-- completion and are variables at this point, which is correct --
+		-- what they turn out to be is read back after solving.
+		u.typeArgs = typeArgs
+		u.neverReturns = resultIsUnconstrained(scheme)
+		u.scopes = Vec.slice(s.scopes, 0, len(s.scopes))
+		Vec.push(s.uses, u)
 	}
 	let context = "the context of '" + Ty.shortName(name) + "'"
 	-- A class predicate's evidence goes into the hole the use reads it from.
@@ -1474,9 +1563,8 @@ fun monoLet(s : Solver, c : LetCell, free : Vec Int) -> Unit {
 	let because = Map.getOr(s.open, free[0], "")
 	for (id, name, ty) in c.binds {
 		let b = Binding { scheme = Ty.mono(ty), mutable = False }
-		match c.dicts {
-			Some(a) -> Map.put(a.schemes, name, b.scheme)
-			None    -> {}
+		if let Some(a) = c.dicts {
+			Map.put(a.schemes, name, b.scheme)
 		}
 		bindFor(s, id, name, b, False)
 		if id == noBinder { continue }
@@ -1694,12 +1782,10 @@ fun numeralAdmits(s : Solver, v : VarCell, con : ConCell) -> Bool {
 	-- A demand on `v` that is inert mentions `v`, so it is among its watchers.
 	for c in Map.getOr(s.watchers, v.id, []) {
 		if !resting(c) || c.pred.name != oneOf || isArrayLiteralDemand(c) { continue }
-		match Ty.prune(c.pred.args[0]) {
-			TVar(w) ->
-				if w.id == v.id && !Array.contains(setNames(c.pred.args[1], c.span), con.name) {
-					return False
-				}
-			_ -> {}
+		if let TVar(w) = Ty.prune(c.pred.args[0]) {
+			if w.id == v.id && !Array.contains(setNames(c.pred.args[1], c.span), con.name) {
+				return False
+			}
 		}
 	}
 	True
@@ -1739,13 +1825,13 @@ fun openRefs(c : Constraint, open : Map Int String, out : Vec Int) -> Unit = mat
 		openRefs(cell.body, open, out)
 	}
 	CAssume(_, _, body) -> openRefs(body, open, out)
-	CInstance(_, _, _, _, of) -> match of {
-		OfBinder(id) -> if Map.contains(open, id) { Vec.push(out, id) }
-		OfScheme(_)  -> {}
+	CInstance(_, _, _, _, of) -> if let OfBinder(id) = of {
+		if Map.contains(open, id) { Vec.push(out, id) }
 	}
-	CUse(_)       -> {}
-	CUnit(body)   -> openRefs(body, open, out)
-	CAmbiguity(_) -> {}
+	CUse(_)             -> {}
+	CUnit(body)         -> openRefs(body, open, out)
+	CAdvise(_, _, body) -> openRefs(body, open, out)
+	CAmbiguity(_)       -> {}
 }
 
 -- A top-level binding group is a unit (`Diag.beginUnit`), its generalization
@@ -1799,9 +1885,8 @@ fun letBody(s : Solver, c : LetCell, closed : Bool) -> Unit {
 	-- An equation tied to a variable this binder quantifies can never be decided
 	-- by an enclosing one -- nothing outside mentions the variable -- so this is
 	-- where it is stuck for good.
-	match Vec.pop(s.pools) {
-		Some(young) -> dischargePool(s, young)
-		None        -> {}
+	if let Some(young) = Vec.pop(s.pools) {
+		dischargePool(s, young)
 	}
 	-- A wanted that can never hold is a definite error, and then the group
 	-- quantifies over nothing: OutsideIn(X) §7.3, "We do not want to
@@ -1882,14 +1967,11 @@ fun letBody(s : Solver, c : LetCell, closed : Bool) -> Unit {
 	}
 	solveUnderScheme(s, c, named, wanteds, mark, definite)
 	forgetSuppressed(s, mark)
-	match c.dicts {
-		Some(a) -> {
-			let params = Vec.new(len(givens))
-			for (n, _) in givens { Vec.push(params, n) }
-			a.params = params
-			a.preds = shared
-		}
-		None -> {}
+	if let Some(a) = c.dicts {
+		let params = Vec.new(len(givens))
+		for (n, _) in givens { Vec.push(params, n) }
+		a.params = params
+		a.preds = shared
 	}
 	let whole = wholeScheme(s, c, theta, shared)
 
@@ -2003,12 +2085,11 @@ fun letBody(s : Solver, c : LetCell, closed : Bool) -> Unit {
 		if !definite && id != noBinder && !Diag.hasErrors() {
 			checkAmbiguity(s, inferredAmbiguity(c, name, b.scheme))
 		}
-		match c.dicts {
+		if let Some(a) = c.dicts {
 			-- Recorded here because here is the only place it exists: a local
 			-- binding's scheme goes into an environment popped as soon as the
 			-- body has been solved.
-			Some(a) -> Map.put(a.schemes, name, b.scheme)
-			None    -> {}
+			Map.put(a.schemes, name, b.scheme)
 		}
 		bindFor(s, id, name, b, c.topLevel)
 		-- The recursive placeholder `CDef` bound for this id is gone, and so
@@ -2271,7 +2352,7 @@ fun writtenKeys(c : LetCell, name : String) -> Set.Set String {
 fun inferredAmbiguity(c : LetCell, name : String, scheme : Scheme) -> Ambiguity {
 	let names = Map.new()
 	let written = Vec.new(len(scheme.preds))
-	for p in scheme.preds { Vec.push(written, None) }
+	for _ in scheme.preds { Vec.push(written, None) }
 	var span = c.span
 	for (n, at, header, context, spans) in c.rigid {
 		if n != Ty.shortName(name) { continue }
@@ -2468,6 +2549,7 @@ fun resimplified(s : Solver, nested : Vec PredCell) -> Vec Pred {
 		outside.checks,
 		outside.inert,
 		rank(s) - 1,
+		rank(s),
 	)
 	s.here = impl
 	for w in nested {
@@ -2546,9 +2628,8 @@ fun inferredDiff(s : Solver, annotated : Vec Pred, inferred : Vec Pred) -> Vec P
 		take(cells[i])
 	}
 	for w in members(impl) { take(w) }
-	match made {
-		Some(i) -> Inert.close(i)
-		None    -> {}
+	if let Some(i) = made {
+		Inert.close(i)
 	}
 	s.here = outside
 	out
@@ -2595,8 +2676,8 @@ fun solveUnderScheme(
 	-- used. A contradiction solving met is a definite error, after which
 	-- nothing is quantified, so this is one that solving did not see.
 	for r in refused {
-		match r {
-			Never(g, why) -> Ty.typeError(
+		if let Never(g, why) = r {
+			Ty.typeError(
 				"the body of '"
 					+ groupName(c)
 					+ "' needs '"
@@ -2605,7 +2686,6 @@ fun solveUnderScheme(
 					+ why,
 				c.span,
 			)
-			GaveUp(_, _) -> {}
 		}
 	}
 	let outside = s.here
@@ -2631,9 +2711,8 @@ fun solveUnderScheme(
 			}
 		}
 	}
-	match made {
-		Some(i) -> Inert.close(i)
-		None    -> {}
+	if let Some(i) = made {
+		Inert.close(i)
 	}
 	s.here = outside
 }
@@ -2702,7 +2781,7 @@ fun schemeImplication(s : Solver, named : Vec (String, Pred)) -> (
 	}
 	s.entered = s.entered + 1
 	(
-		implication(s.classes, s.entered, assumptions, outside.checks, inert, rank(s) + 1),
+		implication(s.classes, s.entered, assumptions, outside.checks, inert, rank(s) + 1, rank(s)),
 		made,
 		refused,
 	)
@@ -2728,8 +2807,8 @@ fun checkRigid(s : Solver, c : LetCell, diff : Vec Pred) -> Unit {
 			for (n, v) in header { if n == varName { t = v } }
 			match Ty.prune(t) {
 				TVar(cell) -> {
-					match Map.get(seen.names, cell.id) {
-						Some(other) -> return Ty.typeError(
+					if let Some(other) = Map.get(seen.names, cell.id) {
+						return Ty.typeError(
 							"the annotation on '"
 								+ name
 								+ "' says '"
@@ -2740,7 +2819,6 @@ fun checkRigid(s : Solver, c : LetCell, diff : Vec Pred) -> Unit {
 								+ "types, but its body makes them the same",
 							Some(where),
 						)
-						None -> {}
 					}
 					Map.put(seen.names, cell.id, varName)
 					if cell.level <= rank(s) {
@@ -2835,19 +2913,32 @@ fun split(s : Solver, c : LetCell, types : Array Ty.Type, after : Int) -> Vec Pr
 		-- Nor is an equation whose variable occurs in its other side under a
 		-- family, `a ~ Option (F a)`: no signature can state it, and once
 		-- nothing more can decide `F a` it is the infinite type it looks like.
+		-- Nor is a method call's receiver: which function the call means is
+		-- decided by the receiver's type, and the same for every use of the
+		-- binding, so a scheme cannot leave it to its uses. Stranded, it
+		-- waits for defaulting, which may decide a literal receiver.
 		let stranded = Vec.filter(
 			retainedPreds,
-			fun(p) = isArrayLiteralDemand(p) || isOccursEquation(p),
+			fun(p) = isArrayLiteralDemand(p) || isOccursEquation(p) || isMethodDemand(p),
 		)
 		for p in unattributed(retainedPreds, types) {
-			if !isArrayLiteralDemand(p) && !isOccursEquation(p) { Vec.push(stranded, p) }
+			if !isArrayLiteralDemand(p) && !isOccursEquation(p) && !isMethodDemand(p) {
+				Vec.push(stranded, p)
+			}
+		}
+		-- A method call on a literal narrows the literal before a default is
+		-- chosen for it: the default must be a type whose home has the method.
+		if narrowStranded(s, stranded, False) {
+			for p in retainedPreds { queue(p) }
+			solveWanteds(s)
+			continue
 		}
 		if len(stranded) == 0 || !applyDefaults(s, stranded, retainedPreds, Vec.new(1)) {
 			-- An equality that can never be solved is what leaves the others
 			-- undecided, most often, so it is reported first.
 			if c.topLevel { rejectQuantified(s, c, after) }
 			rejectStranded(s, stranded)
-			out = retainedPreds
+			out = Vec.filter(retainedPreds, fun(p) = !isMethodDemand(p))
 			going = False
 		} else {
 			-- Something was decided. Put the split back and solve again, so the
@@ -2869,12 +2960,11 @@ fun split(s : Solver, c : LetCell, types : Array Ty.Type, after : Int) -> Vec Pr
 fun dischargePool(s : Solver, young : Vec VarCell) -> Unit {
 	let left = rank(s) + 1
 	for v in young {
-		match Ty.prune(TVar(v)) {
+		if let TVar(pruned) = Ty.prune(TVar(v)) {
 			-- Bound during solving; unification adjusted what it points at.
-			TVar(pruned) -> if pruned.level < left {
+			if pruned.level < left {
 				Vec.push(s.pools[len(s.pools) - 1], pruned)
 			}
-			_ -> {}
 		}
 	}
 }
@@ -3002,18 +3092,16 @@ fun solveNested(s : Solver) -> Unit {
 	let left = Vec.new(len(here.children))
 	for child in here.children {
 		if pending(child) {
-			match child.made {
-				Some(i) -> Inert.reopen(i)
-				None    -> {}
+			if let Some(i) = child.made {
+				Inert.reopen(i)
 			}
 			if child.muted { Diag.beginMuted() }
 			s.here = child
 			solveWanteds(s)
 			s.here = here
 			if child.muted { Diag.endMuted() }
-			match child.made {
-				Some(i) -> Inert.close(i)
-				None    -> {}
+			if let Some(i) = child.made {
+				Inert.close(i)
 			}
 		}
 		if unsolved(child) { Vec.push(left, child) }
@@ -3283,14 +3371,11 @@ fun underFamily(lhs : Ty.Type, t : Ty.Type) -> Bool = match Ty.prune(t) {
 -- were when the rule joined, which the termination of `Inert.rewriteOver`
 -- relies on (T1 and T2 in GHC's Note [Extending the inert equalities]).
 fun woken(s : Solver, v : VarCell) -> Unit {
-	match Map.get(s.watchers, v.id) {
-		Some(list) -> {
-			discard(Map.delete(s.watchers, v.id))
-			for c in list {
-				if resting(c) { enqueue(s, c) }
-			}
+	if let Some(list) = Map.get(s.watchers, v.id) {
+		discard(Map.delete(s.watchers, v.id))
+		for c in list {
+			if resting(c) { enqueue(s, c) }
 		}
-		None -> {}
 	}
 }
 
@@ -3441,6 +3526,8 @@ fun entail(s : Solver, c : PredCell) -> Bool {
 		oneOfRule(s, c)
 	} else if Classes.isClass(s.classes, c.pred.name) {
 		classRule(s, c)
+	} else if c.pred.name == methodCall {
+		methodRule(s, c)
 	} else {
 		bug("no rule for predicate '" + c.pred.name + "'", c.span)
 	}
@@ -3492,9 +3579,8 @@ fun equals(s : Solver, c : PredCell) -> Bool {
 	let right = rewriteW(s, c.pred.args[1])
 	c.pred = Ty.pred(c.pred.name, [left, right])
 	if Ty.sameType(left, right) { return True }
-	match (left, right) {
-		(TBottom, _) | (_, TBottom) -> return True
-		_                           -> {}
+	if let (TBottom, _) | (_, TBottom) = (left, right) {
+		return True
 	}
 	let fams = families(s)
 	if bindable(left, right, fams)
@@ -3696,13 +3782,10 @@ fun mentionsMeta(t : Ty.Type) -> Bool = match t {
 -- inaccessible and its holes are never read.
 fun classRule(s : Solver, c : PredCell) -> Bool {
 	let t = rewriteW(s, c.pred.args[0])
-	match t {
+	if let TBottom = t {
 		-- Absorbed; there is no value to find a method for.
-		TBottom -> {
-			c.hole.proof = Some(ByNothing(c.pred.name))
-			return True
-		}
-		_ -> {}
+		c.hole.proof = Some(ByNothing(c.pred.name))
+		return True
 	}
 	let p = Ty.pred(c.pred.name, [t])
 	c.pred = p
@@ -3830,9 +3913,9 @@ fun checkFieldVisibility(s : Solver, p : Pred, receiver : Ty.Type, c : PredCell)
 		None    -> return False
 	}
 	let (h, _) = Ty.spine(receiver)
-	match h {
-		TCon(con) -> match Map.get(s.decls.tycons, con.name) {
-			Some(info) -> if len(info.variants) == 1 {
+	if let TCon(con) = h {
+		if let Some(info) = Map.get(s.decls.tycons, con.name) {
+			if len(info.variants) == 1 {
 				let ctor = info.variants[0]
 				if Decls.isRecord(ctor) && !Set.contains(s.visibleCons(c.span), ctor.name) {
 					return reported(
@@ -3847,9 +3930,7 @@ fun checkFieldVisibility(s : Solver, p : Pred, receiver : Ty.Type, c : PredCell)
 					)
 				}
 			}
-			None -> {}
 		}
-		_ -> {}
 	}
 	False
 }
@@ -3873,75 +3954,87 @@ fun noField(s : Solver, p : Pred, receiver : Ty.Type, c : PredCell) -> Bool {
 	-- Only an assignment's predicates carry "assign to"; any other context,
 	-- such as a scheme's, is a read.
 	let verb = if c.context == "assign to" { c.context } else { "read" }
-	match fieldLabel(p.name) {
-		Some(label) -> {
-			match h {
-				TCon(con) -> {
-					if Option.isSome(Classes.setterLabel(p.name)) && notVar(s, con.name, label, c) {
-						return True
-					}
-					match Decls.recordFields(s.decls, con.name) {
-						Some(names) -> if !Array.contains(names, label) {
-							return reported(
-								"type '"
-									+ Ty.show(receiver)
-									+ "' has no field '"
-									+ label
-									+ "'; its fields are "
-									+ String.join(Array.map(names, fun(n) = "'" + n + "'"), ", "),
-								c.span,
-							)
-						}
-						None -> {}
-					}
-					match Decls.existentialFields(s.decls, con.name) {
-						Some(hidden) -> if Array.contains(hidden, label) {
-							return reported(
-								"cannot "
-									+ verb
-									+ " field '"
-									+ label
-									+ "' of the existential type '"
-									+ Ty.show(receiver)
-									+ "'; take it apart in a "
-									+ "'match' arm instead",
-								c.span,
-							)
-						}
-						None -> {}
+	if let Some(label) = fieldLabel(p.name) {
+		if let TCon(con) = h {
+			if Option.isSome(Classes.setterLabel(p.name)) && notVar(s, con.name, label, c) {
+				return True
+			}
+			if verb == "read" && !namesField(s, con.name, label) {
+				if let Right(home) = MethodCalls.homeOf(s.homes, con.name) {
+					if Option.isSome(MethodCalls.lookup(s.homes, home, label, c.span)) {
+						return reported(
+							"type '"
+								+ Ty.show(receiver)
+								+ "' has no field '"
+								+ label
+								+ "': '"
+								+ label
+								+ "' is a function of '"
+								+ home
+								+ "'; call it, as in '."
+								+ label
+								+ "()'",
+							c.span,
+						)
 					}
 				}
-				_ -> {}
 			}
-			-- Every type that reaches here lacks the one record constructor
-			-- that '.' needs. A read from a type with constructors of its own
-			-- can take the value apart instead; an assignment has no
-			-- alternative, since such a type is immutable.
-			let fix = match h {
-				TCon(con) -> match Map.get(s.decls.tycons, con.name) {
-					Some(info) -> if verb == "read" && len(info.variants) > 0 {
-						"; take it apart with 'match'"
-					} else {
-						""
-					}
-					None -> ""
+			if let Some(names) = Decls.recordFields(s.decls, con.name) {
+				if !Array.contains(names, label) {
+					return reported(
+						"type '"
+							+ Ty.show(receiver)
+							+ "' has no field '"
+							+ label
+							+ "'; its fields are "
+							+ String.join(Array.map(names, fun(n) = "'" + n + "'"), ", "),
+						c.span,
+					)
 				}
-				_ -> ""
 			}
-			return reported(
-				"cannot "
-					+ verb
-					+ " field '"
-					+ label
-					+ "': '"
-					+ Ty.show(receiver)
-					+ "' is not a record type with one "
-					+ "constructor"
-					+ fix,
-				c.span,
-			)
+			if let Some(hidden) = Decls.existentialFields(s.decls, con.name) {
+				if Array.contains(hidden, label) {
+					return reported(
+						"cannot "
+							+ verb
+							+ " field '"
+							+ label
+							+ "' of the existential type '"
+							+ Ty.show(receiver)
+							+ "'; take it apart in a "
+							+ "'match' arm instead",
+						c.span,
+					)
+				}
+			}
 		}
-		None -> {}
+		-- Every type that reaches here lacks the one record constructor
+		-- that '.' needs. A read from a type with constructors of its own
+		-- can take the value apart instead; an assignment has no
+		-- alternative, since such a type is immutable.
+		let fix = match h {
+			TCon(con) -> match Map.get(s.decls.tycons, con.name) {
+				Some(info) -> if verb == "read" && len(info.variants) > 0 {
+					"; take it apart with 'match'"
+				} else {
+					""
+				}
+				None -> ""
+			}
+			_ -> ""
+		}
+		return reported(
+			"cannot "
+				+ verb
+				+ " field '"
+				+ label
+				+ "': '"
+				+ Ty.show(receiver)
+				+ "' is not a record type with one "
+				+ "constructor"
+				+ fix,
+			c.span,
+		)
 	}
 	let index = match Classes.generatedIndex(p.name) {
 		Some(found) -> found
@@ -3982,7 +4075,7 @@ fun fieldLabel(cls : String) -> Option String = match Classes.generatedLabel(cls
 	None        -> Classes.setterLabel(cls)
 }
 
--- An assignment to a field the record has but did not declare `var`. Named with
+-- An assignment to a field the record has but did not declare `var`. Noted with
 -- its declaration, because that is where the fix goes, and the assignment may
 -- be in another function -- or, for a polymorphic receiver, the error is
 -- reported at the call that supplied the record type. Returns whether it
@@ -3993,20 +4086,20 @@ fun notVar(s : Solver, tycon : String, label : String, c : PredCell) -> Bool {
 		None       -> return False
 	}
 	match Decls.fieldSpan(s.decls, tycon, label) {
-		Some(at) -> reported(
-			"cannot assign to field '"
-				+ label
-				+ "': it is not 'var' in '"
-				+ Ty.shortName(tycon)
-				+ "' (declared at "
-				+ at.file
-				+ ":"
-				+ showSpan(at)
-				+ "); declare it 'var "
-				+ label
-				+ "' to make it assignable",
-			c.span,
-		)
+		Some(at) -> {
+			Ty.typeErrorNoted(
+				"cannot assign to field '"
+					+ label
+					+ "': it is not 'var' in '"
+					+ Ty.shortName(tycon)
+					+ "'; declare it 'var "
+					+ label
+					+ "' to make it assignable",
+				c.span,
+				[("'" + label + "' is declared here", at)],
+			)
+			True
+		}
 		None -> False
 	}
 }
@@ -4485,9 +4578,8 @@ fun decideLiteral(s : Solver, round : Round, c : PredCell, patient : Bool) -> Op
 	}
 	let open = []
 	for var i = 0; i < len(verdicts); i = i + 1 {
-		match verdicts[i] {
-			Carried(need) | Waits(_, need) -> Vec.push(open, (i, need))
-			_                              -> {}
+		if let Carried(need) | Waits(_, need) = verdicts[i] {
+			Vec.push(open, (i, need))
 		}
 	}
 	-- One candidate, or several leaving the same needs, which then say nothing
@@ -4741,6 +4833,7 @@ fun decideTopLevelLiterals(s : Solver) -> Unit {
 	loop {
 		solveWanteds(s)
 		let cells = everywhere(s.here)
+		if narrowStranded(s, cells, True) { continue }
 		let open = Vec.filter(cells, fun(c) = isArrayLiteralDemand(c) && undecided(c))
 		-- The binding's numerals are left to the rest of the module, except
 		-- one a literal's choice waits on, so that a literal here is decided
@@ -4941,11 +5034,10 @@ fun undeducible(w : PredCell, fix : String) -> Unit {
 	-- unknown type is not called by one of them.
 	let types = Vec.new(4)
 	for a in w.pred.args { Vec.push(types, a) }
-	match w.at {
-		Some(i) -> for (_, g) in i.assumptions {
+	if let Some(i) = w.at {
+		for (_, g) in i.assumptions {
 			for a in g.args { Vec.push(types, a) }
 		}
-		None -> {}
 	}
 	let taken = Set.new()
 	for k in Ty.skolemsOf(Vec.toArray(types)) { Set.add(taken, k.name) }
@@ -5011,26 +5103,26 @@ fun rejectStranded(s : Solver, cells : Vec PredCell) -> Unit {
 	-- A predicate left open after an error is most often open because of it:
 	-- the error left a variable unbound that would have decided it.
 	if Diag.hasErrors() { return }
+	for c in stranded {
+		if let Some(m) = c.method { return unknownMethodReceiver(m, c.span) }
+	}
 	-- An infinite type first: what else is stranded is most often stranded
 	-- because of it.
 	var c = stranded[0]
 	for p in stranded {
 		if isOccursEquation(p) && !isOccursEquation(c) { c = p }
 	}
-	match occursSide(c) {
+	if let Some((v, other)) = occursSide(c) {
 		-- In the words `Ty.unify` uses for the same cycle.
-		Some((v, other)) -> {
-			let n = Ty.namer("")
-			return Ty.typeError(
-				"cannot construct the infinite type '"
-					+ Ty.showAt(v, n, 0)
-					+ " = "
-					+ Ty.showAt(other, n, 0)
-					+ "'",
-				c.span,
-			)
-		}
-		None -> {}
+		let n = Ty.namer("")
+		return Ty.typeError(
+			"cannot construct the infinite type '"
+				+ Ty.showAt(v, n, 0)
+				+ " = "
+				+ Ty.showAt(other, n, 0)
+				+ "'",
+			c.span,
+		)
 	}
 	-- Below a superclass of an instance's head, the fix is in that instance's
 	-- context, so the message says what the wanted was needed for.
@@ -5065,13 +5157,11 @@ fun rejectStranded(s : Solver, cells : Vec PredCell) -> Unit {
 			TFam(name, _, _) -> Classes.fieldFamilyOwner(name)
 			_                -> "?"
 		}
-		match fieldLabel(owner) {
-			Some(label) -> return unknownReceiver("field '" + label + "' is used", c.span)
-			None        -> {}
+		if let Some(label) = fieldLabel(owner) {
+			return unknownReceiver("field '" + label + "' is used", c.span)
 		}
-		match Classes.generatedIndex(owner) {
-			Some(index) -> return unknownReceiver("'." + Int.toString(index) + "' is taken", c.span)
-			None        -> {}
+		if let Some(index) = Classes.generatedIndex(owner) {
+			return unknownReceiver("'." + Int.toString(index) + "' is taken", c.span)
 		}
 		-- Name the remedy. It is not "add a type annotation": an equality is
 		-- something a context can state, and stating it is what fixes this.
@@ -5130,13 +5220,11 @@ fun rejectStranded(s : Solver, cells : Vec PredCell) -> Unit {
 			c.span,
 		)
 	}
-	match fieldLabel(c.pred.name) {
-		Some(label) -> return unknownReceiver("field '" + label + "' is used", c.span)
-		None        -> {}
+	if let Some(label) = fieldLabel(c.pred.name) {
+		return unknownReceiver("field '" + label + "' is used", c.span)
 	}
-	match Classes.generatedIndex(c.pred.name) {
-		Some(index) -> return unknownReceiver("'." + Int.toString(index) + "' is taken", c.span)
-		None        -> {}
+	if let Some(index) = Classes.generatedIndex(c.pred.name) {
+		return unknownReceiver("'." + Int.toString(index) + "' is taken", c.span)
 	}
 	undetermined(s, c, "")
 }
@@ -5190,11 +5278,10 @@ fun isOccursEquation(c : PredCell) -> Bool = Option.isSome(occursSide(c))
 fun occursSide(c : PredCell) -> Option (Ty.Type, Ty.Type) {
 	if c.pred.name != Ty.equals { return None }
 	for (v, other) in [(c.pred.args[0], c.pred.args[1]), (c.pred.args[1], c.pred.args[0])] {
-		match Ty.prune(v) {
-			TVar(cell) -> if Option.isNone(Ty.breakerFor(cell)) && Ty.occursIn(v, other) {
+		if let TVar(cell) = Ty.prune(v) {
+			if Option.isNone(Ty.breakerFor(cell)) && Ty.occursIn(v, other) {
 				return Some((Ty.prune(v), other))
 			}
-			_ -> {}
 		}
 	}
 	None
@@ -5273,3 +5360,434 @@ fun bug(message : String, where : Option Span) -> a = match where {
 }
 
 fun discard(x : a) -> Unit {}
+
+-- -- method calls ------------------------------------------------------------------
+
+-- Decides the method call `c` demands once its receiver's type is known, and
+-- returns whether it is done with `c`. A receiver that is still a variable
+-- leaves `c` inert, to be woken when the variable is bound; if the variable is
+-- a literal's, its set of types is narrowed first to the types whose home
+-- defines the method. A class method is never chosen for a receiver that is
+-- still a variable: which of a type's own functions and fields there are is
+-- what decides whether one is needed.
+fun methodRule(s : Solver, c : PredCell) -> Bool {
+	let m = match c.method {
+		Some(m) -> m
+		None    -> bug("a method call's demand without its call", c.span)
+	}
+	if Option.isNone(m.scopes) { m.scopes = Some(Vec.slice(s.scopes, 0, len(s.scopes))) }
+	let receiver = rewriteW(s, c.pred.args[0])
+	match Ty.spine(receiver).0 {
+		-- A skolem is a type variable a signature or a pattern fixed: known,
+		-- but naming no type, so with no fields and no module.
+		TCon(con) -> decideMethod(
+			s,
+			c,
+			m,
+			if con.uid == 0 { Some(con.name) } else { None },
+			receiver,
+		)
+		TVar(v)       -> narrowLiteral(s, c, m, v)
+		TFam(_, _, _) -> False
+		TBottom       -> True
+		_             -> decideMethod(s, c, m, None, receiver)
+	}
+}
+
+-- Decides the call `m` on `receiver`, whose named type is `tycon`, or `None`
+-- for a type that names none, and returns `True`. The type's field and its
+-- home's function of the call's name are equals, and both is an error; a
+-- class method in scope is tried only when there is neither.
+fun decideMethod(
+	s : Solver,
+	c : PredCell,
+	m : MethodCall,
+	tycon : Option String,
+	receiver : Ty.Type,
+) -> Bool {
+	let EMethod(_, args) = m.call.kind else { bug("a method call was decided twice", c.span) }
+	var home = Left("")
+	var function = None
+	var field = False
+	if let Some(t) = tycon {
+		home = MethodCalls.homeOf(s.homes, t)
+		if let Right(h) = home { function = MethodCalls.lookup(s.homes, h, m.label, c.span) }
+		field = hasField(s, t, m.label)
+	}
+	match (field, function) {
+		(True, Some(_)) -> return ambiguousCall(s, c, m, receiver, home, args)
+		(True, None) -> {
+			callField(s, c, m, receiver, args)
+			return True
+		}
+		(False, Some((target, id))) -> return callFunction(s, c, m, target, id, args)
+		(False, None)               -> {}
+	}
+	let candidate = MethodCalls.classMethod(s.homes, m.label, c.span)
+	if m.shadowed && Option.isSome(candidate) {
+		return reported(
+			"'"
+				+ Ast.sketch(m.call)
+				+ "' cannot call the class method '"
+				+ m.label
+				+ "': the local '"
+				+ m.label
+				+ "' hides it, as it does from a call by name",
+			c.span,
+		)
+	}
+	match candidate {
+		Some(Right((target, id))) -> callFunction(s, c, m, target, id, args)
+		Some(Left(why))           -> reported(why, c.span)
+		None -> match (tycon, home) {
+			(Some(_), Right(h)) -> noMethod(s, c, m, receiver, h)
+			(Some(_), Left(why)) -> reported(
+				"'" + Ty.show(receiver) + "' has no method '" + m.label + "': " + why,
+				c.span,
+			)
+			(None, _) -> noNamedType(c, m, receiver)
+		}
+	}
+}
+
+-- Reports that `receiver`, which names no type, has neither a class method
+-- nor anything else the call `m` could call, and returns `True`.
+fun noNamedType(c : PredCell, m : MethodCall, receiver : Ty.Type) -> Bool =
+	reported(
+		"cannot call '."
+			+ m.label
+			+ "' on a value of type '"
+			+ Ty.show(receiver)
+			+ "': it names no type, and no class method '"
+			+ m.label
+			+ "' is in scope",
+		c.span,
+	)
+
+-- Reports that the call `m` could mean both its receiver's field and its
+-- home's function, and returns `True`.
+fun ambiguousCall(
+	s : Solver,
+	c : PredCell,
+	m : MethodCall,
+	receiver : Ty.Type,
+	home : Either String String,
+	args : Vec Expr,
+) -> Bool {
+	let written = Ast.sketch(args[0])
+	let rest = if len(args) > 1 { ", ...)" } else { ")" }
+	let called = if len(args) > 1 { "(...)" } else { "()" }
+	let owner = match home {
+		Right(h) -> h
+		Left(_)  -> "?"
+	}
+	let function = MethodCalls.spelling(s.homes, owner, m.label, c.span)
+	reported(
+		"'"
+			+ written
+			+ "."
+			+ m.label
+			+ called
+			+ "' is ambiguous: '"
+			+ Ty.show(receiver)
+			+ "' has a field '"
+			+ m.label
+			+ "' and '"
+			+ owner
+			+ "' defines '"
+			+ m.label
+			+ "'; write '("
+			+ written
+			+ "."
+			+ m.label
+			+ ")"
+			+ called
+			+ "' for the field or '"
+			+ function
+			+ "("
+			+ written
+			+ rest
+			+ "' for the function",
+		c.span,
+	)
+}
+
+-- Rewrites the call `m` into a call of the function stored in its receiver's
+-- field: the field is read as `x.f` is (`Infer.genField`), and the call takes
+-- the other arguments.
+fun callField(
+	s : Solver,
+	c : PredCell,
+	m : MethodCall,
+	receiver : Ty.Type,
+	args : Vec Expr,
+) -> Unit {
+	let cls = Classes.fieldClass(m.label)
+	discard(Classes.ensureGenerated(s.classes, cls))
+	let reads = Ty.pred(cls, [receiver])
+	let hole = newHole()
+	let u = m.use
+	u.name = cls
+	Vec.push(u.preds, reads)
+	Vec.push(u.holes, hole)
+	u.scopes = match m.scopes {
+		Some(scopes) -> scopes
+		None         -> Vec.slice(s.scopes, 0, len(s.scopes))
+	}
+	Vec.push(s.uses, u)
+	solve(s, cpredInto(reads, hole, c.span, "read"))
+	let fam = Classes.fieldFamily(m.label)
+	let kind = match Map.get(s.classes.decls.families, fam) {
+		Some(info) -> info.resKind
+		None       -> bug("'" + fam + "' was not declared", c.span)
+	}
+	let rest = Vec.slice(args, 1, len(args))
+	let restTypes = Array.slice(m.args, 1, len(m.args))
+	Ty.unify(m.calleeType, TFam(fam, receiver, kind), c.span, "read", families(s))
+	Ty.unify(
+		m.calleeType,
+		TFun(restTypes, m.result),
+		c.span,
+		"the call of the field '" + m.label + "'",
+		families(s),
+	)
+	m.callee.kind = EField(args[0], m.label)
+	m.call.kind = ECall(m.callee, rest)
+}
+
+-- Rewrites the call `m` into a call of `target`, the function or class
+-- method whose binder is `id`, with the receiver first, and returns `True`.
+-- The callee is instantiated as a use of that name would be, with the
+-- dictionary scopes of the place the call was first met.
+fun callFunction(
+	s : Solver,
+	c : PredCell,
+	m : MethodCall,
+	target : String,
+	id : Int,
+	args : Vec Expr,
+) -> Bool {
+	-- Bound unless it has no complete signature and is checked after the
+	-- call, which the binding groups make the order of only when the call is
+	-- part of a cycle they report (`Infer.checkGroupRecursion`).
+	if Option.isNone(binding(s.env, id)) {
+		return reported(
+			"'."
+				+ m.label
+				+ "(...)' calls '"
+				+ Ty.shortName(target)
+				+ "', which is checked after this definition; give '"
+				+ Ty.shortName(target)
+				+ "' a complete signature",
+			c.span,
+		)
+	}
+	let u = m.use
+	u.name = target
+	u.binder = Some(id)
+	-- Instantiated where the call is, at the level of the implication the
+	-- demand arose in, as GHC's `solveNestedImplications` solves each wanted
+	-- at its implication's `TcLevel`. Woken from outside, at the solver's
+	-- rank, an existential the call's arguments mention would escape. On its
+	-- first look the solver is at the call itself, which may be deeper, in a
+	-- local `let` of the implication's body. The variables are born there
+	-- then: born at the implication's level, they would lower that `let`'s
+	-- variables they are unified with, and the `let` would not generalize.
+	let level = match c.at {
+		Some(impl) -> max(rank(s), impl.level)
+		None       -> rank(s)
+	}
+	let callee = TFun(m.args, m.result)
+	solveInstanceAt(s, level, target, callee, c.span, Some(u), OfBinder(id))
+	Ty.unify(m.calleeType, callee, c.span, "the call of '." + m.label + "'", families(s))
+	if let Some(scopes) = m.scopes { u.scopes = scopes }
+	MethodCalls.refer(s.homes, m.callee.id, id)
+	m.callee.kind = EVar(target, False)
+	m.call.kind = ECall(m.callee, args)
+	True
+}
+
+-- Reports that `receiver`'s home defines no function the call `m` names, and
+-- returns `True`.
+fun noMethod(s : Solver, c : PredCell, m : MethodCall, receiver : Ty.Type, home : String) -> Bool {
+	let written = match m.call.kind {
+		EMethod(_, args) -> Ast.sketch(args[0])
+		_                -> "x"
+	}
+	let rest = if len(m.args) > 1 { ", ...)" } else { ")" }
+	var fix = ""
+	let elsewhere = MethodCalls.elsewhere(s.homes, m.label, c.span)
+	if hasField(s, Ty.spine(receiver).0 |> tyconName, m.label) {
+		-- A field holding a function is called through parentheses, which
+		-- is what a reader who meant the field has to be told.
+		let args = if len(m.args) > 1 { "...)" } else { ")" }
+		fix = "; to call its field '"
+			+ m.label
+			+ "', write '("
+			+ written
+			+ "."
+			+ m.label
+			+ ")("
+			+ args
+			+ "'"
+	} else if len(elsewhere) == 1 {
+		fix = "; to call '"
+			+ elsewhere[0]
+			+ "', write '"
+			+ elsewhere[0]
+			+ "("
+			+ written
+			+ rest
+			+ "'"
+	}
+	let why = if MethodCalls.declares(s.homes, home, m.label) {
+		"'" + home + "' does not export '" + m.label + "'"
+	} else {
+		"'" + home + "' defines no '" + m.label + "'"
+	}
+	reported("'" + Ty.show(receiver) + "' has no method '" + m.label + "': " + why + fix, c.span)
+}
+
+-- Narrows the set of types the literal typed `v` may have, if `v` is a
+-- literal's, to the types whose home defines the method `m` calls, and
+-- returns `False`: the call waits for the literal to be decided. A narrowing
+-- is a consequence of the call, whatever the literal turns out to be, so it is
+-- made at once: a set of one decides the literal, which wakes the call. A
+-- literal demand that is not resting is narrowed when the binding generalizes,
+-- before any default (`narrowStranded`).
+fun narrowLiteral(s : Solver, c : PredCell, m : MethodCall, v : VarCell) -> Bool {
+	for w in Map.getOr(s.watchers, v.id, []) {
+		if !resting(w) || !literalOf(w, v) { continue }
+		discard(narrowByMethod(s, w, m, c.span, True))
+		return False
+	}
+	False
+}
+
+-- Returns whether `w` is the literal demand over the variable `v`.
+fun literalOf(w : PredCell, v : VarCell) -> Bool =
+	w.pred.name == oneOf
+		&& match Ty.prune(w.pred.args[0]) {
+			TVar(own) -> own.id == v.id
+			_         -> False
+		}
+
+-- Narrows the literal demand `w` by the method `m`: to the members whose home
+-- defines it, when some do. Returns whether it narrowed the set. A smaller
+-- set is queued to be solved again if `requeue` says so; a caller that queues
+-- every demand it holds again says not. Only the members' own functions count, never a class
+-- method: which classes exist must not change what a literal is. A set no
+-- member of which defines the method is left alone, to be defaulted, and the
+-- call may then find a class method.
+fun narrowByMethod(
+	s : Solver,
+	w : PredCell,
+	m : MethodCall,
+	where : Option Span,
+	requeue : Bool,
+) -> Bool {
+	let names = setNames(w.pred.args[1], w.span)
+	let kept = Array.filter(names, fun(n) = definesMethod(s, n, m.label, where))
+	if len(kept) == 0 || len(kept) == len(names) { return False }
+	let old = w.pred.args
+	w.pred = Ty.pred(oneOf, Array.init(len(old), fun(i) = if i == 1 { TSet(kept) } else { old[i] }))
+	if requeue { enqueue(s, w) }
+	True
+}
+
+-- Narrows each literal demand among `cells` by the method calls among them on
+-- the same literal, and returns whether one changed. Every place that
+-- chooses a literal's default calls this first, so that the default is a type
+-- whose home has the method. `requeue` is `narrowByMethod`'s.
+fun narrowStranded(s : Solver, cells : Vec PredCell, requeue : Bool) -> Bool {
+	var changed = False
+	for c in cells {
+		let Some(m) = c.method else { continue }
+		let TVar(v) = Ty.spine(Ty.prune(rewriteW(s, c.pred.args[0]))).0 else { continue }
+		for w in cells {
+			if !literalOf(w, v) { continue }
+			if narrowByMethod(s, w, m, c.span, requeue) { changed = True }
+		}
+	}
+	changed
+}
+
+-- Returns whether the home of the literal set's member `name` defines `label`.
+fun definesMethod(s : Solver, name : String, label : String, where : Option Span) -> Bool =
+	match Ty.spine(Ty.literalSetType(name)).0 {
+		TCon(con) -> match MethodCalls.homeOf(s.homes, con.name) {
+			Right(home) -> Option.isSome(MethodCalls.lookup(s.homes, home, label, where))
+			Left(_)     -> False
+		}
+		_ -> False
+	}
+
+fun tyconName(t : Ty.Type) -> String = match t {
+	TCon(con) -> con.name
+	_         -> ""
+}
+
+-- Returns whether a constructor of `tycon` has a field `label`, readable or
+-- not.
+fun namesField(s : Solver, tycon : String, label : String) -> Bool =
+	match Map.get(s.decls.tycons, tycon) {
+		Some(info) -> Iter.any(info.variants, fun(v) = match v.fields {
+			Some(names) -> Array.contains(names, label)
+			None        -> False
+		})
+		None -> False
+	}
+
+-- Returns whether `tycon` is a record type with a field `label`.
+fun hasField(s : Solver, tycon : String, label : String) -> Bool =
+	match Decls.recordFields(s.decls, tycon) {
+		Some(names) -> Array.contains(names, label)
+		None        -> False
+	}
+
+-- Returns whether `c` is a method call's demand, which no scheme carries.
+fun isMethodDemand(c : PredCell) -> Bool = c.pred.name == methodCall
+
+-- Reports a method call whose receiver's type is still unknown where its
+-- binding generalizes.
+fun unknownMethodReceiver(m : MethodCall, where : Option Span) -> Unit {
+	let (receiver, call) = match m.call.kind {
+		EMethod(_, args) -> (args[0], Ast.sketch(m.call))
+		_                -> return
+	}
+	-- A `_` written as the receiver is a parameter of the function it makes,
+	-- with a name no program writes, so the message speaks of the `_`.
+	if let EVar(name, _) = receiver.kind {
+		if String.startsWith(name, Ast.shorthandPrefix) {
+			let written = "_." + m.label + "(" + (if len(m.args) > 1 { "..." } else { "" }) + ")"
+			return Ty.typeError(
+				"cannot tell which '"
+					+ m.label
+					+ "' '"
+					+ written
+					+ "' calls: the type of the receiver of '"
+					+ written
+					+ "' is not known here; write the function out, with its parameter annotated",
+				where,
+			)
+		}
+	}
+	let (whose, fix) = match receiver.kind {
+		EVar(name, _) -> {
+			let n = "'" + Ty.shortName(name) + "'"
+			("the type of " + n, "annotate " + n)
+		}
+		_ -> ("the type of its receiver", "annotate the receiver")
+	}
+	Ty.typeError(
+		"cannot tell which '"
+			+ m.label
+			+ "' '"
+			+ call
+			+ "' calls: "
+			+ whose
+			+ " is not known here; "
+			+ fix,
+		where,
+	)
+}

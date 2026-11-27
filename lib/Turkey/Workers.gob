@@ -149,12 +149,11 @@ export (
 import Prelude ()
 import Data.Int (Int)
 import Data.Tuple (Unit)
-import Data.Eq (Eq(..), (==), (!=))
-import Data.Ord (Ord(..), (<), (<=), (>), (>=))
-import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
-import Data.Int ()
+import Data.Eq ((==), (!=))
+import Data.Ord ((<), (<=), (>), (>=))
+import Data.Num (Neg(..), (*), (/), (%))
 import Data.Bool (Bool(..))
-import Bits (BitAnd(..), BitOr(..), Shift(..), (&), (|), (<<), (>>))
+import Bits ((&), (|), (<<), (>>))
 import Target (OS(..))
 import Target as Target
 import Turkey.Libc as Libc
@@ -207,7 +206,7 @@ let stoppedState : Int = 1
 let waitingState : Int = 2
 let callingState : Int = 4
 let noPermit : Int = 8
-let callStep : Int = 16
+let _callStep : Int = 16
 
 -- Word 0: 1 while a collection is stopping the world, 2 while a thread is
 -- being registered, claimed by compare-and-swap. Word 8: how many threads
@@ -587,7 +586,7 @@ fun callEnter(frame : Ptr) -> Unit {
 	if Ptr.atomicLoad(control, 8) == 0 { return }
 	parkAt(frame)
 	let at = mine()
-	-- `callStep` plus `callingState`.
+	-- `_callStep` plus `callingState`.
 	Ptr.atomicStore(states, at, plus(Ptr.atomicLoad(states, at), 20))
 }
 
@@ -958,7 +957,7 @@ let changesAt : Int = 56
 -- larger), a `struct timespec` after them for `kevent`'s timeout, then the
 -- eight bytes holding the number 1 that Linux writes to break a wait, and
 -- eight to read it back into.
-let eventsEnd : Int = 2048
+let _eventsEnd : Int = 2048
 let timespecAt : Int = 2048
 let oneAt : Int = 2064
 let drainAt : Int = 2072
@@ -1011,9 +1010,10 @@ fun make() -> Int {
 	let r = match Target.os {
 		Darwin -> makeKqueue()
 		Linux  -> makeEpoll()
-		-- No poller on wasm: WASI preview 1 waits with `poll_oneoff`, which
-		-- this module does not use, so every registration fails here.
-		Wasi -> -Sys.enosys()
+		-- Nothing to make on wasm, whose waits are for time alone: WASI
+		-- preview 1 waits with `poll_oneoff` (`waitFor`), and every
+		-- registration of a descriptor fails.
+		Wasi -> 0
 	}
 	if r != 0 {
 		Ptr.store(poller, scratchAt, Ptr.null())
@@ -1317,11 +1317,7 @@ fun pollForgetChild(pid : Int, token : Int) -> Unit {
 --- be none.
 fun pollForgetUnlock(fd : Int) -> Unit {
 	if Ptr.atomicLoad(poller, stateAt) != 2 { return }
-	match Target.os {
-		Darwin -> { let _ = change(Sys.filterVnode(), fd, Sys.evDelete, 0, 0) }
-		Linux  -> {}
-		Wasi   -> {}
-	}
+	if let Darwin = Target.os { let _ = change(Sys.filterVnode(), fd, Sys.evDelete, 0, 0) }
 }
 
 -- -- the pidfd table (Linux)
@@ -1335,7 +1331,7 @@ var childLock : Ptr = Lock.new()
 
 fun childAdd(token : Int, fd : Int) -> Bool {
 	acquire(childLock)
-	var n : Int = Ptr.load(children, 8)
+	let n : Int = Ptr.load(children, 8)
 	var table : Ptr = Ptr.load(children, 0)
 	var ok = True
 	if n == Ptr.load(children, 16) {
@@ -1467,7 +1463,10 @@ fun waitFor(timeout : Int) -> Int {
 	let n = match Target.os {
 		Darwin -> kqueueWait(scratch, timeout)
 		Linux  -> epollWaitFor(scratch, timeout)
-		Wasi   -> 0
+		-- One thread, so nothing can break the wait, and with no descriptor
+		-- registered only the deadline can end it, so a wait with none would
+		-- never end: `Turkey.Scheduler.wait` makes none.
+		Wasi -> if timeout > 0 && Wasi.sleep(scratch, timeout) < 0 { -Sys.errno() } else { 0 }
 	}
 	if n <= 0 { return n }
 	var count = 0

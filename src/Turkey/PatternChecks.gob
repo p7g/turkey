@@ -1,0 +1,592 @@
+export (singleMatch, unreachableArm, irrefutableIfLet, irrefutableMatch)
+
+--- The checks about `match` and the condition lists of `if` and `while`
+--- (`Turkey.Checks` registers them).
+---
+--- Where two of them could see one construct, one owns it and the others skip
+--- it, so no two report or fix the same text:
+---
+--- * `single-match` owns a `match` of two or more arms in which one does
+---   something and the rest do nothing; it rewrites it to `if let`.
+--- * `irrefutable-match` owns a `match` of one arm.
+--- * `irrefutable-if-let` owns every `if let` and `while let`, and the arm
+---   desugaring makes for its other branch.
+--- * `unreachable-arm` owns every arm the author wrote.
+---
+--- The typed checks read what the exhaustiveness check found about each arm
+--- (`Typed.ArmCoverage`), so that "not exhaustive", an error, and these
+--- checks never disagree about what a pattern matches.
+
+import Data.Set as Set
+import Turkey.Ast (
+	Expr(..),
+	ExprKind(..),
+	Pat(..),
+	PatKind(..),
+	Stmt(..),
+	StmtKind(..),
+	Arm(..),
+	Guard(..),
+	Lit(..),
+	Child(..),
+	FunDecl(..),
+	Decl(..),
+	children,
+	patternVars,
+	unparen,
+)
+import Turkey.Lint (File, Finding(..), Fix(..), Edit(..), finding)
+import Turkey.Lint as Lint
+import Turkey.Source (Span(..))
+import Turkey.Source as Source
+import Turkey.Typed (TypeTable(..), ArmCoverage(..))
+
+-- -- single-match -------------------------------------------------------------------
+--
+-- `if let p = e { A }` means `match e { p -> A; _ -> () }`, so a `match` of
+-- that shape is an `if let` written the long way. The rewrite is the same
+-- program when one arm does something, every other arm is `()` or `{}`, and
+-- no value that an arm before the one that does something takes would reach
+-- it once it is tried first. Before desugaring, since `if let`
+-- desugars into a `match` of this shape and the two cannot be told apart
+-- after.
+
+fun singleMatch(f : File) -> Vec Finding {
+	let out = []
+	Lint.nodes(f, fun(c) {
+		if let ChExpr(e) = c {
+			if let EMatch(scrutinee, arms) = e.kind { singleMatchAt(f, e, scrutinee, arms, out) }
+		}
+		True
+	})
+	out
+}
+
+fun singleMatchAt(f : File, e : Expr, scrutinee : Expr, arms : Vec Arm, out : Vec Finding) -> Unit {
+	-- A `match` of one arm is `irrefutable-match`'s.
+	if len(arms) < 2 || Iter.any(arms, \len(_.guards) > 0) { return }
+	var live = -1
+	for var i = 0; i < len(arms); i = i + 1 {
+		if !doesNothing(arms[i].body) {
+			if live >= 0 { return }
+			live = i
+		}
+	}
+	-- With no arm that does anything, the `match` is dead code, not a
+	-- spelling of `if let`.
+	if live < 0 { return }
+	let arm = arms[live]
+	-- A catch-all would need an `if let` that tests the other arms'
+	-- patterns failing, which there is none of. One that is irrefutable
+	-- another way leaves the other arms unreachable, which `unreachable-arm`
+	-- reports, and its `if let` would be `irrefutable-if-let`'s.
+	if Iter.any(arm.patterns, surelyIrrefutable) { return }
+	for var i = 0; i < live; i = i + 1 {
+		for p in arm.patterns {
+			if !Iter.all(arms[i].patterns, disjoint(_, p)) { return }
+		}
+	}
+	-- The arm's alternatives become the `if let`'s, `|` and all.
+	let pattern = patternsSpan(arm)
+	if Source.isEmpty(e.span) || Source.isEmpty(scrutinee.span) || Source.isEmpty(pattern) {
+		return
+	}
+	let lead = if live == 0 { leadingComments(f, scrutinee, pattern) } else { None }
+	let replacement = "if let "
+		+ Lint.textOf(f, pattern)
+		+ " = "
+		+ Lint.textOf(f, scrutinee.span)
+		+ " "
+		+ bodyBlock(f, e, arm, Option.unwrapOr(lead, []))
+	Vec.push(out, Finding {
+		span    = e.span
+		message = "this 'match' does something for one pattern and nothing otherwise; use 'if let'"
+		fix = Some(Fix {
+			edits      = [Edit { span = e.span, text = replacement }]
+			mechanical = keepsEverything(f, e, scrutinee, pattern, arm.body, Option.isSome(lead))
+		})
+	})
+}
+
+-- The comments between the `match`'s `{` and `pattern`, where its first arm
+-- begins, one per line, which describe that arm and so move into its block; or
+-- `None` if anything else is there.
+fun leadingComments(f : File, scrutinee : Expr, pattern : Span) -> Option (Vec String) {
+	let between = Lint.textOf(f, from(scrutinee.span, pattern))
+	let Some(inside) = String.stripPrefix(String.trimStart(between), "{") else { return None }
+	let out = []
+	for line in String.lines(inside) {
+		let text = String.trim(line)
+		if String.isEmpty(text) { continue }
+		if !String.startsWith(text, "--") { return None }
+		Vec.push(out, text)
+	}
+	Some(out)
+}
+
+-- From the end of `a` to the start of `b`.
+fun from(a : Span, b : Span) -> Span = Span {
+	line    = a.endLine
+	col     = a.endCol
+	endLine = b.line
+	endCol  = b.col
+	file    = a.file
+	inlined = None
+}
+
+-- Whether an arm's body is `()` or `{}`, which do nothing.
+fun doesNothing(body : Expr) -> Bool = match unparen(body).kind {
+	EUnit         -> True
+	EBlock(stmts) -> len(stmts) == 0
+	_             -> False
+}
+
+-- Whether `p` matches every value of its type, as far as its shape alone
+-- shows: a variable, `_`, or a tuple of those. A constructor's type is not
+-- known before checking, so a constructor is never surely irrefutable here.
+fun surelyIrrefutable(p : Pat) -> Bool = match p.kind {
+	PVar(_) | PWild                  -> True
+	PAnnot(inner, _) | PParen(inner) -> surelyIrrefutable(inner)
+	PTuple(parts)                    -> Iter.all(parts, surelyIrrefutable)
+	_                                -> False
+}
+
+-- Whether no value matches both `a` and `b`: at some position the two test
+-- for different constructors or different literals. A `False` only means
+-- the shapes do not show it.
+fun disjoint(a : Pat, b : Pat) -> Bool = match (a.kind, b.kind) {
+	(PAnnot(x, _), _) | (PParen(x), _) -> disjoint(x, b)
+	(_, PAnnot(y, _)) | (_, PParen(y)) -> disjoint(a, y)
+	(POr(alts), _)                     -> Iter.all(alts, disjoint(_, b))
+	(_, POr(alts))                     -> Iter.all(alts, disjoint(a, _))
+	-- Resolution spelled every constructor by its one internal name, so two
+	-- names that differ are two constructors.
+	(PCon(x, xs), PCon(y, ys)) -> x != y || anyDisjoint(xs, ys)
+	(PRecord(x, xs, _), PRecord(y, ys, _)) -> x != y
+		|| Iter.any(xs, fun((label, p)) {
+			for (other, q) in ys {
+				if other == label && disjoint(p, q) { return True }
+			}
+			False
+		})
+	(PCon(x, _), PRecord(y, _, _)) | (PRecord(x, _, _), PCon(y, _)) -> x != y
+	(PTuple(xs), PTuple(ys))                                        -> anyDisjoint(xs, ys)
+	(PLit(x, _), PLit(y, _))                                        -> differentLiterals(x, y)
+	_                                                               -> False
+}
+
+fun anyDisjoint(xs : Vec Pat, ys : Vec Pat) -> Bool {
+	if len(xs) != len(ys) { return False }
+	for var i = 0; i < len(xs); i = i + 1 {
+		if disjoint(xs[i], ys[i]) { return True }
+	}
+	False
+}
+
+-- Compares values, not spellings, since `0x10` and `16` are one value. Two
+-- floats are never taken to differ: what a float pattern matches is not this
+-- check's to decide.
+fun differentLiterals(a : Lit, b : Lit) -> Bool = match (a, b) {
+	(LInt(x), LInt(y))       -> x != y
+	(LString(x), LString(y)) -> x != y
+	(LChar(x), LChar(y))     -> x != y
+	_                        -> False
+}
+
+-- The `if let`'s block: the arm's body if it is a block, and the body in one
+-- otherwise, laid out the way the `match` was, with `comments` at its top.
+-- The inside of the block is indented as the arms were, or one step deeper
+-- than the `match` when its arms share its line. A block body on several
+-- lines keeps its own lines, each one step less deep, since the arms sit one
+-- step deeper than the `match`.
+fun bodyBlock(f : File, e : Expr, arm : Arm, comments : Vec String) -> String {
+	let outer = indentOf(f, e.span)
+	let armIndent = indentOf(f, arm.span)
+	let step = Option.unwrapOr(String.stripPrefix(armIndent, outer), "")
+	let inner = if arm.span.line > e.span.line {
+		armIndent
+	} else if String.startsWith(outer, " ") {
+		outer + "    "
+	} else {
+		outer + "\t"
+	}
+	let leading = String.join(Vec.map(comments, \inner + _ + "\n"), "")
+	let text = Lint.textOf(f, arm.body.span)
+	let lines = String.split(text, "\n")
+	let EBlock(_) = arm.body.kind else {
+		return "{\n" + leading + inner + text + "\n" + outer + "}"
+	}
+	if len(lines) == 1 {
+		let opened = Option.unwrapOr(String.stripPrefix(text, "{"), text)
+		let body = Option.unwrapOr(String.stripSuffix(opened, "}"), opened)
+		return "{\n" + leading + inner + String.trim(body) + "\n" + outer + "}"
+	}
+	let kept = []
+	for var i = 1; i < len(lines); i = i + 1 {
+		Vec.push(kept, Option.unwrapOr(String.stripPrefix(lines[i], step), lines[i]))
+	}
+	lines[0] + "\n" + leading + String.join(kept, "\n")
+}
+
+-- The whitespace that begins the line `s` starts on.
+fun indentOf(f : File, s : Span) -> String {
+	let before = Lint.textOf(f, Span {
+		line    = s.line
+		col     = 1
+		endLine = s.line
+		endCol  = s.col
+		file    = s.file
+		inlined = None
+	})
+	let kept = []
+	for c in String.codePoints(before) {
+		if c != ' ' && c != '\t' { break }
+		Vec.push(kept, c)
+	}
+	String.fromCodePoints(kept)
+}
+
+-- Whether the rewrite keeps every comment: the text it drops, everything of
+-- the `match` but the scrutinee, the pattern and the body, has none, except
+-- for the comments `leadingComments` moves when `moved`. The scrutinee is
+-- kept only when it holds no `{`, since an `if` head reads a `{` as where its
+-- block begins.
+fun keepsEverything(
+	f : File,
+	e : Expr,
+	scrutinee : Expr,
+	pattern : Span,
+	body : Expr,
+	moved : Bool,
+) -> Bool {
+	if String.contains(Lint.textOf(f, scrutinee.span), "{") { return False }
+	let close = Span {
+		line    = e.span.endLine
+		col     = e.span.endCol
+		endLine = e.span.endLine
+		endCol  = e.span.endCol
+		file    = e.span.file
+		inlined = None
+	}
+	let gaps = [
+		from(Source.emptyAt(e.span), scrutinee.span),
+		from(pattern, body.span),
+		from(body.span, close),
+	]
+	if !moved { Vec.push(gaps, from(scrutinee.span, pattern)) }
+	!Iter.any(gaps, \String.contains(Lint.textOf(f, _), "--"))
+}
+
+-- -- unreachable-arm ----------------------------------------------------------------
+--
+-- An arm that the arms before it already take every value of, or an
+-- alternative its earlier siblings already take, is dead code. An arm with
+-- an empty span is one desugaring wrote, and is skipped: the other branch of
+-- an `if let` is `irrefutable-if-let`'s, and the rest are the compiler's.
+
+fun unreachableArm(f : File, types : TypeTable) -> Vec Finding {
+	let out = []
+	matchesIn(f, fun(e, scope) {
+		let EMatch(_, arms) = e.kind else { return }
+		let Some(coverage) = Map.get(types.coverage, e.id) else { return }
+		for var i = 0; i < len(arms); i = i + 1 {
+			let arm = arms[i]
+			if Source.isEmpty(arm.span) { continue }
+			let c = coverage[i]
+			if !c.reached {
+				Vec.push(out, finding(patternsSpan(arm), unreachedArm(arms, i, scope)))
+				continue
+			}
+			for p in c.unreached {
+				Vec.push(
+					out,
+					finding(
+						p.span,
+						"this alternative is never taken, since the patterns before it match "
+							+ "every value it does; remove it",
+					),
+				)
+			}
+		}
+	})
+	out
+}
+
+-- The message for the arm `i` of `arms`, which no value reaches. When an arm
+-- before it is a variable named like one in `scope`, the author most likely
+-- meant it to compare with that one, and the message says it does not.
+fun unreachedArm(arms : Vec Arm, i : Int, scope : Vec String) -> String {
+	for var j = 0; j < i; j = j + 1 {
+		let earlier = arms[j]
+		if len(earlier.guards) > 0 { continue }
+		for p in earlier.patterns {
+			if let Some(name) = bareName(p) {
+				if Vec.contains(scope, name) {
+					return "this arm is never taken, since the pattern '"
+						+ name
+						+ "' before it binds a new variable, which matches every value, and "
+						+ "does not compare with the '"
+						+ name
+						+ "' in scope; to test for that value, compare with '==' in an 'if'"
+				}
+			}
+		}
+	}
+	"this arm is never taken, since the arms before it match every value it does; "
+		+ "remove it, or move it above the arm that takes its values"
+}
+
+fun bareName(p : Pat) -> Option String = match p.kind {
+	PVar(name)                       -> Some(name)
+	PAnnot(inner, _) | PParen(inner) -> bareName(inner)
+	_                                -> None
+}
+
+-- From the start of an arm's first pattern to the end of its last.
+fun patternsSpan(arm : Arm) -> Span {
+	let first = arm.patterns[0].span
+	let last = arm.patterns[len(arm.patterns) - 1].span
+	Source.endingAt(first, last.endLine, last.endCol)
+}
+
+-- Calls `visit` on every `match` of `f`, with the names bound where it is:
+-- the module's top-level definitions, and the parameters, `let`s, `var`s,
+-- local `fun`s and arm patterns around it.
+fun matchesIn(f : File, visit : fun(Expr, Vec String) -> Unit) -> Unit {
+	let scope = []
+	for d in Lint.treeOf(f).decls {
+		if let DStmt(s) = d { bindStmt(s, scope) }
+	}
+	for d in Lint.treeOf(f).decls {
+		match d {
+			DStmt(s)                           -> scoped(ChStmt(s), scope, visit)
+			DClass(c) -> for m in c.methods { scoped(ChFun(m), scope, visit) }
+			DInstance(i) -> for m in i.methods { scoped(ChFun(m), scope, visit) }
+			DType(_) | DForeign(_) | DInfix(_) -> {}
+		}
+	}
+}
+
+-- Adds the names `s` binds for what follows it to `scope`, as the author
+-- spelled them. Resolution renamed a top-level one to `Module#name`.
+fun bindStmt(s : Stmt, scope : Vec String) -> Unit = match s.kind {
+	SLet(p, _) | SVar(p, _) -> for name in patternVars(p) { Vec.push(scope, spelled(name)) }
+	SFun(d)                 -> Vec.push(scope, spelled(d.name))
+	_                       -> {}
+}
+
+fun spelled(name : String) -> String = match String.rsplitOnce(name, "#") {
+	Some((_, short)) -> short
+	None             -> name
+}
+
+fun scoped(c : Child, scope : Vec String, visit : fun(Expr, Vec String) -> Unit) -> Unit {
+	let mark = len(scope)
+	match c {
+		ChFun(d) -> {
+			for p in d.params {
+				for name in patternVars(p) { Vec.push(scope, name) }
+			}
+			for child in children(c) { scoped(child, scope, visit) }
+		}
+		ChExpr(e) -> match e.kind {
+			ELambda(params, _, body, _) -> {
+				for p in params {
+					for name in patternVars(p) { Vec.push(scope, name) }
+				}
+				scoped(ChExpr(body), scope, visit)
+			}
+			EBlock(stmts) -> for s in stmts {
+				-- A local `fun` is in scope in its own body.
+				if let SFun(_) = s.kind { bindStmt(s, scope) }
+				scoped(ChStmt(s), scope, visit)
+				match s.kind {
+					SFun(_) -> {}
+					_       -> bindStmt(s, scope)
+				}
+			}
+			EMatch(scrutinee, arms) -> {
+				visit(e, scope)
+				scoped(ChExpr(scrutinee), scope, visit)
+				for arm in arms {
+					let armMark = len(scope)
+					for name in patternVars(arm.patterns[0]) { Vec.push(scope, name) }
+					for g in arm.guards {
+						match g {
+							GTest(test) -> scoped(ChExpr(test), scope, visit)
+							GLet(alts, value) -> {
+								scoped(ChExpr(value), scope, visit)
+								for name in patternVars(alts[0]) { Vec.push(scope, name) }
+							}
+						}
+					}
+					scoped(ChExpr(arm.body), scope, visit)
+					truncate(scope, armMark)
+				}
+			}
+			_ -> for child in children(c) { scoped(child, scope, visit) }
+		}
+		_ -> for child in children(c) { scoped(child, scope, visit) }
+	}
+	truncate(scope, mark)
+}
+
+fun truncate(xs : Vec String, to : Int) -> Unit {
+	while len(xs) > to {
+		let _ = Vec.pop(xs)
+	}
+}
+
+-- -- irrefutable-if-let -------------------------------------------------------------
+--
+-- An `if let` whose conditions always hold never takes its `else`, and a
+-- `while let` whose conditions always hold ends only by `break`. A test among
+-- the conditions can fail, so a list with one is not reported.
+--
+-- Desugaring has rewritten both by the time types are known, into shapes
+-- that no other source makes (`Turkey.Desugar`, "the forms that mean a
+-- `match`"): an `if` is a `match` with the `if`'s span whose arms have empty
+-- spans, and a `while` is a `loop` whose body, a block with an empty span,
+-- is only such a `match`, with an empty span, whose other arm is a `break`.
+-- The arm that runs the body holds the first condition's patterns, and the
+-- later conditions as its guards. A `let ... else` makes a `match` with an
+-- empty span that is no loop's whole body, and is not reported.
+
+fun irrefutableIfLet(f : File, types : TypeTable) -> Vec Finding {
+	let out = []
+	Lint.nodes(f, fun(c) {
+		let ChExpr(e) = c else { return True }
+		match e.kind {
+			EMatch(_, arms) -> if !Source.isEmpty(e.span) && len(arms) == 2 && isWritten(arms) {
+				let consequence = if Source.isEmpty(arms[1].body.span) {
+					"this 'if let' tests nothing; use 'let'"
+				} else {
+					"the 'else' is never taken; use 'let'"
+				}
+				alwaysHolds(e, arms, types, consequence, out)
+			}
+			ELoop(body) -> if let Some(m) = whileMatch(body) {
+				if let EMatch(_, arms) = m.kind {
+					alwaysHolds(
+						m,
+						arms,
+						types,
+						"only a 'break' ends this loop; use 'loop' and 'let'",
+						out,
+					)
+				}
+			}
+			_ -> {}
+		}
+		True
+	})
+	out
+}
+
+-- Whether `arms` are the two that desugaring a condition list writes: both
+-- with empty spans, and a pattern of the first written by the author.
+fun isWritten(arms : Vec Arm) -> Bool =
+	Source.isEmpty(arms[0].span)
+		&& Source.isEmpty(arms[1].span)
+		&& !Source.isEmpty(arms[0].patterns[0].span)
+
+-- The `match` a `while` with conditions became, if `body` is a loop's body
+-- that desugaring wrote for one.
+fun whileMatch(body : Expr) -> Option Expr {
+	let EBlock(stmts) = body.kind else { return None }
+	if !Source.isEmpty(body.span) || len(stmts) != 1 { return None }
+	let SExpr(m) = stmts[0].kind else { return None }
+	let EMatch(_, arms) = m.kind else { return None }
+	if !Source.isEmpty(m.span) || len(arms) != 2 || !isWritten(arms) { return None }
+	match arms[1].body.kind {
+		EBreak(None) -> Some(m)
+		_            -> None
+	}
+}
+
+-- Reports `consequence` at the first condition of `m`, whose `arms`
+-- desugaring wrote, when every condition always holds.
+--
+-- A pattern that opens an existential is left alone: `let` cannot open one,
+-- so the advice would be wrong, and only a `match` can.
+fun alwaysHolds(
+	m : Expr,
+	arms : Vec Arm,
+	types : TypeTable,
+	consequence : String,
+	out : Vec Finding,
+) -> Unit {
+	let Some(coverage) = Map.get(types.coverage, m.id) else { return }
+	let first = coverage[0]
+	if !first.irrefutable || !Iter.all(first.irrefutableGuards, \_) { return }
+	if Iter.any(arms[0].patterns, opens) { return }
+	for g in arms[0].guards {
+		if let GLet(alts, _) = g {
+			if Iter.any(alts, opens) { return }
+		}
+	}
+	let held = if len(arms[0].guards) == 0 {
+		"this pattern matches every value"
+	} else {
+		"these conditions always hold"
+	}
+	Vec.push(out, finding(patternsSpan(arms[0]), held + ", so " + consequence))
+}
+
+-- Whether `p` opens an existential constructor anywhere inside it, which
+-- inference marks on the pattern that does.
+fun opens(p : Pat) -> Bool {
+	if Option.isSome(p.opening) { return True }
+	match p.kind {
+		PAnnot(inner, _) | PParen(inner)         -> opens(inner)
+		POr(alts) | PTuple(alts) | PCon(_, alts) -> Iter.any(alts, opens)
+		PRecord(_, fields, _)                    -> Iter.any(fields, fun((_, q)) = opens(q))
+		PVar(_) | PWild | PLit(_, _)             -> False
+	}
+}
+
+-- -- irrefutable-match --------------------------------------------------------------
+--
+-- A `match` of one arm whose pattern always matches is a `let` written the
+-- long way, or, when it is a function's whole body and takes apart a
+-- parameter, a parameter pattern. A program that compiles has only such
+-- one-arm `match`es, since any other is not exhaustive. A pattern that opens
+-- an existential is left alone: `let` cannot open one.
+
+fun irrefutableMatch(f : File, types : TypeTable) -> Vec Finding {
+	let out = []
+	-- The `match`es reported as a function's whole body, which the walk
+	-- reaches again as expressions.
+	let bodies = Set.new()
+	Lint.nodes(f, fun(c) {
+		match c {
+			ChFun(d) -> if let Some(body) = d.body {
+				if let EMatch(scrutinee, _) = body.kind {
+					if let EVar(name, _) = scrutinee.kind {
+						if Iter.any(d.params, \bareName(_) == Some(name)) {
+							Set.add(bodies, body.id)
+							oneArm(body, types, "; take it apart in the parameter list", out)
+						}
+					}
+				}
+			}
+			ChExpr(e) -> if !Set.contains(bodies, e.id) { oneArm(e, types, "; use 'let'", out) }
+			_         -> {}
+		}
+		True
+	})
+	out
+}
+
+fun oneArm(e : Expr, types : TypeTable, advice : String, out : Vec Finding) -> Unit {
+	let EMatch(_, arms) = e.kind else { return }
+	if len(arms) != 1 || Source.isEmpty(e.span) { return }
+	let arm = arms[0]
+	if Source.isEmpty(arm.span) || len(arm.patterns) != 1 || len(arm.guards) > 0 { return }
+	let Some(coverage) = Map.get(types.coverage, e.id) else { return }
+	if !coverage[0].irrefutable || opens(arm.patterns[0]) { return }
+	Vec.push(
+		out,
+		finding(e.span, "this 'match' has one arm, whose pattern matches every value" + advice),
+	)
+}

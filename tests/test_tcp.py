@@ -135,15 +135,24 @@ fun listening(address : Net.IP) -> (TCP.Listener, Int) = match TCP.listen(addres
     Left(e) -> error(show(e))
 }
 
-fun dial(address : Net.IP, port : Int) -> Either IO.IOError TCP.Socket {
+fun dial(address : Net.IP, port : Int) -> Either SomeError TCP.Socket {
     let d = Net.resolve(show(address), port, Net.anywhere, Duration.seconds(10))?
     TCP.connect(d, Duration.seconds(10))
 }
 
+-- Connecting fails with a `SomeError` and a socket's own operations with
+-- its `IOError`; `asIO` reads the `IOError` out of either.
+class AsIO e { fun asIO(e) -> IO.IOError }
+instance AsIO IO.IOError { fun asIO(e) = e }
+instance AsIO SomeError { fun asIO(e) = Option.expect(Error.find(e), "an IOError") }
+
 -- What is left of an error to compare: its operation and kind.
-fun brief(r : Either IO.IOError a) -> String = match r {
+fun brief[AsIO e](r : Either e a) -> String = match r {
     Right(_) -> "Right"
-    Left(e) -> e.op + " " + debug(e.kind)
+    Left(e) -> {
+        let io = asIO(e)
+        io.op + " " + debug(io.kind)
+    }
 }
 """
 
@@ -177,7 +186,7 @@ fun exchange(address : Net.IP) -> String {
             let s = dial(address, port)?
             let local = TCP.localAddress(s)?
             -- Large enough to need several writes and reads.
-            talk(s, "from the client " + String.repeat("x", 300000) + show(local.0))
+            Error.promote(talk(s, "from the client " + String.repeat("x", 300000) + show(local.0)))
         })?
         pure((server, client))
     })
@@ -268,7 +277,7 @@ fun main() {
             Right(s) -> Vec.push(held, s)
             Left(e) -> {
                 let took = Duration.toNanos(Stopwatch.elapsed(watch)) / 1000000
-                outcome = e.op + " " + debug(e.kind) + " " + show(took >= 300 && took < 5000)
+                outcome = brief(Left(e) : Either SomeError Unit) + " " + show(took >= 300 && took < 5000)
                 break
             }
         }
@@ -420,7 +429,10 @@ import Time.Duration as Duration
 fun check(policy : Net.ConnectPolicy, host : String) -> String =
     match Net.resolve(host, 443, policy, Duration.seconds(5)) {
         Right(d) -> "allowed [" + String.join(Array.map(Net.addresses(d), show), ", ") + "]"
-        Left(e) -> debug(e.kind)
+        Left(e) -> match Error.find(e) : Option IO.IOError {
+            Some(io) -> debug(io.kind)
+            None -> show(e)
+        }
     }
 
 fun main() {

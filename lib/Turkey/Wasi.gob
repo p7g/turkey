@@ -36,6 +36,7 @@ export (
 	readdir,
 	closedir,
 	clockGettime,
+	sleep,
 	schedYield,
 	exit,
 )
@@ -66,11 +67,10 @@ export (
 import Prelude ()
 import Data.Int (Int)
 import Data.Tuple (Unit)
-import Data.Eq (Eq(..), (==), (!=))
-import Data.Ord (Ord(..), (<), (<=), (>), (>=))
-import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
-import Bits (BitAnd(..), BitOr(..), BitXor(..), Shift(..), (&), (|), (^), (<<), (>>))
-import Data.Int ()
+import Data.Eq ((==), (!=))
+import Data.Ord ((<), (<=), (>), (>=))
+import Data.Num (Neg(..), (+), (-), (*), (/), (%))
+import Bits ((&), (|), (^), (>>))
 import Data.Bool (Bool(..))
 
 -- A giblet module, since the collector's own allocations come from here:
@@ -184,6 +184,12 @@ foreign "wasi_snapshot_preview1" {
 		used : Ptr,
 	) -> Prim.Int32
 	"clock_time_get" fun clockTimeGet(id : Prim.Int32, precision : Int, time : Ptr) -> Prim.Int32
+	"poll_oneoff" fun pollOneoff(
+		subscriptions : Ptr,
+		events : Ptr,
+		count : Prim.Int32,
+		stored : Ptr,
+	) -> Prim.Int32
 	"proc_exit" fun procExit(status : Prim.Int32) -> Unit
 }
 
@@ -448,7 +454,7 @@ fun malloc(size : Int) -> Ptr {
 	if size > smallLimit() { return pages((size + pageBytes() - 1) / pageBytes()) }
 	let c = classOf(size)
 	let head = mapBytes() + 8 * c
-	var block = loadPtr(allocator(), head)
+	let block = loadPtr(allocator(), head)
 	if isNull(block) {
 		let page = pages(1)
 		if isNull(page) { return page }
@@ -732,6 +738,23 @@ fun clockGettime(id : Int, timespec : Ptr) -> Int {
 	store64(timespec, 0, nanos / 1_000_000_000)
 	store64(timespec, 8, nanos % 1_000_000_000)
 	0
+}
+
+--- Sleeps for `nanoseconds` on the monotonic clock, with the 88 bytes at
+--- `block` to hand WASI. Returns 0, or -1 with `errno` set.
+fun sleep(block : Ptr, nanoseconds : Int) -> Int {
+	-- One subscription, the 48 bytes from 0: its user data; the tag of a
+	-- clock, 0, at 8; and from 16 the clock, `CLOCK_MONOTONIC` (1), the
+	-- timeout, the precision, and the flags, 0 for a timeout from now. The
+	-- event it ends in is the 32 bytes from 48, and the count of events the
+	-- word at 80.
+	store64(block, 0, 0)
+	store64(block, 8, 0)
+	store64(block, 16, 1)
+	store64(block, 24, nanoseconds)
+	store64(block, 32, 0)
+	store64(block, 40, 0)
+	checked(pollOneoff(block, at(block, 48), i32(1), at(block, 80)))
 }
 
 -- -- scratch -----------------------------------------------------------------------------

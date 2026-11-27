@@ -509,9 +509,7 @@ fun joinParams(
 	entered
 }
 
-fun blockIndex(b : BlockId) -> Int = match b {
-	BlockId(n) -> n
-}
+fun blockIndex(BlockId(n) : BlockId) -> Int = n
 
 -- The arguments a jump passes `values` to `target` in: a value of several
 -- slots as its slots, or as its box where `target` takes it boxed, each
@@ -589,7 +587,6 @@ fun lowerProgram(
 		}),
 	)
 	for var i = 0; i < len(all); i = i + 1 {
-		let bind = all[i]
 		let (f, lifted, why) = made[i]
 		match f {
 			Some(function) -> {
@@ -602,9 +599,8 @@ fun lowerProgram(
 			-- counted as one -- the histogram is what says how much of the
 			-- language is still unwritten, so a form that *is* handled, by
 			-- another phase, does not belong in it.
-			None -> match why {
-				Some(u) -> Vec.push(skipped, u)
-				None    -> {}
+			None -> if let Some(u) = why {
+				Vec.push(skipped, u)
 			}
 		}
 	}
@@ -651,22 +647,18 @@ fun adaptClosures(m : Module, sigs : Map String Signature) -> Unit {
 	for f in m.functions {
 		for block in f.blocks {
 			for inst in block.insts {
-				match inst.op {
-					ClosureNew(name, None) -> match Map.get(sigs, name) {
-						Some(sig) ->
-							if Iter.any(sig.params, fun(reps) = len(reps) > 1)
-									|| len(sig.results) > 1 {
-								let symbol = name + "%boxed"
-								if !Map.contains(made, name) {
-									let a = adapter(name, symbol, sig)
-									a.module_ = Map.getOr(modules, name, "")
-									Map.put(made, name, a)
-								}
-								inst.op = ClosureNew(symbol, None)
+				if let ClosureNew(name, None) = inst.op {
+					if let Some(sig) = Map.get(sigs, name) {
+						if Iter.any(sig.params, fun(reps) = len(reps) > 1) || len(sig.results) > 1 {
+							let symbol = name + "%boxed"
+							if !Map.contains(made, name) {
+								let a = adapter(name, symbol, sig)
+								a.module_ = Map.getOr(modules, name, "")
+								Map.put(made, name, a)
 							}
-						None -> {}
+							inst.op = ClosureNew(symbol, None)
+						}
 					}
-					_ -> {}
 				}
 			}
 		}
@@ -740,25 +732,21 @@ fun internNullaries(m : Module, init : Ssa.Func Low) -> Unit {
 		}
 		for block in f.blocks {
 			for inst in block.insts {
-				match inst.op {
-					ObjectNew(kind, tag, layout, fields, mutable) -> if len(fields) == 0 {
+				if let ObjectNew(kind, tag, layout, fields, mutable) = inst.op {
+					if len(fields) == 0 {
 						let name = "%nullary." + Int.toString(kind) + "." + Int.toString(tag)
 						Map.put(objects, name, (kind, tag, layout, []))
 						inst.op = GlobalLoad(name)
 					} else if shared && kind == 0 && tag == -1 && len(mutable) == 0 {
-						match constantsOf(constants, fields) {
-							Some(ops) -> {
-								let name = "%box."
-									+ String.join(Array.map(layout.reps, repCode), "")
-									+ "."
-									+ String.join(Array.map(ops, constantName), ".")
-								Map.put(objects, name, (kind, tag, layout, ops))
-								inst.op = GlobalLoad(name)
-							}
-							None -> {}
+						if let Some(ops) = constantsOf(constants, fields) {
+							let name = "%box."
+								+ String.join(Array.map(layout.reps, repCode), "")
+								+ "."
+								+ String.join(Array.map(ops, constantName), ".")
+							Map.put(objects, name, (kind, tag, layout, ops))
+							inst.op = GlobalLoad(name)
 						}
 					}
-					_ -> {}
 				}
 			}
 		}
@@ -816,9 +804,8 @@ fun storageOf(program : CProgram, decls : DeclTable) -> Vec (String, Rep) {
 		} else {
 			bind.ty
 		}
-		match signatureOf(decls, bind) {
-			Some(_) -> {}
-			None    -> Vec.push(out, (bind.name, repIn(decls, bind.layouts, ty)))
+		if let None = signatureOf(decls, bind) {
+			Vec.push(out, (bind.name, repIn(decls, bind.layouts, ty)))
 		}
 	}
 	out
@@ -835,16 +822,13 @@ fun signatures(program : CProgram, decls : DeclTable) -> Map String Signature {
 	-- program lists them, and a mutually recursive pair is ordinary.
 	let out = Map.new()
 	for bind in Vec.append(program.dicts, program.binds) {
-		match signatureOf(decls, bind) {
-			Some(sig) -> {
-				-- Top-level names are module-qualified, so a collision is a
-				-- compiler bug and not a program that shadows.
-				if Map.contains(out, bind.name) {
-					oops("two top-level bindings named '" + bind.name + "'")
-				}
-				Map.put(out, bind.name, sig)
+		if let Some(sig) = signatureOf(decls, bind) {
+			-- Top-level names are module-qualified, so a collision is a
+			-- compiler bug and not a program that shadows.
+			if Map.contains(out, bind.name) {
+				oops("two top-level bindings named '" + bind.name + "'")
 			}
-			None -> {}
+			Map.put(out, bind.name, sig)
 		}
 	}
 	boxParameters(program, decls, out)
@@ -933,18 +917,16 @@ fun usesIn(a : Uses, e : Core, boxed : Bool) -> Unit {
 		CTyLam(_, inner) -> usesIn(a, inner, boxed)
 		CLet(_, id, _, bound, body, _) -> {
 			usesIn(a, bound, False)
-			match bound.kind {
-				CVar(r) -> if Set.contains(a.ids, binderId(r)) { Set.add(a.ids, id) }
-				_       -> {}
+			if let CVar(r) = bound.kind {
+				if Set.contains(a.ids, binderId(r)) { Set.add(a.ids, id) }
 			}
 			usesIn(a, body, boxed)
 		}
 		CIf(c, then_, otherwise) -> {
 			usesIn(a, c, False)
 			usesIn(a, then_, boxed)
-			match otherwise {
-				Some(o) -> usesIn(a, o, boxed)
-				None    -> {}
+			if let Some(o) = otherwise {
+				usesIn(a, o, boxed)
 			}
 		}
 		CMatch(scrutinee, alts) -> {
@@ -1075,12 +1057,11 @@ fun markDiverging(program : CProgram, sigs : Map String Signature) -> Unit {
 	while changed {
 		changed = False
 		for bind in program.binds {
-			match (Map.get(sigs, bind.name), spine(bind.value)) {
-				(Some(sig), Some((_, body))) -> if !sig.diverges && neverReturns(sigs, body) {
+			if let (Some(sig), Some((_, body))) = (Map.get(sigs, bind.name), spine(bind.value)) {
+				if !sig.diverges && neverReturns(sigs, body) {
 					sig.diverges = True
 					changed = True
 				}
-				_ -> {}
 			}
 		}
 	}
@@ -1109,9 +1090,8 @@ fun neverReturns(sigs : Map String Signature, e : Core) -> Bool = match e.kind {
 -- bottom, or it is `Prim.error`, or a saturated direct call to a function
 -- `sigs` says diverges.
 fun divergingCall(sigs : Map String Signature, e : Core, fn : Core, args : Array Core) -> Bool {
-	match Ty.prune(e.ty) {
-		TBottom -> return True
-		_       -> {}
+	if let TBottom = Ty.prune(e.ty) {
+		return True
 	}
 	match erased(fn).kind {
 		CPrim(Prims.Error) -> True
@@ -1126,9 +1106,8 @@ fun divergingCall(sigs : Map String Signature, e : Core, fn : Core, args : Array
 --- One binding's signature, keyed on *that binding's* layouts.
 fun signatureOf(decls : DeclTable, bind : CBind) -> Option Signature {
 	let shape = spine(bind.value)
-	match shape {
-		None    -> return None
-		Some(_) -> {}
+	if let None = shape {
+		return None
 	}
 	let params = match shape {
 		Some((ps, _)) -> ps
@@ -1188,9 +1167,8 @@ fun lowerBind(
 	-- which is its own phase. Two `let`s rather than one destructuring
 	-- binding, because a control transfer cannot cross one.
 	let shape = spine(bind.value)
-	match shape {
-		None    -> return (None, [], None)
-		Some(_) -> {}
+	if let None = shape {
+		return (None, [], None)
 	}
 	let params = match shape {
 		Some((ps, _)) -> ps
@@ -1363,12 +1341,9 @@ fun refuse(l : Lower, message : String) -> Unit = halt(l, message, True)
 
 -- Records the first reason the lowering stopped, and keeps it.
 fun halt(l : Lower, what : String, overLimit : Bool) -> Unit {
-	match l.stopped {
-		None -> {
-			l.stopped = Some(what)
-			l.overLimit = overLimit
-		}
-		Some(_) -> {}
+	if let None = l.stopped {
+		l.stopped = Some(what)
+		l.overLimit = overLimit
 	}
 }
 
@@ -1445,14 +1420,11 @@ fun named(
 		layout    = heldOf(l, t)
 		boxed     = boxed
 	}
-	match Map.get(l.localRefs, id) {
-		Some((slot, _)) -> {
-			let content = Core.refElem(ty)
-			Vec.push(f.variables, variable(content, isMulti(heldOf(l, content))))
-			Map.put(f.slotHolds, slot, k)
-			return
-		}
-		None -> {}
+	if let Some((slot, _)) = Map.get(l.localRefs, id) {
+		let content = Core.refElem(ty)
+		Vec.push(f.variables, variable(content, isMulti(heldOf(l, content))))
+		Map.put(f.slotHolds, slot, k)
+		return
 	}
 	match Map.get(l.held.multis, id) {
 		Some(Slots(_, values)) -> {
@@ -1515,18 +1487,16 @@ fun localPosition(l : Lower, e : Core, index : Int) -> Option (Int, Rep) =
 -- on it for the duration, as `value` has.
 fun lower(l : Lower, e : Core, dest : Dest) -> Unit {
 	let outer = L.place(l.b)
-	match e.span {
-		Some(_) -> L.setSpan(l.b, e.span)
-		None    -> {}
+	if let Some(_) = e.span {
+		L.setSpan(l.b, e.span)
 	}
 	lowerHere(l, e, dest)
 	L.setPlace(l.b, outer)
 }
 
 fun lowerHere(l : Lower, e : Core, dest : Dest) -> Unit {
-	match l.stopped {
-		Some(_) -> return
-		None    -> {}
+	if let Some(_) = l.stopped {
+		return
 	}
 	match e.kind {
 		CIf(cond, then_, otherwise) -> {
@@ -1553,7 +1523,7 @@ fun lowerHere(l : Lower, e : Core, dest : Dest) -> Unit {
 		}
 		-- A join is a block, and a jump to it is a jump. This is the case the
 		-- whole IR is shaped for.
-		CJoin(name, id, params, body, rest, recursive) -> {
+		CJoin(name, id, params, body, rest, _) -> {
 			let target = L.block(l.b)
 			let entered = joinParams(l, target, params, body, dest)
 			Map.put(l.joins, idOf(name, id), target)
@@ -1670,15 +1640,12 @@ fun switched(l : Lower, whole : Value, ty : Ty.Type, alts : Vec CAlt, dest : Des
 	var default : Option BlockId = Some(otherwise)
 	match shape {
 		Literals -> for var i = 0; i < len(tested); i = i + 1 {
-			match tested[i].alt {
-				ALit(lit) -> {
-					let key = literalKey(lit)
-					if !Set.contains(keyed, key) {
-						Set.add(keyed, key)
-						Vec.push(cases, (key, blocks[i]))
-					}
+			if let ALit(lit) = tested[i].alt {
+				let key = literalKey(lit)
+				if !Set.contains(keyed, key) {
+					Set.add(keyed, key)
+					Vec.push(cases, (key, blocks[i]))
 				}
-				_ -> {}
 			}
 		}
 		Tags(all) -> {
@@ -1821,9 +1788,8 @@ fun switchShape(l : Lower, whole : Value, ty : Ty.Type, tested : Vec CAlt) -> Op
 			if Option.isSome(Decls.enumIndex(l.decls, first)) {
 				return Some(Indices(variants))
 			}
-			match compactAt(l, first, ty) {
-				Some(c) -> return Some(Words(c))
-				None    -> {}
+			if let Some(c) = compactAt(l, first, ty) {
+				return Some(Words(c))
 			}
 			match flatHere(l, ty) {
 				Some(f) -> Some(Spread(f))
@@ -1903,9 +1869,8 @@ fun testArm(
 	success : BlockId,
 	failure : BlockId,
 ) -> Unit {
-	match l.stopped {
-		Some(_) -> return
-		None    -> {}
+	if let Some(_) = l.stopped {
+		return
 	}
 	match alt {
 		AAny(binder) -> {
@@ -1930,18 +1895,15 @@ fun testArm(
 		}
 		ACon(name, binders, Some(o)) -> opened(l, name, binders, o, v, ty, success, failure)
 		ACon(name, binders, None) -> {
-			match Decls.enumIndex(l.decls, name) {
-				Some(i) -> {
-					if Decls.variantCount(l.decls, name) <= 1 {
-						L.terminate(l.b, Jump(success, []))
-						return
-					}
-					let want = enumValue(l, i, Ssa.repOf(l.func, v))
-					let test = L.emit(l.b, Cmp(Eq, v, want), Ssa.untraced(I1))
-					L.terminate(l.b, Branch(test, success, failure))
+			if let Some(i) = Decls.enumIndex(l.decls, name) {
+				if Decls.variantCount(l.decls, name) <= 1 {
+					L.terminate(l.b, Jump(success, []))
 					return
 				}
-				None -> {}
+				let want = enumValue(l, i, Ssa.repOf(l.func, v))
+				let test = L.emit(l.b, Cmp(Eq, v, want), Ssa.untraced(I1))
+				L.terminate(l.b, Branch(test, success, failure))
+				return
 			}
 			-- The wrapper is not there, so there is no tag to test and nothing
 			-- to take out: the value in hand already *is* the payload. See
@@ -1953,32 +1915,26 @@ fun testArm(
 					return
 				}
 			}
-			match compactAt(l, name, ty) {
-				Some(c) -> {
-					compactTest(l, c, name, binders, v, ty, success, failure)
-					return
-				}
-				None -> {}
+			if let Some(c) = compactAt(l, name, ty) {
+				compactTest(l, c, name, binders, v, ty, success, failure)
+				return
 			}
-			match flatHere(l, ty) {
-				Some(f) -> {
-					let k = if len(f.names) == 0 {
-						0
-					} else {
-						let k = Option.unwrapOr(Array.indexOf(f.names, name), -1)
-						let tag = flatTag(l, v, f)
-						let want = enumValue(l, k, f.slots[0])
-						let test = L.emit(l.b, Cmp(Eq, tag, want), Ssa.untraced(I1))
-						let contents = L.block(l.b)
-						L.terminate(l.b, Branch(test, contents, failure))
-						L.into(l.b, contents)
-						k
-					}
-					bindFlat(l, v, f, k, binders)
-					L.terminate(l.b, Jump(success, []))
-					return
+			if let Some(f) = flatHere(l, ty) {
+				let k = if len(f.names) == 0 {
+					0
+				} else {
+					let k = Option.unwrapOr(Array.indexOf(f.names, name), -1)
+					let tag = flatTag(l, v, f)
+					let want = enumValue(l, k, f.slots[0])
+					let test = L.emit(l.b, Cmp(Eq, tag, want), Ssa.untraced(I1))
+					let contents = L.block(l.b)
+					L.terminate(l.b, Branch(test, contents, failure))
+					L.into(l.b, contents)
+					k
 				}
-				None -> {}
+				bindFlat(l, v, f, k, binders)
+				L.terminate(l.b, Jump(success, []))
+				return
 			}
 			let types = match Decls.conFieldTypes(l.decls, ty, name) {
 				Some(ts) -> ts
@@ -1992,12 +1948,9 @@ fun testArm(
 }
 
 fun bindTo(l : Lower, binder : Option (String, Int), v : Value, ty : Ty.Type) -> Unit =
-	match binder {
-		Some((name, id)) -> {
-			Map.put(l.env, idOf(name, id), v)
-			named(l, name, ty, L.here(l.b), False, v)
-		}
-		None -> {}
+	if let Some((name, id)) = binder {
+		Map.put(l.env, idOf(name, id), v)
+		named(l, name, ty, L.here(l.b), False, v)
 	}
 
 -- Bind the fields an arm binds of `v`, a value of a flat type built with its
@@ -2016,13 +1969,10 @@ fun bindFlat(
 	let whole = Ssa.Layout { slots = f.slots }
 	let fields = f.fields[k]
 	for var i = 0; i < len(binders) && i < len(fields); i = i + 1 {
-		match binders[i] {
-			Some((name, id)) -> {
-				let at = fields[i]
-				let layout = Ssa.Layout { slots = Array.map(at, fun(j) = f.slots[j]) }
-				Map.put(l.env, idOf(name, id), fromSlots(l, layout, slotsAt(l, v, whole, at)))
-			}
-			None -> {}
+		if let Some((name, id)) = binders[i] {
+			let at = fields[i]
+			let layout = Ssa.Layout { slots = Array.map(at, fun(j) = f.slots[j]) }
+			Map.put(l.env, idOf(name, id), fromSlots(l, layout, slotsAt(l, v, whole, at)))
 		}
 	}
 }
@@ -2041,9 +1991,8 @@ fun positions(binders : Array (Option (String, Int)), types : Array Ty.Type, fir
 ) {
 	let out = []
 	for var i = 0; i < len(binders) && i < len(types); i = i + 1 {
-		match binders[i] {
-			Some((name, id)) -> Vec.push(out, (first + i, name, idOf(name, id), types[i]))
-			None             -> {}
+		if let Some((name, id)) = binders[i] {
+			Vec.push(out, (first + i, name, idOf(name, id), types[i]))
 		}
 	}
 	out
@@ -2124,11 +2073,10 @@ fun openedLayoutsFor(alt : Alt, outer : Map String Ssa.Layout) -> Map String Ssa
 	}
 	let inner = Map.new()
 	for (id_, layout) in Map.entries(outer) { Map.put(inner, id_, layout) }
-	match o.layouts {
-		Some(ls) -> for var i = 0; i < len(o.skolems) && i < len(ls); i = i + 1 {
+	if let Some(ls) = o.layouts {
+		for var i = 0; i < len(o.skolems) && i < len(ls); i = i + 1 {
 			Map.put(inner, Layout.skolemKey(o.skolems[i]), ls[i])
 		}
-		None -> {}
 	}
 	inner
 }
@@ -2507,9 +2455,8 @@ fun retagged(l : Lower, v : Value, want : Rep) -> Value =
 -- -- one the compiler made -- keeps its parent's.
 fun value(l : Lower, e : Core) -> Value {
 	let outer = L.place(l.b)
-	match e.span {
-		Some(_) -> L.setSpan(l.b, e.span)
-		None    -> {}
+	if let Some(_) = e.span {
+		L.setSpan(l.b, e.span)
 	}
 	let held = if Option.isSome(l.stopped) { Ssa.Layout { slots = [] } } else { heldOf(l, e.ty) }
 	let v = adopted(l, e.ty, held, valueHere(l, e, held))
@@ -2518,9 +2465,8 @@ fun value(l : Lower, e : Core) -> Value {
 }
 
 fun valueHere(l : Lower, e : Core, held : Ssa.Layout) -> Value {
-	match l.stopped {
-		Some(_) -> return Ssa.freshValue(l.func, Ssa.untraced(Unit))
-		None    -> {}
+	if let Some(_) = l.stopped {
+		return Ssa.freshValue(l.func, Ssa.untraced(Unit))
 	}
 	let rep = Layout.storedRep(held)
 	match e.kind {
@@ -2722,9 +2668,8 @@ fun store(l : Lower, target : Core, assigned : Value) -> Unit = match target.kin
 	}
 	CProject(receiver, index) -> match localPosition(l, receiver, index) {
 		Some((slot, held)) -> L.effect(l.b, SlotStore(slot, coerce(l, stored(l, assigned), held)))
-		None -> match projected(l, receiver.ty, index) {
-			Some(p) -> writeField(l, value(l, receiver), p, index, assigned)
-			None    -> {}
+		None -> if let Some(p) = projected(l, receiver.ty, index) {
+			writeField(l, value(l, receiver), p, index, assigned)
 		}
 	}
 	-- Anything else is a reference cell: a `var`, whose mentions are already
@@ -2878,7 +2823,7 @@ fun capturesOf(l : Lower, body : Core, extra : Set.Set Int) -> Vec (Ref, Ssa.Lay
 		if Set.contains(extra, binderId(local)) {
 			Vec.push(out, (local, Ssa.Layout { slots = [Ssa.traced(Ptr)] }))
 		} else {
-			match lookup(l, local) {
+			if let Some(v) = lookup(l, local) {
 				-- A flattened `var` or record is a marker, never emitted, and
 				-- capturing one would be a use of an undefined value. None is
 				-- held here: `LocalEscape` keeps any binding a closure
@@ -2886,15 +2831,12 @@ fun capturesOf(l : Lower, body : Core, extra : Set.Set Int) -> Vec (Ref, Ssa.Lay
 				--
 				-- A `unit` holds nothing, and `lift` makes the child its own
 				-- rather than spend an environment field on it.
-				Some(v) -> {
-					match multiOf(l, v) {
-						Some(m) -> Vec.push(out, (local, multiLayout(m)))
-						None -> if !isMarker(l, v) && Ssa.repOf(l.func, v).class_ != Unit {
-							Vec.push(out, (local, Ssa.Layout { slots = [Ssa.repOf(l.func, v)] }))
-						}
+				match multiOf(l, v) {
+					Some(m) -> Vec.push(out, (local, multiLayout(m)))
+					None -> if !isMarker(l, v) && Ssa.repOf(l.func, v).class_ != Unit {
+						Vec.push(out, (local, Ssa.Layout { slots = [Ssa.repOf(l.func, v)] }))
 					}
 				}
-				None -> {}
 			}
 		}
 	}
@@ -2968,11 +2910,10 @@ fun lift(
 	-- The `unit` locals `capturesOf` leaves out of the environment, made here
 	-- instead, in the order the body first mentions them.
 	for local in Core.references(body) {
-		match lookup(l, local) {
-			Some(v) -> if Ssa.repOf(l.func, v).class_ == Unit {
+		if let Some(v) = lookup(l, local) {
+			if Ssa.repOf(l.func, v).class_ == Unit {
 				put(child, local, L.emit(child.b, ConstUnit, Ssa.untraced(Unit)))
 			}
-			None -> {}
 		}
 	}
 	let taken : Vec Value = []
@@ -3161,8 +3102,8 @@ fun letrec(l : Lower, binds : Vec CBind, body : Core, dest : Dest) -> Unit {
 		let firsts = environmentFirsts(captures)
 		for var j = 0; j < len(captures); j = j + 1 {
 			if isSibling(siblings, captures[j].0) {
-				match lookup(l, captures[j].0) {
-					Some(v) -> L.effect(
+				if let Some(v) = lookup(l, captures[j].0) {
+					L.effect(
 						l.b,
 						ClosureCapture(
 							shells[i],
@@ -3170,7 +3111,6 @@ fun letrec(l : Lower, binds : Vec CBind, body : Core, dest : Dest) -> Unit {
 							v,
 						),
 					)
-					None -> {}
 				}
 			}
 		}
@@ -3281,15 +3221,13 @@ fun compactField(l : Lower, c : Compact, ty : Ty.Type) -> Ty.Type =
 -- integers or wraps.
 fun plain(l : Lower, ty : Ty.Type) -> Bool {
 	let t = Ty.prune(ty)
-	match Decls.erasedPayload(l.decls, t) {
-		Some(payload) -> return plain(l, payload)
-		None          -> {}
+	if let Some(payload) = Decls.erasedPayload(l.decls, t) {
+		return plain(l, payload)
 	}
 	-- A flat value of several slots is held as its box, an ordinary object. One
 	-- of one slot is that slot, which may be anything.
-	match flatHere(l, t) {
-		Some(f) -> return len(f.slots) > 1
-		None    -> {}
+	if let Some(f) = flatHere(l, t) {
+		return len(f.slots) > 1
 	}
 	match t {
 		TTuple(_)  -> return True
@@ -3307,9 +3245,8 @@ fun plain(l : Lower, ty : Ty.Type) -> Bool {
 
 -- A one-word compact sum's constructor applied to `args`.
 fun compactValue(l : Lower, c : Compact, name : String, ty : Ty.Type, args : Array Core) -> Value {
-	match Vec.indexOf(c.nullaries, name) {
-		Some(i) -> return L.emit(l.b, ConstInt(i), Ssa.traced(Ptr))
-		None    -> {}
+	if let Some(i) = Vec.indexOf(c.nullaries, name) {
+		return L.emit(l.b, ConstInt(i), Ssa.traced(Ptr))
 	}
 	if len(args) != 1 {
 		return stop(l, "the constructor '" + name + "' must be saturated")
@@ -3354,14 +3291,11 @@ fun compactTest(
 	success : BlockId,
 	failure : BlockId,
 ) -> Unit {
-	match Vec.indexOf(c.nullaries, name) {
-		Some(i) -> {
-			let want = L.emit(l.b, ConstInt(i), Ssa.traced(Ptr))
-			let test = L.emit(l.b, Cmp(Eq, v, want), Ssa.untraced(I1))
-			L.terminate(l.b, Branch(test, success, failure))
-			return
-		}
-		None -> {}
+	if let Some(i) = Vec.indexOf(c.nullaries, name) {
+		let want = L.emit(l.b, ConstInt(i), Ssa.traced(Ptr))
+		let test = L.emit(l.b, Cmp(Eq, v, want), Ssa.untraced(I1))
+		L.terminate(l.b, Branch(test, success, failure))
+		return
 	}
 	let count = L.emit(l.b, ConstInt(len(c.nullaries)), Ssa.traced(Ptr))
 	let nullary = L.emit(l.b, Cmp(Lt, v, count), Ssa.untraced(I1))
@@ -3420,34 +3354,28 @@ fun enumValue(l : Lower, index : Int, rep : Rep) -> Value =
 -- one-word compact sum's is an object with no fields, interned per (kind, tag)
 -- rather than allocated at each use.
 fun constructor(l : Lower, e : Core, name : String, args : Array Core, rep : Rep) -> Value {
-	match Decls.enumIndex(l.decls, name) {
-		Some(i) -> return enumValue(l, i, repOf(l, e.ty))
-		None    -> {}
+	if let Some(i) = Decls.enumIndex(l.decls, name) {
+		return enumValue(l, i, repOf(l, e.ty))
 	}
-	match Decls.erasedPayload(l.decls, e.ty) {
-		Some(_) -> if len(args) == 1 { return value(l, args[0]) }
-		None    -> {}
+	if let Some(_) = Decls.erasedPayload(l.decls, e.ty) {
+		if len(args) == 1 { return value(l, args[0]) }
 	}
-	match compactAt(l, name, e.ty) {
-		Some(c) -> return compactValue(l, c, name, e.ty, args)
-		None    -> {}
+	if let Some(c) = compactAt(l, name, e.ty) {
+		return compactValue(l, c, name, e.ty, args)
 	}
-	match flatHere(l, e.ty) {
-		Some(f) -> {
-			let k = if len(f.names) == 0 {
-				0
-			} else {
-				match Array.indexOf(f.names, name) {
-					Some(i) -> i
-					None -> return stop(
-						l,
-						"the constructor '" + name + "' is not one of " + Ty.show(e.ty) + "'s",
-					)
-				}
+	if let Some(f) = flatHere(l, e.ty) {
+		let k = if len(f.names) == 0 {
+			0
+		} else {
+			match Array.indexOf(f.names, name) {
+				Some(i) -> i
+				None -> return stop(
+					l,
+					"the constructor '" + name + "' is not one of " + Ty.show(e.ty) + "'s",
+				)
 			}
-			return flatValue(l, f, heldOf(l, e.ty), k, args)
 		}
-		None -> {}
+		return flatValue(l, f, heldOf(l, e.ty), k, args)
 	}
 	match Map.get(l.tags, name) {
 		Some(tag) -> match Decls.con(l.decls, name) {
@@ -3984,6 +3912,8 @@ fun primitive(l : Lower, e : Core, p : Prims.Prim, args : Array Core, rep : Rep)
 		Prims.IntMul       -> primBinary(l, p, args, Mul, rep)
 		Prims.IntDiv       -> primBinary(l, p, args, Div, rep)
 		Prims.IntRem       -> primBinary(l, p, args, Rem, rep)
+		Prims.IntFloorDiv  -> primBinary(l, p, args, FloorDiv, rep)
+		Prims.IntMod       -> primBinary(l, p, args, Mod, rep)
 		Prims.IntNeg       -> L.emit(l.b, Neg(operands(l, p, args, 1)[0]), rep)
 		-- Distinct opcodes, not the same one: what differs is whether overflow
 		-- panics, and a backend that could not tell them apart would emit an
@@ -4371,9 +4301,8 @@ fun lowerActions(
 		-- This was a scaffold while the histogram was being worked down --
 		-- skip the global, count it, carry on -- and it is deleted now that
 		-- every program in the corpus lowers with nothing skipped.
-		match l.stopped {
-			None      -> {}
-			Some(why) -> oops("the global '" + owner + "' cannot be lowered: " + why)
+		if let Some(why) = l.stopped {
+			oops("the global '" + owner + "' cannot be lowered: " + why)
 		}
 	}
 	f.module_ = ""

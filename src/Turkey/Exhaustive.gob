@@ -1,4 +1,4 @@
-export (Witness(..), check, checkPattern, render)
+export (Witness(..), check, checkPattern, covers, reach, render)
 
 --- Pattern-matching exhaustiveness checking.
 ---
@@ -15,7 +15,7 @@ import Turkey.Decls as Decls
 import Turkey.Diag as Diag
 import Turkey.Decls (DeclTable(..), ConInfo(..), TyconInfo(..))
 import Turkey.Types as Ty
-import Turkey.Types (TVar, TCon, TApp, TFam, TFun, TTuple)
+import Turkey.Types (TFun, TTuple)
 
 --- The shapes the algorithm understands. Not the surface patterns: a record
 --- pattern is reordered into declaration order and filled out with wildcards, so
@@ -30,32 +30,46 @@ type Witness
 	--- column is looked at.
 	| WOr(Array Witness)
 
-fun normalize(p : Pat, decls : DeclTable) -> Witness = match p.kind {
-	PVar(_)                          -> WWild
-	PWild                            -> WWild
-	PAnnot(inner, _) | PParen(inner) -> normalize(inner, decls)
-	POr(alts)                        -> WOr(Array.map(alts, normalize(_, decls)))
-	PLit(l, _)                       -> WLit(l)
-	PTuple(elems)                    -> WTuple(Array.map(elems, normalize(_, decls)))
-	PCon(name, args)                 -> WCon(name, Array.map(args, normalize(_, decls)))
-	PRecord(name, fields, _) -> {
-		-- Reorder the fields into declaration order and fill in the ones the
-		-- pattern left out, so every row for a constructor has the same width.
-		let supplied = Map.new()
-		for (label, sub) in fields { Map.put(supplied, label, sub) }
-		let args = match Decls.con(decls, name) {
-			Some(info) -> match info.fields {
-				Some(names) -> Array.map(names, fun(n) = match Map.get(supplied, n) {
-					Some(sub) -> normalize(sub, decls)
-					None      -> WWild
-				})
+fun normalize(p : Pat, decls : DeclTable) -> Witness = normalizeWith(p, decls, noChoices)
+
+let noChoices : Map Int (Vec Int) = Map.new()
+
+-- `normalize`, except that an alternatives pattern whose id `chosen` holds
+-- keeps only the alternatives at the indices it gives, which are never none.
+fun normalizeWith(p : Pat, decls : DeclTable, chosen : Map Int (Vec Int)) -> Witness =
+	match p.kind {
+		PVar(_)                          -> WWild
+		PWild                            -> WWild
+		PAnnot(inner, _) | PParen(inner) -> normalizeWith(inner, decls, chosen)
+		POr(alts) -> match Map.get(chosen, p.id) {
+			Some(kept) -> if len(kept) == 1 {
+				normalizeWith(alts[kept[0]], decls, chosen)
+			} else {
+				WOr(Array.map(kept, \normalizeWith(alts[_], decls, chosen)))
+			}
+			None -> WOr(Array.map(alts, normalizeWith(_, decls, chosen)))
+		}
+		PLit(l, _)       -> WLit(l)
+		PTuple(elems)    -> WTuple(Array.map(elems, normalizeWith(_, decls, chosen)))
+		PCon(name, args) -> WCon(name, Array.map(args, normalizeWith(_, decls, chosen)))
+		PRecord(name, fields, _) -> {
+			-- Reorder the fields into declaration order and fill in the ones the
+			-- pattern left out, so every row for a constructor has the same width.
+			let supplied = Map.new()
+			for (label, sub) in fields { Map.put(supplied, label, sub) }
+			let args = match Decls.con(decls, name) {
+				Some(info) -> match info.fields {
+					Some(names) -> Array.map(names, fun(n) = match Map.get(supplied, n) {
+						Some(sub) -> normalizeWith(sub, decls, chosen)
+						None      -> WWild
+					})
+					None -> []
+				}
 				None -> []
 			}
-			None -> []
+			WCon(name, args)
 		}
-		WCon(name, args)
 	}
-}
 
 -- The head constructor a pattern tests for, compared by `sameKey`. Encoding it
 -- as a string would mean parsing it back out, which is how a key stops being a
@@ -107,9 +121,8 @@ fun litText(l : Ast.Lit) -> String = match l {
 -- `String` and friends have unboundedly many values, so a column of them is only
 -- covered by a wildcard.
 fun signature(decls : DeclTable, t : Ty.Type) -> Option (Array Key) {
-	match Ty.prune(t) {
-		TTuple(elems) -> return Some([KTuple(len(elems))])
-		_             -> {}
+	if let TTuple(elems) = Ty.prune(t) {
+		return Some([KTuple(len(elems))])
 	}
 	match Ty.headCon(t) {
 		None -> None
@@ -164,10 +177,10 @@ fun keyArity(decls : DeclTable, key : Key, t : Ty.Type) -> Int = match key {
 }
 
 fun rebuild(key : Key, args : Array Witness) -> Witness = match key {
-	KTuple(_)     -> WTuple(args)
-	KLit(kind, _) -> WWild
-	KNone         -> WWild
-	KCon(name)    -> WCon(name, args)
+	KTuple(_)  -> WTuple(args)
+	KLit(_, _) -> WWild
+	KNone      -> WWild
+	KCon(name) -> WCon(name, args)
 }
 
 -- -- the algorithm ------------------------------------------------------------------
@@ -191,32 +204,30 @@ fun witness(
 	}
 	let sig = signature(decls, headType)
 
-	match sig {
-		Some(keys) -> {
-			var complete = True
-			for k in keys {
-				if !holdsKey(used, k) { complete = False }
-			}
-			if complete {
-				-- The match is exhaustive only if it is exhaustive under every
-				-- constructor.
-				for k in keys {
-					let (specialized, argTypes) = specialize(decls, matrix, k, headType)
-					match witness(decls, specialized, Array.append(argTypes, restTypes)) {
-						Some(found) -> {
-							let width = len(argTypes)
-							let built = rebuild(k, Array.slice(found, 0, width))
-							return Some(
-								Array.append([built], Array.slice(found, width, len(found))),
-							)
-						}
-						None -> {}
-					}
-				}
-				return None
-			}
+	if let Some(keys) = sig {
+		var complete = True
+		for k in keys {
+			if !holdsKey(used, k) { complete = False }
 		}
-		None -> {}
+		if complete {
+			-- The match is exhaustive only if it is exhaustive under every
+			-- constructor.
+			for k in keys {
+				let (specialized, argTypes) = specialize(decls, matrix, k, headType)
+				if let Some(found) = witness(
+					decls,
+					specialized,
+					Array.append(argTypes, restTypes),
+				) {
+					let width = len(argTypes)
+					let built = rebuild(k, Array.slice(found, 0, width))
+					return Some(
+						Array.append([built], Array.slice(found, width, len(found))),
+					)
+				}
+			}
+			return None
+		}
 	}
 
 	-- Incomplete: a value built from a constructor nobody tested reaches the
@@ -250,6 +261,64 @@ fun witness(
 }
 
 fun wilds(n : Int) -> Array Witness = Array.filled(n, WWild)
+
+-- Whether some value matches `row` and no row of `matrix`: Maranget's
+-- usefulness, U(P, q), over the same specialization `witness` uses.
+fun useful(
+	decls : DeclTable,
+	matrix : Vec (Array Witness),
+	row : Array Witness,
+	types : Array Ty.Type,
+) -> Bool {
+	if len(types) == 0 { return len(matrix) == 0 }
+	let matrix = expandOrs(matrix)
+	let headType = types[0]
+	let restTypes = Array.slice(types, 1, len(types))
+	let rest = Array.slice(row, 1, len(row))
+	match row[0] {
+		WOr(alts) -> Iter.any(
+			alts,
+			fun(alt) = useful(decls, matrix, Array.append([alt], rest), types),
+		)
+		WWild -> {
+			let used = Vec.new(4)
+			for r in matrix {
+				let k = keyOf(r[0])
+				if !isNone(k) && !holdsKey(used, k) { Vec.push(used, k) }
+			}
+			-- A wildcard reaches a value the matrix misses under some
+			-- constructor when the matrix tests every one, and otherwise
+			-- exactly when it does after the rows that test none.
+			if let Some(keys) = signature(decls, headType) {
+				if Iter.all(keys, holdsKey(used, _)) {
+					return Iter.any(keys, fun(k) {
+						let (specialized, argTypes) = specialize(decls, matrix, k, headType)
+						useful(
+							decls,
+							specialized,
+							Array.append(wilds(len(argTypes)), rest),
+							Array.append(argTypes, restTypes),
+						)
+					})
+				}
+			}
+			let default_ = Vec.new(len(matrix))
+			for r in matrix {
+				if isNone(keyOf(r[0])) { Vec.push(default_, Array.slice(r, 1, len(r))) }
+			}
+			useful(decls, default_, rest, restTypes)
+		}
+		head -> {
+			let (specialized, argTypes) = specialize(decls, matrix, keyOf(head), headType)
+			let args = match head {
+				WCon(_, a)    -> a
+				WTuple(elems) -> elems
+				_             -> []
+			}
+			useful(decls, specialized, Array.append(args, rest), Array.append(argTypes, restTypes))
+		}
+	}
+}
 
 -- `matrix` with each row whose first pattern is alternatives replaced by one
 -- row per alternative, in order: a row `(p | q) rest` covers what `p rest` and
@@ -319,6 +388,109 @@ fun checkPattern(decls : DeclTable, p : Pat, scrutinee : Ty.Type) -> Option Stri
 		None        -> None
 		Some(found) -> Some(render(found[0]))
 	}
+}
+
+--- Returns whether `patterns`, as alternatives, together match every value of
+--- `scrutinee`.
+fun covers(decls : DeclTable, patterns : Vec Pat, scrutinee : Ty.Type) -> Bool {
+	let row = [WOr(Array.map(patterns, normalize(_, decls)))]
+	!useful(decls, [row], [WWild], [scrutinee])
+}
+
+--- Returns, for each of `arms` of a `match` on `scrutinee`, in order, whether
+--- some value reaches the arm, and if one does, the alternatives in its
+--- patterns that no value reaches: an alternative at the top of the arm that
+--- the arms and alternatives before it already match, or one nested inside a
+--- pattern that its earlier siblings already match. An arm with a guard is
+--- reached or not like any other, and stops no value from reaching a later
+--- arm, since its guard may decline any value its patterns match.
+fun reach(decls : DeclTable, arms : Vec Arm, scrutinee : Ty.Type) -> Vec (Bool, Vec Pat) {
+	let types = [scrutinee]
+	let rows = Vec.new(8)
+	let out = Vec.new(len(arms))
+	for arm in arms {
+		let reached = Iter.any(
+			arm.patterns,
+			fun(p) = useful(decls, rows, [normalize(p, decls)], types),
+		)
+		let dead = []
+		if reached {
+			let before = Vec.slice(rows, 0, len(rows))
+			for p in arm.patterns {
+				let row = [normalize(p, decls)]
+				if useful(decls, before, row, types) {
+					deadAlternatives(decls, p, p, before, Map.new(), types, dead)
+				} else {
+					Vec.push(dead, p)
+				}
+				Vec.push(before, row)
+			}
+		}
+		Vec.push(out, (reached, dead))
+		if len(arm.guards) == 0 {
+			for p in arm.patterns { Vec.push(rows, [normalize(p, decls)]) }
+		}
+	}
+	out
+}
+
+-- Adds to `dead` each alternative inside `at`, a part of the arm pattern
+-- `whole`, that no value reaches past `before`, with each alternatives pattern
+-- around `at` narrowed to the one alternative `chosen` holds for it.
+--
+-- An alternative is reached when a value matches it and none of the patterns
+-- tried first: the rows before, and `whole` with this alternative's earlier
+-- siblings in its place, under the same narrowing. Inside an alternative no
+-- value reaches, nothing is reported again.
+fun deadAlternatives(
+	decls : DeclTable,
+	whole : Pat,
+	at : Pat,
+	before : Vec (Array Witness),
+	chosen : Map Int (Vec Int),
+	types : Array Ty.Type,
+	dead : Vec Pat,
+) -> Unit {
+	match at.kind {
+		POr(alts) -> for var i = 0; i < len(alts); i = i + 1 {
+			let tried = Vec.slice(before, 0, len(before))
+			if i > 0 {
+				let earlier = []
+				for j in Int.range(0, i) { Vec.push(earlier, j) }
+				Vec.push(tried, [normalizeWith(whole, decls, choosing(chosen, at.id, earlier))])
+			}
+			let narrowed = choosing(chosen, at.id, [i])
+			if useful(decls, tried, [normalizeWith(whole, decls, narrowed)], types) {
+				deadAlternatives(decls, whole, alts[i], before, narrowed, types, dead)
+			} else {
+				Vec.push(dead, alts[i])
+			}
+		}
+		PAnnot(inner, _) | PParen(inner) -> deadAlternatives(
+			decls,
+			whole,
+			inner,
+			before,
+			chosen,
+			types,
+			dead,
+		)
+		PTuple(parts) | PCon(_, parts) -> for part in parts {
+			deadAlternatives(decls, whole, part, before, chosen, types, dead)
+		}
+		PRecord(_, fields, _) -> for (_, part) in fields {
+			deadAlternatives(decls, whole, part, before, chosen, types, dead)
+		}
+		PVar(_) | PWild | PLit(_, _) -> {}
+	}
+}
+
+-- `chosen`, with `kept` for the alternatives pattern `id`.
+fun choosing(chosen : Map Int (Vec Int), id : Int, kept : Vec Int) -> Map Int (Vec Int) {
+	let out = Map.new()
+	for (k, v) in Map.entries(chosen) { Map.put(out, k, v) }
+	Map.put(out, id, kept)
+	out
 }
 
 fun render(w : Witness) -> String = match w {

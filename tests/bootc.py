@@ -16,6 +16,7 @@ through `boot_each`, so the corpus is compiled once, not once per worker.
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import fcntl
 import functools
@@ -243,6 +244,45 @@ def executable(entry: Path, output: Path, *flags: str, cwd: Path = REPO_ROOT,
     return compiled
 
 
+def write_compiler(compiler: Path, output: Path, *flags: str) -> None:
+    """Writes the compiler's own source, `src/Main.gob`, at `output` with
+    `compiler build` and the build flags `flags`."""
+    result = subprocess.run(
+        toolchain.command(compiler, "build", *flags, "-o", str(output), str(BOOT_MAIN)),
+        cwd=REPO_ROOT, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr[:4000]
+
+
+@functools.lru_cache(maxsize=None)
+def _compiler_key() -> str:
+    """Stage2 and today's `src/`, as a cache key for what stage2 writes for
+    the compiler's own source."""
+    # Keyed on the source as well as on stage2: under `$TURKEY_BOOT`,
+    # `build_key` covers the binary and `lib/` alone, and what stage2 writes
+    # is today's `src/` too.
+    h = hashlib.sha256(build_key().encode())
+    for path in sorted((REPO_ROOT / "src").rglob("*.gob")):
+        h.update(str(path.relative_to(REPO_ROOT)).encode() + b"\0")
+        h.update(path.read_bytes())
+    return h.hexdigest()[:16]
+
+
+def written_compiler(name: str, *flags: str) -> Path:
+    """Returns what stage2 writes for the compiler's own source with the build
+    flags `flags`, cached on disk as `name`. Concurrent callers may each build
+    it, and every one of them returns a complete file."""
+    output = CACHE / f"{name}-{_compiler_key()}"
+    if not output.exists():
+        CACHE.mkdir(parents=True, exist_ok=True)
+        staging = CACHE / f"{name}-{_compiler_key()}-{os.getpid()}"
+        try:
+            write_compiler(binary(), staging, *flags)
+            os.replace(staging, output)
+        finally:
+            staging.unlink(missing_ok=True)
+    return output
+
+
 def replace_built(command: list[str], output: Path) -> None:
     """Run a build whose `-o` is a staging path, then move it to `output`."""
     result = subprocess.run(command, capture_output=True, text=True)
@@ -255,8 +295,8 @@ def corpus() -> list[Path]:
 
     Every program there but an error case (`err_*`, whose point is to fail)
     and a known failure (marked `--% xfail`, which may stop `turkey` partway).
-    A corpus test compiles them all in one `turkey` run (`boot_each`), so one
-    program that cannot compile fails every test that shares the run, and
+    A corpus test compiles them all in a few `turkey` runs (`boot_each`), so
+    one program that cannot compile fails every test that shares its run, and
     each of those tests then runs it again.
     """
     return sorted(
@@ -264,6 +304,68 @@ def corpus() -> list[Path]:
         if not path.name.startswith("err_")
         and "--% xfail" not in path.read_text(encoding="utf-8")
     )
+
+
+# The fewest programs worth a `turkey` process of their own. A process spends
+# about a second before its first program, and a corpus program then compiles
+# in a fraction of one, so a smaller share spends more on starting than the
+# extra core saves.
+_SHARE = 16
+
+
+def _cores() -> int:
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0))
+    return os.cpu_count() or 1
+
+
+def boot_split(args: list[str], paths: list[Path],
+               split: Callable[[str, list[Path]], list[str]],
+               compiler: Path | None = None) -> list[str]:
+    """Runs `compiler` (by default `binary()`) with `args` over `paths` and
+    returns one output per path, in the order of `paths`. `split` cuts one
+    run's stdout into one text per path it was given. Raises AssertionError
+    if any run fails or `split` returns the wrong number of texts.
+
+    Spreads the paths over up to one process per core.
+    """
+    compiler = compiler or binary()
+    # One `turkey` run over many programs keeps about two cores busy: it
+    # compiles its programs one after another and runs only each program's
+    # backend in parallel. Under `pytest -n auto` the workers that want the
+    # same programs are blocked on `boot_each`'s locks meanwhile, so the cores
+    # they would use are idle. Several processes of one worker each fill those
+    # cores.
+    count = max(1, min(_cores(), len(paths) // _SHARE))
+    # Deal the paths out in turn rather than in runs. Neighbours in sorted
+    # order are often variations on one program, and a share made of the slow
+    # ones would finish last.
+    shares = [paths[i::count] for i in range(count)]
+    env = dict(os.environ)
+    if count > 1:
+        # One worker per process, since the processes already fill the cores.
+        # What `turkey` writes does not depend on its worker count.
+        env["TURKEY_WORKERS"] = "1"
+
+    def run(share: list[Path]) -> list[str]:
+        result = subprocess.run(
+            toolchain.command(compiler, *args, *(str(path) for path in share)),
+            cwd=REPO_ROOT, capture_output=True, env=env)
+        out = result.stdout.decode("utf-8")
+        assert result.returncode == 0, (
+            f"turkey exited {result.returncode}\n{out[-4000:]}\n"
+            f"{result.stderr.decode('utf-8')[-4000:]}")
+        texts = split(out, share)
+        assert len(texts) == len(share), (
+            f"{len(texts)} dumps for {len(share)} programs")
+        return texts
+
+    with concurrent.futures.ThreadPoolExecutor(count) as pool:
+        results = list(pool.map(run, shares))
+    texts: dict[Path, str] = {}
+    for share, result in zip(shares, results):
+        texts.update(zip(share, result))
+    return [texts[path] for path in paths]
 
 
 def boot_each(output: str, paths: list[Path],
@@ -281,7 +383,8 @@ def boot_each(output: str, paths: list[Path],
     the library, which the fingerprint covers; a program that imported a
     sibling would need its directory hashed too, as `reference` does.
 
-    The missing programs are computed in one `turkey` run, holding a lock per
+    The missing programs are computed by one caller (`boot_split`, so across
+    every core), holding a lock per
     program, so a cold entry is filled once while any other worker that wants
     it waits. Per program rather than per output: the `select` dump of
     `src/Main.gob` takes minutes and the corpus's takes seconds, and one lock
@@ -319,10 +422,7 @@ def boot_each(output: str, paths: list[Path],
             fcntl.flock(lock, fcntl.LOCK_EX)
         found, missing = load()
         if missing:
-            text = boot(*argv(output), *flags, *(str(path) for path in missing))
-            chunks = split(text, missing)
-            assert len(chunks) == len(missing), (
-                f"{len(chunks)} dumps for {len(missing)} programs")
+            chunks = boot_split([*argv(output), *flags], missing, split)
             for path, chunk in zip(missing, chunks):
                 cached = entry(path)
                 staging = cached.with_suffix(f".{os.getpid()}")

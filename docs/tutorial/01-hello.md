@@ -1,12 +1,11 @@
 # Hello, Turkey
 
-Turkey is a statically typed language in the ML family, with inferred types,
-data built from records and variants, and type classes that give operators
-and loops their meaning. The compiler is written in Turkey, and on this page
-it runs in your browser.
+Turkey is a statically typed language in the ML family. It has type inference,
+algebraic data types with pattern matching, and type classes. The compiler is
+written in Turkey, and on this page it runs in your browser.
 
-A program starts at `main`, a function that takes nothing and returns
-nothing. `print` writes a value and a line break.
+Every program starts in the `main` function, which takes no arguments and
+returns nothing. `print` writes a value and a newline to standard output.
 
 <!-- run -->
 ```kotlin
@@ -21,18 +20,19 @@ Hello, Turkey!
 
 ## How the page works
 
-The program is in an editor, and the output under it is what the program
-printed when this page was made.
+You can edit the program. The output under it was recorded when this page was
+built.
 
-* **Run** compiles the program and runs it. The compiler, about 6 MB,
-  downloads the first time you click into the editor or press Run, and later
-  visits use the browser's cache.
-* **Format** lays the program out the way `turkey format` does.
-* **Reset** brings back the lesson's program. Until then, this browser keeps
-  your edits to each lesson.
+* **Run** compiles the program and runs it. The compiler is about 6 MB. It
+  downloads the first time you click in the editor or press Run, and your
+  browser caches it for later visits.
+* **Format** formats the program as `turkey format` does.
+* **Reset** restores the lesson's program. Until you press it, your browser
+  keeps your edits to each lesson.
 * **Share** copies a link that opens the program in the playground.
 
-Change the greeting, or print a sum such as `print(6 * 7)`, and run it again.
+Change the greeting, or print an expression such as `print(6 * 7)`, and run
+the program again.
 
 ## In the reference
 

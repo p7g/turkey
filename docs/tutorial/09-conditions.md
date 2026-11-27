@@ -1,16 +1,21 @@
 # Conditions that bind
 
-A `match` with one interesting arm reads better as a condition. `if let` runs
-its block when a pattern matches, with the pattern's names bound inside it.
-Its head can list several conditions, separated by commas: patterns and
-`Bool` tests, tried left to right, each seeing the names bound before it.
+`if let` is a conditional that pattern-matches. It tests a value against a
+pattern and, when the pattern matches, runs its block with the pattern's
+variables bound. Use it instead of a `match` when only one case matters.
 
-`let ... else` binds a pattern for the rest of the block, and its `else`
-block runs when the pattern doesn't match. That block has to leave, with
-`return`, `break` or `continue`, or end in a call that never returns, such
-as `error(...)`, so the names are bound wherever the code goes on.
+You can chain conditions with commas. Each condition is a pattern match or a
+`Bool` expression. They are tested from left to right, and each can use the
+variables that the ones before it bound. In `portOf`, the second condition
+tests the `key` that the first one bound.
 
-`while let` runs its block for as long as a pattern matches.
+`let ... else` is for a value that the rest of the block needs.
+`let Some(port) = portOf(setting) else { ... }` binds `port` for the rest of
+the block. When the pattern doesn't match, the `else` block runs instead. The
+`else` block must exit: with `return`, `break` or `continue`, or with a call
+that never returns, such as `error(...)`.
+
+`while let` loops for as long as a pattern matches.
 
 <!-- run -->
 ```kotlin
@@ -49,14 +54,13 @@ running test
 running deploy
 ```
 
-`pending` is a `Vec`, a sequence that grows and shrinks, which
-[Loops and collections](10-loops.md) covers. `Vec.pop` removes its last
-element and returns it, or `None` once there are none, so the `while let`
-ends when `pending` is empty.
+In `main`, the loop ends when `Vec.pop` returns `None`, which it does once
+`pending` is empty. `pending` is a `Vec`, a growable array that
+[Loops and collections](10-loops.md) explains.
 
-A plain `let`, with no `else`, takes only a pattern that matches every value,
-such as a tuple or a record. Anything else is an error that names a value it
-would miss:
+A plain `let` accepts only an irrefutable pattern: one that matches every
+value of its type, such as a tuple pattern or a record pattern. For any other
+pattern, the compiler reports a value that the pattern doesn't match:
 
 <!-- error: this pattern does not match 'None' -->
 ```kotlin

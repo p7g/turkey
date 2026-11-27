@@ -1,17 +1,22 @@
 # Loops and collections
 
-`for x in xs` runs once for each element of anything iterable: an array, a
-`Vec`, a `Map`, a range of numbers, or the code points of a string, through
-`String.codePoints(s)`. Its pattern can take each element apart, as
-`(word, n)` does a map's entries.
+`for x in xs` iterates over a collection. It works on arrays, `Vec`s, `Map`s,
+ranges of integers and every other iterable type.
 
-An array literal such as `[]` is an `Array`, a `Vec` or a `FrozenArray`,
-decided by how its value is used. An `Array` has a fixed length and a `Vec`
-grows: `Vec.push(long, word)` needs a `Vec`, so `long` is one, and `words`,
-which nothing decides, defaults to an `Array`. A `Map` is indexed
-by its keys, and `Map.get` returns an `Option`, since a key may be missing.
+The loop variable can be a pattern. `for (word, n) in counts` destructures
+each entry of the map into its key and its value.
 
-`continue` goes on to the next element and `break` leaves the loop.
+`continue` skips to the next iteration, and `break` exits the loop.
+
+Turkey has three array types. An `Array` has a fixed length, a `Vec` is
+growable, and a `FrozenArray` is immutable. You write all three with the same
+literal, `[...]`, and the compiler infers which one you mean from how you use
+the value. The program passes `long` to `Vec.push`, so `long` is a `Vec`.
+Nothing constrains `words`, so it defaults to an `Array`.
+
+A `Map` is a hash map. Index it with a key to read or assign an entry, as in
+`counts[word] = ...`. `Map.get` returns an `Option`, because the key may be
+missing. Iterating over a map yields its entries in insertion order.
 
 <!-- run -->
 ```kotlin
@@ -52,11 +57,12 @@ other: 1
 55
 ```
 
-A map's entries come out in the order their keys were first added.
-`Int.range(1, 11)` is the numbers from 1 up to 10: the end is left out.
+`Int.range(1, 11)` is the integers from 1 to 10: the end of a range is
+exclusive.
 
-`loop` runs until a `break`, and it is the one loop with a value, which
-`break` gives it:
+`loop` repeats until a `break`. It is the only loop with a value:
+`break value` exits the loop, and `value` becomes the value of the `loop`
+expression.
 
 <!-- run -->
 ```kotlin

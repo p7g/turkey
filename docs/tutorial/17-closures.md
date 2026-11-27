@@ -1,15 +1,20 @@
 # Closures and tail calls
 
-A lambda can use the variables around it, and it captures them by reference,
-not by copying. `makeCounter` returns a lambda that assigns its `count`, and
-`count` lives on for as long as the lambda does, so each call sees the last
-one's assignment. Two counters have a `count` each.
+A closure is a function that captures variables from the scope around it.
+Every lambda is a closure. A closure captures variables by reference, not by
+value, so it sees assignments to them and can assign to them itself.
 
-A call is in *tail position* when its result is the function's result, with
-nothing left to do after it. Such a call takes the place of its caller's
-frame, so recursion through tail calls runs in constant stack however deep
-it goes. The same holds for functions that call each other, like `isEven`
-and `isOdd`. `sumTo` goes a hundred million calls deep.
+`makeCounter` returns a closure that increments `count`. `count` lives as long
+as the closure does, so each call continues from the previous one. Every call
+to `makeCounter` creates a new `count`, so `next` and `other` count
+separately.
+
+Turkey eliminates tail calls. A call is in tail position when its result is
+the function's result, with nothing left to do after it. A tail call reuses
+the caller's stack frame, so a function that recurses through tail calls runs
+in constant stack space, as a loop does. This holds for mutually recursive
+functions too, such as `isEven` and `isOdd`. `sumTo` recurses a hundred
+million times without overflowing the stack.
 
 <!-- run -->
 ```kotlin
@@ -45,12 +50,12 @@ fun main() {
 False
 ```
 
-`let _ = next()` calls `next` for what it does and drops the number it
-returns.
+`let _ = next()` calls `next` and discards the result.
 
-A call whose result is still worked on isn't in tail position:
-`n * factorial(n - 1)` has a multiplication left to do, so each call keeps a
-frame until the one it made returns, and its depth is limited by the stack.
+A call isn't in tail position when the function still uses its result.
+`n * factorial(n - 1)` multiplies after the call returns, so every call needs
+its own stack frame, and the depth of the recursion is limited by the size of
+the stack.
 
 ## In the reference
 

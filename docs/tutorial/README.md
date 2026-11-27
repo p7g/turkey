@@ -11,46 +11,92 @@ ends with links to the sections of the reference that state its rules.
 
 ## Writing a lesson
 
-**Keep to one idea, and keep it short.** A lesson is read on a phone beside
-its program, so write a few paragraphs, one program and at most two or three
-more examples. Start it with `# Title`, and end it with
-`## In the reference`, a list of links into `docs/ref/` by heading, or, for
-a lesson about the library rather than the language, `## In the library`, a
-list of links to its modules' pages.
+Write for a programmer who knows another language and is new to Turkey. A
+lesson is a page of a language tour, not a section of the reference. Keep it
+short and direct, and address the reader.
 
-**Make the first `run` example the program.** It goes in the page's editor,
-and the `text` fence after it is shown as its output until the reader runs
-it. Every other example is shown highlighted, with its recorded output or
-the error it quotes, and the ones that compile alone can be loaded into the
-editor. Write the prose so that it reads with the program beside it, not
-inline.
+### The prose
+
+**Name a thing with the term programmers already use.** Write "a task is a
+lightweight thread", not "a task is a function that runs concurrently with
+the code that started it". When Turkey has its own name for something, give
+the familiar term beside it the first time: "a variant type is a sum type".
+
+**Make the programmer the subject, or write an instruction.** Write "to
+start a task, pass a function to `spawn`" and "you can only start tasks
+inside `runScope`". Don't write "a task only starts inside `runScope`" or
+"`spawn` is sequenced with `?`".
+
+**Use the field's standard vocabulary, and don't invent phrasing.** Write
+"access to shared data must be synchronized", not "tasks that change shared
+data need to take turns". Write "applies a function to each element in
+parallel", not "spreads a function over an array". Write "mutex", not
+"guards a value".
+
+**Explain the concept first, then show how to do it.** Say what the concept
+is, briefly and in plain terms, before you name the functions or the syntax.
+Explain structured concurrency (every task belongs to a scope and can't
+outlive it) before you show `runScope` and `spawn`.
+
+**Teach the language, not the library.** A library function can appear in a
+program without the prose documenting it. Concurrency is the exception:
+tasks are central to the runtime, so `runScope` and `spawn` belong in the
+prose.
+
+**Leave out implementation and target details.** How one target schedules
+tasks belongs where that target is documented.
+
+**Don't compare Turkey with other languages.** Use common vocabulary, but
+don't write "unlike Java" or add a "Coming from Rust" note.
+
+**Write short sentences with one idea each.** Define a term in the sentence
+that first uses it. If a lesson needs a term from a later lesson, link to
+that lesson.
+
+**Name the code you mean.** The program is beside the prose on a wide screen
+and below it on a narrow one. Name the function, or quote the line, that a
+sentence is about.
+
+### The page
+
+**Keep to one idea, and keep it short.** Write a few paragraphs, one program
+and at most two or three more examples. Start the lesson with `# Title`. End
+it with `## In the reference`, a list of links to headings in `docs/ref/`.
+For a lesson about the library, end it with `## In the library` instead, a
+list of links to the pages of its modules.
+
+**Make the first `run` example the program.** The page puts it in the
+editor, and shows the `text` fence after it as the output until the reader
+runs it. The page shows every other example highlighted, with its recorded
+output or the error it quotes. The reader can load the ones that compile
+alone into the editor.
 
 **Give every `kotlin` fence a directive**, from the list in
 [`docs/ref/README.md`](../ref/README.md#for-maintainers).
-`sh scripts/test.sh docs/tutorial` runs them as it runs the reference's,
-and the `run` and `panic` examples also run with `--target wasm32-wasi`,
-since that is what the browser runs. `<!-- skip: wasm32-wasi: REASON -->`,
-on the line before an example's directive, skips it there, and the page
-shows that program with its recorded output and the reason, with Run turned
-off. A program with
-`module` files is shown the same way, since the browser compiles one file.
+`sh scripts/test.sh docs/tutorial` runs the examples as it runs the
+reference's. It also runs the `run` and `panic` examples with
+`--target wasm32-wasi`, because that is what the browser runs. To skip an
+example there, write `<!-- skip: wasm32-wasi: REASON -->` on the line before
+its directive. The page then shows the program with its recorded output and
+the reason, and turns Run off. It shows a program with `module` files the
+same way, because the browser compiles one file.
 
-**Write the programs as `turkey format` does.** The page's Format button
-would otherwise change a lesson's program, and the site's build refuses a
-lesson whose examples it would change.
+**Format the programs with `turkey format`.** The page's Format button would
+otherwise change a lesson's program, and the site's build rejects a lesson
+whose examples the formatter would change.
 
-**Write idiomatic examples**, by the rules in the repository's
-`CLAUDE.md`: `let` or a parameter pattern rather than a one-armed `match`,
-`if let` rather than a `match` whose other arm does nothing, `for ... in`
-rather than an index loop, `[]` rather than `Array.new`, and annotations
-only where they explain an interface.
+**Write idiomatic examples**, by the rules in the repository's `CLAUDE.md`.
+Use `let` or a parameter pattern instead of a one-armed `match`, `if let`
+instead of a `match` whose other arm does nothing, `for ... in` instead of
+an index loop, and `[]` instead of `Array.new`. Annotate only where the
+annotation documents an interface.
 
 **Link to a heading in `docs/ref/`** (`../ref/types.md#records`), to
 another lesson (`06-records.md`), or to a library module's page
 (`https://p7g.github.io/turkey/System.Task.html`). The site's build checks
-each link, by GitHub's rule for a heading's anchor, and fails on a link to a
-heading or module that does not exist. Don't use tables, since the renderer
-does not draw them.
+every link, by GitHub's rule for a heading's anchor, and fails on a link to
+a heading or a module that doesn't exist. Don't use tables, because the
+renderer doesn't draw them.
 
 ## Building the pages
 

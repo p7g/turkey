@@ -1,16 +1,18 @@
 # Strings and method calls
 
-A string literal takes holes: `"${n} items"` puts `show(n)` where the hole
-is. Any value with a `Show` instance can go in one, and a string goes in as
-it is, without quotes.
+String literals support interpolation. `"${n} items"` evaluates `n`, converts
+it to a string with `show`, and inserts the result. You can interpolate any
+value that you can `print`. A string is inserted as it is, without quotes.
 
-`x.f(args)` calls the function `f` of the module that declares `x`'s type,
-with `x` first. `item.trim()` is `String.trim(item)`, and calls chain left to
-right.
+To write a multi-line string, start it with `"""` at the end of a line and end
+it with `"""` on a line of its own. The indentation of the closing `"""` is
+stripped from every line, so you can indent the string with the code around
+it.
 
-A string that starts with `"""` at the end of a line runs to a `"""` on a
-line of its own, and the indentation before that closing line is not part of
-the text.
+You can call a function with method syntax. `x.f(args)` calls the function `f`
+from the module that declares the type of `x`, and passes `x` as the first
+argument. So `item.trim()` is the same call as `String.trim(item)`. Method
+calls chain from left to right.
 
 <!-- run -->
 ```kotlin
@@ -36,11 +38,12 @@ Order:
   apples + pears + figs
 ```
 
-`print(fruits)` shows the strings in quotes. A collection shows each element
-as Turkey would write it, so `["a,b"]` and `["a", "b"]` can't print alike.
+`print(fruits)` prints the strings in quotes. `print` writes the elements of a
+collection as literals, so `["a,b"]` and `["a", "b"]` print differently.
 
-A string is UTF-8, and it has no `len` and no index: "length" could mean
-bytes, code points or what a reader sees, so each has its own function.
+Strings are UTF-8. You can't index a string or take its `len`, because the
+length of a string could mean bytes, code points or visible characters. Call
+the function that counts what you mean:
 
 <!-- run -->
 ```kotlin

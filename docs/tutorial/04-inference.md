@@ -1,15 +1,22 @@
 # Types you don't write
 
-The programs so far have no type annotations, and every one of them is
-checked. The compiler infers each function's *principal type*: the most
-general type it can have. `twice` works for any function from a type to
-itself, so the one `twice` adds 3 to a number twice and puts two `!` on a
-string.
+Turkey is statically typed, and yet the programs so far have no type
+annotations. The compiler infers the type of every variable and function, and
+type-checks the program with them.
 
-Reading a field doesn't fix the record's type either. `area` reads `width`
-and `height`, so it takes any record that has both fields, as long as the
-two can be multiplied: a `Room` measured in `Int`s and a `Poster` measured in
-`Float`s.
+The compiler infers the most general type that a function's body allows,
+called its *principal type*. `twice` calls `f` on `x` and again on the result,
+so `f` must return the type it takes. The body requires nothing else, so
+`twice` is generic: the program calls it with a function on `Int`s and with a
+function on `String`s.
+
+Field access is generic too. `area` multiplies the fields `width` and
+`height`, so it accepts any record type that has both, as long as they have
+the same type and that type supports `*`. `Room` has `Int` fields and `Poster`
+has `Float` fields, and `area` accepts both.
+
+Records are still nominally typed. `Room` and `Poster` are distinct types, and
+`area` accepts each one because its declaration has the two fields.
 
 <!-- run -->
 ```kotlin
@@ -35,13 +42,10 @@ fun main() {
 hey!!
 ```
 
-Records are still nominal: `area` accepts a type because its declaration has
-those fields, not because a value happens to have them.
-
-An annotation is never needed for a program to be checked, except in a few
-places the reference lists. Write one where it explains an interface, such as
-a function other modules call. It is checked, so it can't drift from the
-code:
+You can annotate a parameter with `: Type` and a function's result with
+`-> Type`. Annotations are almost always optional. Add them where they
+document an interface, such as a function that other modules call. The
+compiler checks every annotation, so it can't go out of date.
 
 <!-- run -->
 ```kotlin
@@ -56,8 +60,9 @@ fun main() {
 2.5
 ```
 
-One place an annotation is needed: an empty array whose element type
-nothing decides. Printing it would need to know how to show its elements.
+Occasionally the compiler can't infer a type, and asks for an annotation. An
+empty array literal is one case: `print` needs the element type to print the
+array, and nothing in the program determines it.
 
 <!-- error: add a type annotation -->
 ```kotlin
@@ -66,7 +71,8 @@ fun main() {
 }
 ```
 
-`print([] : Array Int)` prints `[]`.
+`print([] : Array Int)` compiles, and prints `[]`. The reference lists the
+other places that need an annotation.
 
 ## In the reference
 

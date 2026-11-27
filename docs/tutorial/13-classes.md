@@ -1,12 +1,16 @@
 # Type classes
 
-A class names operations that many types can have. Its body lists method
-signatures, and an instance gives them for one type. A method is called like
-any function, and the argument's type picks the instance.
+A type class is an interface: a set of method signatures. A type implements a
+class with an `instance` declaration, which defines the methods for that type.
 
-An instance can depend on others: `Describe (Array a) : Describe a` declares
-that an array can be described whenever its elements can, so one instance
-covers arrays of anything describable.
+Call a method like any other function. The compiler selects the instance from
+the type of the argument, so `describe(Dog { name = "Rex" })` calls the
+`describe` in `instance Describe Dog`.
+
+An instance can be generic, with constraints on its type parameters.
+`instance Describe (Array a) : Describe a` implements `Describe` for an array
+of any type `a` that implements `Describe`. That one instance covers arrays of
+dogs, arrays of `Bool`s, and arrays of arrays.
 
 <!-- run -->
 ```kotlin
@@ -41,9 +45,10 @@ Rex the dog
 [[Rex the dog], [Fido the dog]]
 ```
 
-Operators are class methods too: `a + b` is `add(a, b)`, from the class
-`Add`, and `==` and `<` come from `Eq` and `Ord`. So `+` works on a type of
-your own once it has an instance, and `show` decides how `print` writes it:
+Operators are class methods. `a + b` calls `add(a, b)` from the class `Add`,
+and `==` and `<` come from `Eq` and `Ord`. To overload an operator for your
+own type, implement its class. Implement `Show` to control how `print` writes
+a value:
 
 <!-- run -->
 ```kotlin
@@ -67,9 +72,11 @@ fun main() {
 $15.00
 ```
 
-A function that uses a class on a type it doesn't know gets the class as a
-constraint on its type, inferred or written in brackets:
-`fun total[Add a](xs : Array a, zero : a) -> a`.
+A generic function can require its type parameters to implement a class. Write
+the constraint in brackets after the function's name:
+`fun total[Add a](xs : Array a, zero : a) -> a` accepts an array of any type
+`a` that implements `Add`. If you leave out the annotations, the compiler
+infers the constraint.
 
 ## In the reference
 

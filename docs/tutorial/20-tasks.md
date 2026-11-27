@@ -1,17 +1,24 @@
 # Tasks
 
-A task is a function that runs concurrently with the code that started it.
-Tasks come from the library, `System.Task`, not from the language.
+A task is a lightweight thread managed by Turkey's runtime. Tasks are provided
+by a library module, `System.Task`, not by the language's syntax.
 
-`spawn(f)` starts `f` as a task, and `join(task)` waits for its result. A
-task only starts inside `runScope`, which waits for every task started in it
-before it returns, so no task outlives the scope that started it. `spawn` is
-sequenced with `?`, in a `do` block that `runScope` runs.
+Concurrency in Turkey is structured. Every task belongs to a scope, and a
+scope ends only when all its tasks have finished, so a task can't outlive the
+scope that started it.
 
-`System.Parallel.map` spreads a function over an array's elements, and
-returns the results in order. Tasks that change shared data need to take
-turns: `System.Sync.mutex` guards a value, and `Sync.update` changes it while
-holding the lock.
+`runScope` creates a scope, and you can only start tasks inside one. To start
+a task, pass a function to `spawn`. `join` waits for a task and returns its
+result.
+
+Pass `runScope` a `do` block. Inside the block, write `?` after each `spawn`
+to get the task it started, and end with `pure(x)` to make `x` the result of
+`runScope`. `runScope` returns once every task in the scope has finished.
+
+Tasks share memory, so access to shared data must be synchronized.
+`System.Sync` provides the primitives, such as the mutex in the program.
+
+Scheduling is cooperative: a task runs until it waits or finishes.
 
 <!-- run -->
 ```kotlin
@@ -51,11 +58,6 @@ fun main() {
 [10, 20, 30, 40]
 11
 ```
-
-Scheduling is cooperative: a task runs until it waits, in `join` or on a
-lock, or finishes. In the browser every task runs on one thread, so they
-take turns. A program built with `turkey build` runs them on a worker per
-core.
 
 ## In the library
 

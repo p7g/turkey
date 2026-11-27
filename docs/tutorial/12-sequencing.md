@@ -1,13 +1,26 @@
 # `?` beyond errors
 
-`?` is not an early return, and nothing about it is specific to errors. It
-hands the rest of the block, as a function, to the `bind` method of the
-value's `Monad` instance, and `bind` decides what happens next. `Option`'s
-and `Either`'s stop at the first failure. `Array`'s runs the rest of the
-block once for each element, and joins what each run returns.
+In the last lesson, `?` looked like an early return. It is more general than
+that: `?` works on any monad, and `Either` is one of several.
 
-So `outfits` runs its last line once for every shirt and every pair of
-trousers, with no loop written:
+A monad is a type with a `bind` method. `bind` takes a value of the type and a
+function, and decides how to apply the function to what the value holds. `e?`
+calls `bind` with `e` and, as the function, the rest of the block:
+
+* `Option` and `Either` short-circuit. Their `bind` runs the rest of the block
+  on the value in a `Some` or a `Right`, and returns a `None` or a `Left`
+  without running it.
+* `Array` iterates. Its `bind` runs the rest of the block once for each
+  element, and concatenates the results.
+
+`outfits` uses `?` on two arrays, so its last line runs once for each
+combination of a shirt and a pair of trousers, as it would inside two nested
+loops.
+
+A block that uses `?` evaluates to what `bind` returns, so it must end with a
+value of the same monad. `outfits` ends with an array, and returns an array.
+To use `?` in a function that returns something else, put it in a `do` block,
+as `main` does with two `Option`s.
 
 <!-- run -->
 ```kotlin
@@ -38,12 +51,11 @@ blue with shorts
 Some(42)
 ```
 
-A function whose body has a `?` returns what `bind` returns, so its result is
-monadic. `do { ... }` makes a block of its own for `?`, inside a function
-that returns something else.
-
-A type of your own becomes a monad with three instances. `Logged` carries
-log lines beside its value, and its `bind` joins each step's lines:
+To make your own type a monad, implement the classes `Functor`, `Applicative`
+and `Monad` for it. [Type classes](13-classes.md) explains instances. `Logged`
+pairs a value with log lines. Its `bind` runs the rest of the block and
+appends the lines that the rest logged. `pure(x)` wraps a plain value in the
+monad: for `Logged`, that is `x` with an empty log.
 
 <!-- run -->
 ```kotlin

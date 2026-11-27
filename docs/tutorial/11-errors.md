@@ -1,13 +1,23 @@
 # Errors as values: `throw` and `?`
 
-A function that can fail returns an `Either`. `e?` takes the value out of a
-`Right` and goes on, or makes the whole block's result the `Left` it found,
-so a chain of steps that can each fail reads as a straight line.
+Errors in Turkey are values. A function that can fail returns an `Either`: a
+`Right` with its result, or a `Left` with an error.
 
-`?` never converts an error, so every `Left` in one block has the same type.
-When failures come from different places, that type is `SomeError`, which
-holds any value with an `Error` instance. `throw(e)` returns a `Left` holding
-`e` as a `SomeError`, and `Error.describe` reads its message.
+The `?` operator propagates errors. `e?` evaluates to the value in a `Right`.
+If `e` is a `Left`, the rest of the function doesn't run, and the function
+returns that `Left`. With `?`, a sequence of calls that can fail reads as
+straight-line code.
+
+`?` doesn't convert errors, so every error that a function propagates must
+have the same type. When a function can fail with errors of different types,
+use `SomeError`. A `SomeError` holds a value of any type that implements the
+`Error` class. To implement `Error` for a type, define `message` in an
+`instance` declaration, as the program does for `NotANumber` and `OutOfRange`.
+[Type classes](13-classes.md) explains classes and instances.
+
+`throw(e)` wraps `e` in a `SomeError` and returns it in a `Left`. `throw` is
+an ordinary function and doesn't exit its caller, which is why `percent`
+writes `return throw(...)`. `Error.describe` returns an error's message.
 
 <!-- run -->
 ```kotlin
@@ -46,13 +56,16 @@ error: out of range: 140
 error: not a number: loud
 ```
 
-The last line of a block with a `?` is its result, and it is not wrapped for
-you: `percent` ends with `Right(n)`, not `n`.
+`?` doesn't wrap the result for you. A function that uses `?` must still end
+with an `Either`: `percent` ends with `Right(n)`, not `n`.
 
-`Error.context(err, e)` wraps an error in another without losing it, and
-`Error.describe` reads the whole chain, outermost first. `Either.mapLeft`
-applies `Error.context` to the error of a call that failed, and leaves a
-`Right` as it is:
+You can add context to an error as it propagates. `Error.context(err, e)`
+wraps `err` in the new error `e` without discarding it, and `Error.describe`
+returns the messages of the whole chain, outermost first.
+
+In the example, `volume` calls `Either.mapLeft`, which applies a function to
+the error in a `Left` and returns a `Right` unchanged. Here the function is
+`Error.context(_, Setting { name = "volume" })`, which adds the context:
 
 <!-- run -->
 ```kotlin

@@ -37,8 +37,10 @@ import Time.Duration (Duration)
 import Time.Duration as Duration
 import Time.Stopwatch as Stopwatch
 import Turkey.Diag as Diag
+import Turkey.MethodCalls as MethodCalls
 import Turkey.Format as Format
 import Turkey.Format (Outcome(..))
+import Turkey.Highlight as Highlight
 import Turkey.Directives as Directives
 import Turkey.Source as Source
 import Turkey.Source (Source(..))
@@ -55,7 +57,6 @@ import Turkey.Classes as Classes
 import Turkey.Solved as Solved
 import Turkey.Constraints as Constraints
 import Turkey.Typed as Typed
-import Turkey.Exhaustive as Exhaustive
 import Turkey.PrimTypes as PrimTypes
 import Turkey.Prims as Prims
 import Turkey.Inert as Inert
@@ -115,6 +116,7 @@ import Turkey.Ast (
 	ClassDecl(..),
 	ForeignLibrary(..),
 	LibraryKind(..),
+	TypeKind(..),
 	patternVars,
 )
 import Turkey.Libraries as Libraries
@@ -310,15 +312,16 @@ type Sink = Sink { to : Destination, format : Format, name : String }
 fun main() {
 	let p = Args.parser(Env.args())
 	let building = match Args.next(p) {
-		Right(Some(Value("check")))  -> False
-		Right(Some(Value("build")))  -> True
-		Right(Some(Value("doc")))    -> return doc(p)
-		Right(Some(Value("format"))) -> return format(p)
+		Right(Some(Value("check")))     -> False
+		Right(Some(Value("build")))     -> True
+		Right(Some(Value("doc")))       -> return doc(p)
+		Right(Some(Value("format")))    -> return format(p)
+		Right(Some(Value("highlight"))) -> return highlight(p)
 		Right(Some(Value(other))) -> die(
 			"unknown command '"
 				+ other
 				+ "'; the commands are 'check', "
-				+ "'build', 'doc' and 'format'",
+				+ "'build', 'doc', 'format' and 'highlight'",
 		)
 		_ -> usage()
 	}
@@ -349,6 +352,15 @@ fun main() {
 							"unknown target '" + name + "'; supported: " + Target.spellings(),
 						)
 					}
+				}
+				Long("diagnostics") -> match valueOf(p) {
+					"text" -> {}
+					"json" -> Diag.writeJSON()
+					other -> die(
+						"unknown diagnostics format '"
+							+ other
+							+ "'; the formats are 'text' and 'json'",
+					)
 				}
 				Long("timings") -> {
 					timings = True
@@ -676,7 +688,7 @@ fun formatFile(path : String, checking : Bool, unparsed : Int) -> Int {
 			if text == source.text { return 0 }
 			if !checking {
 				if let Left(e) = File.writeText(path, text) {
-					toStderr("turkey: cannot write '" + path + "': " + message(e) + "\n")
+					toStderr("turkey: cannot write '" + path + "': " + Error.describe(e) + "\n")
 					return 13
 				}
 			}
@@ -730,6 +742,45 @@ fun formatInput(name : String, checking : Bool) -> Unit {
 	}
 }
 
+-- `turkey highlight FILE` writes FILE as an HTML fragment that reads as FILE
+-- does, every character escaped and every token and comment in a span whose
+-- class names its group (`Turkey.Highlight`). `turkey highlight -` reads
+-- standard input instead. It neither parses nor checks the text, so only a
+-- file it cannot read or that is not UTF-8 fails, with status 2. The page that
+-- shows the fragment supplies the colours, as the doc site's style sheet does.
+fun highlight(p : Args.Parser) -> Unit {
+	let paths = []
+	loop {
+		match Args.next(p) {
+			Left(message)            -> die(message)
+			Right(None)              -> break
+			Right(Some(Value(path))) -> Vec.push(paths, path)
+			Right(Some(arg))         -> die(Args.unexpected(arg))
+		}
+	}
+	if len(paths) != 1 { die(highlightSynopsis) }
+	let text = if paths[0] == "-" {
+		let bytes = match IO.readAll(IO.stdin()) {
+			Right(b) -> b
+			Left(e)  -> die("cannot read standard input: " + message(e))
+		}
+		match String.fromBytes(bytes) {
+			Some(t) -> t
+			None    -> die("standard input is not valid UTF-8")
+		}
+	} else {
+		readOrDie(paths[0]).text
+	}
+	if let Left(e) = IO.writeText(IO.stdout(), Highlight.html(text)) {
+		die("cannot write standard output: " + message(e))
+	}
+	if let Left(e) = IO.flush(IO.stdout()) {
+		die("cannot write standard output: " + message(e))
+	}
+}
+
+let highlightSynopsis = "usage: turkey highlight FILE\n       turkey highlight -"
+
 -- `turkey doc [--html DIR] FILE...`: checks the modules the files hold, as one
 -- program, and writes what each exports: as one JSON document on standard
 -- output, or with `--html` as the files of a website in `DIR`, the JSON
@@ -760,7 +811,7 @@ fun doc(p : Args.Parser) -> Unit {
 	var directory = None
 	let names = []
 	for path in paths {
-		if let Left(e) = File.metadata(path) { die(message(e)) }
+		if let Left(e) = File.metadata(path) { die(Error.describe(e)) }
 		let (root, name) = moduleNamed(path, library)
 		if root != library {
 			match directory {
@@ -845,9 +896,9 @@ fun doc(p : Args.Parser) -> Unit {
 -- Writes each of `files`, a path relative to `dir` and its contents, under
 -- `dir`, creating `dir` first if it is not there.
 fun writeSite(dir : String, files : Vec (String, String)) -> Unit {
-	if let Left(e) = File.createDirAll(dir) { die(message(e)) }
+	if let Left(e) = File.createDirAll(dir) { die(Error.describe(e)) }
 	for (path, text) in files {
-		if let Left(e) = File.writeText(dir + "/" + path, text) { die(message(e)) }
+		if let Left(e) = File.writeText(dir + "/" + path, text) { die(Error.describe(e)) }
 	}
 }
 
@@ -945,8 +996,8 @@ fun writeExecutable(path : String, bytes : IO.Buffer) -> Unit {
 		let _ = File.close(out)
 		die(message(e))
 	}
-	if let Left(e) = File.close(out) { die(message(e)) }
-	if let Left(e) = File.rename(partial, path) { die(message(e)) }
+	if let Left(e) = File.close(out) { die(Error.describe(e)) }
+	if let Left(e) = File.rename(partial, path) { die(Error.describe(e)) }
 	Diag.keepOnExit(partial)
 }
 
@@ -964,9 +1015,13 @@ fun createPartial(stem : String, n : Int, executable : Bool) -> (String, File.Fi
 	}
 	match made {
 		Right(out) -> (candidate, out)
-		Left(e) -> match e.kind {
-			IO.AlreadyExists -> createPartial(stem, n + 1, executable)
-			_                -> die(message(e))
+		Left(e) -> match Error.find(e) : Option IO.IOError {
+			Some(IO.IOError { kind = IO.AlreadyExists, .. }) -> createPartial(
+				stem,
+				n + 1,
+				executable,
+			)
+			_ -> die(Error.describe(e))
 		}
 	}
 }
@@ -1001,12 +1056,12 @@ fun finishAssembly(pending : Pending) -> Unit {
 	}
 	-- `die` removes the partial file, once: removing it here as well could
 	-- remove another build's, made under the same name in between.
-	if let Left(e) = File.close(out) { die(message(e)) }
+	if let Left(e) = File.close(out) { die(Error.describe(e)) }
 	-- A rename, so the file at `path` is replaced, not written through: a
 	-- symbolic link there becomes a regular file, and the file's mode is the
 	-- partial's, whatever the replaced file's was. An executable written over
 	-- another is replaced the same way.
-	if let Left(e) = File.rename(partial, pending.path) { die(message(e)) }
+	if let Left(e) = File.rename(partial, pending.path) { die(Error.describe(e)) }
 	Diag.keepOnExit(partial)
 }
 
@@ -1040,45 +1095,50 @@ fun compile(
 	at = lap("lower", at)
 	Lint.report(lint(checked))
 	at = lap("lint", at)
+	-- Nothing after the lint reads the type table or the typed statements,
+	-- which are much of the heap. Keep only what the later passes read, so
+	-- that the collector can free the rest.
+	let front = frontOf(checked)
+	let files = Position.files(checked.files)
 	if wants("core") {
-		String.push(b, Core.showProgram(program, Some(entry.name), slotNames(checked)))
+		String.push(b, Core.showProgram(program, Some(entry.name), slotNames(front.classes)))
 	}
 	write(String.drain(b))
 	if through("core") { return }
 	let main = Map.getOr(entry.scope.values, "main", "main")
-	let specialized = monomorphized(checked, main, program)
+	let specialized = monomorphized(front, main, program)
 	at = lap("mono", at)
-	if wants("mono") { dumpMono(b, checked, entry, specialized) }
+	if wants("mono") { dumpMono(b, front.classes, entry, specialized) }
 	if through("mono") { return }
-	let optimized = optimize(checked, main, specialized)
+	let optimized = optimize(front, main, specialized)
 	at = lap("opt", at)
 	if wants("opt") {
-		String.push(b, Core.showProgram(optimized, Some(entry.name), slotNames(checked)))
+		String.push(b, Core.showProgram(optimized, Some(entry.name), slotNames(front.classes)))
 	}
 	write(String.drain(b))
 	if through("opt") { return }
-	let files = Position.files(checked.files)
-	let (module_, skipped) = lowerModule(optimized, checked.decls, checked.classes, files, path)
-	at = lap("ssa", at)
+	let decls = front.decls
+	let (module_, skipped) = lowerModule(optimized, decls, front.classes, files, path)
+	let _ = lap("ssa", at)
 	if wants("ssa") { dumpSsa(b, module_, skipped) }
 	write(String.drain(b))
 	if through("ssa") { return }
 	refuseSkipped(skipped, path)
-	refuseForeignCalls(module_, checked.decls, path)
+	refuseForeignCalls(module_, decls, path)
 	match target.arch {
-		"Arm64" -> compileArm64(
-			b,
-			path,
-			wants,
-			through,
-			listing,
-			sink,
-			checked,
-			entry,
-			module_,
-			files,
-		)
-		"Wasm32" -> compileWasm(b, path, wants, through, sink, checked, main, module_, files)
+		"Arm64" -> {
+			-- With `-g`, the types of the variables, as they are named.
+			-- Nothing asks for a type without it, so the tags are not worked
+			-- out. Worked out here so that the backend is handed `decls`
+			-- and not the class table.
+			let tags = if debugVariables() {
+				SsaLower.tagsOf(decls, Map.keys(front.classes.classes))
+			} else {
+				Map.new()
+			}
+			compileArm64(b, path, wants, through, listing, sink, decls, tags, main, module_, files)
+		}
+		"Wasm32" -> compileWasm(b, path, wants, through, sink, decls, main, module_, files)
 		_        -> die("internal error: no backend for the architecture '" + target.arch + "'")
 	}
 }
@@ -1092,7 +1152,7 @@ fun compileWasm(
 	wants : fun(String) -> Bool,
 	through : fun(String) -> Bool,
 	sink : Option Sink,
-	checked : Checked,
+	decls : Decls.DeclTable,
 	main : String,
 	module_ : SsaLower.Module,
 	files : Position.Files,
@@ -1104,7 +1164,7 @@ fun compileWasm(
 	let program = WasmProgram.build(
 		module_,
 		main,
-		foreignLibraries(checked.decls),
+		foreignLibraries(decls),
 		tracedFiles(files, path),
 		tracedName,
 	)
@@ -1112,6 +1172,7 @@ fun compileWasm(
 	if wants("select") {
 		String.push(b, "; === " + path + "\n")
 		for u in program.refused { String.push(b, "-- refused " + u.name + ": " + u.what + "\n") }
+		for name in program.switching { String.push(b, "-- may switch stacks: " + name + "\n") }
 		String.push(
 			b,
 			"-- selected "
@@ -1120,6 +1181,14 @@ fun compileWasm(
 				+ Int.toString(len(module_.functions))
 				+ " functions\n",
 		)
+		String.push(
+			b,
+			"-- "
+				+ Int.toString(len(program.switching))
+				+ " may switch stacks, with "
+				+ Int.toString(program.resumePoints)
+				+ " resume points\n",
+		)
 		write(String.drain(b))
 	}
 	if through("select") { return }
@@ -1127,13 +1196,10 @@ fun compileWasm(
 	-- runtime has many no small program reaches, so they are counted rather
 	-- than refused.
 	if len(program.refused) > 0 {
-		toStderr(
-			path
-				+ ": warning: "
-				+ Int.toString(len(program.refused))
-				+ " functions use operations the wasm32 backend does not compile yet, "
-				+ "and trap if they are called; '--dump select' lists them\n",
-		)
+		let message = Int.toString(len(program.refused))
+			+ " functions use operations the wasm32 backend does not compile yet, "
+			+ "and trap if they are called; '--dump select' lists them"
+		toStderr(Diag.shown(Diag.warning(message), path))
 	}
 	if let Some(Sink { to, .. }) = sink { sendBytes(to, Vec.toArray(program.bytes)) }
 }
@@ -1151,9 +1217,9 @@ fun foreignLibraries(decls : Decls.DeclTable) -> Map String String {
 }
 
 -- Selection, register allocation, emission and the executable writer for an
--- arm64 target, from the low IR `module_` that `compile` lowered `entry` to.
--- `wants` says whether a dump was asked for, and `through` whether the compile
--- stops at or before a stage.
+-- arm64 target, from the low IR `module_` that `compile` lowered the program
+-- to, whose `main` is the function `main`. `wants` says whether a dump was
+-- asked for, and `through` whether the compile stops at or before a stage.
 fun compileArm64(
 	b : String.Builder,
 	path : String,
@@ -1161,22 +1227,16 @@ fun compileArm64(
 	through : fun(String) -> Bool,
 	listing : Encode.Listing,
 	sink : Option Sink,
-	checked : Checked,
-	entry : Modules.Module,
+	decls : Decls.DeclTable,
+	tags : Map String Int,
+	main : String,
 	module_ : SsaLower.Module,
 	files : Position.Files,
 ) -> Unit {
 	if wants("select") { dumpSelect(b, path, module_) }
 	write(String.drain(b))
 	if through("select") { return }
-	-- With `-g`, the types of the variables, as they are named. Nothing
-	-- asks for a type without it, so the tags are not worked out.
-	let tags = if debugVariables() {
-		SsaLower.tagsOf(checked.decls, Map.keys(checked.classes.classes))
-	} else {
-		Map.new()
-	}
-	let types = DebugTypes.new(checked.decls, tags)
+	let types = DebugTypes.new(decls, tags)
 	-- The listing and the assembly come from one emission, each consumer
 	-- with its own text, since the program's text is too large to emit twice.
 	let outs = []
@@ -1207,7 +1267,7 @@ fun compileArm64(
 				apart  = True
 				render = Stream.print
 			})
-			let _ = emitModule(path, entry, module_, files, types, outs)
+			let _ = emitModule(path, main, module_, files, types, outs)
 		}
 		Some(Sink { to, format = Executable, name }) -> {
 			let assembler = Assembler.new(Encode.isa(), Asm.dialectFor(target))
@@ -1217,7 +1277,7 @@ fun compileArm64(
 				apart  = False
 				render = fun(d, code, t) { Assembler.feed(assembler, code) }
 			})
-			let refused = emitModule(path, entry, module_, files, types, outs)
+			let refused = emitModule(path, main, module_, files, types, outs)
 			-- A function that is not there is a link error at best, and no
 			-- error at all if its callers were refused too.
 			if len(refused) > 0 {
@@ -1232,23 +1292,23 @@ fun compileArm64(
 			let started = Stopwatch.start()
 			let obj = Assembler.finish(assembler)
 			let dialect = Asm.dialectFor(target)
-			let imported = importedLibraries(checked.decls, obj.undefined, dialect)
-			let main = Asm.runtimeFor(dialect, "main")
+			let imported = importedLibraries(decls, obj.undefined, dialect)
+			let entrySymbol = Asm.runtimeFor(dialect, "main")
 			sendBytes(
 				to,
 				match dialect {
 					Asm.MachO -> MachOExecutable.executableFile(
 						obj,
-						main,
+						entrySymbol,
 						name,
 						installNames(imported, path),
 					)
-					Asm.Elf -> ElfExecutable.executableFile(obj, main, sonames(imported))
+					Asm.Elf -> ElfExecutable.executableFile(obj, entrySymbol, sonames(imported))
 				},
 			)
 			let _ = lap("executable", started)
 		}
-		None -> { let _ = emitModule(path, entry, module_, files, types, outs) }
+		None -> { let _ = emitModule(path, main, module_, files, types, outs) }
 	}
 	if wants("positions") {
 		showCoverage(coverage, b)
@@ -1505,7 +1565,13 @@ fun loadSource(source : Source) -> (Vec (Vec Modules.Module), Modules.Module, Bi
 			-- The syntactic checks see the module as written, which
 			-- desugaring rewrites in place.
 			if linting && (!m.library || libraryOwn) {
-				let f = Lint.file(m.file, m.text, m.program)
+				let f = Lint.resolved(
+					m.file,
+					m.text,
+					m.program,
+					binders,
+					Modules.importUses(loader, m),
+				)
 				Lint.claim(f, directives)
 				Lint.runSyntactic(Checks.registry, f)
 			}
@@ -1611,8 +1677,8 @@ fun dumpTypes(b : String.Builder, checked : Checked, entry : Modules.Module) -> 
 -- unchecked is evidence nobody has checked, so it runs the way exhaustiveness
 -- does: always, on every program.
 -- How a dump names a dictionary's slots, which the program holds by position.
-fun slotNames(checked : Checked) -> fun(String, Int) -> String =
-	fun(cls, index) = Classes.slotName(checked.classes, cls, index)
+fun slotNames(classes : Classes.ClassTable) -> fun(String, Int) -> String =
+	fun(cls, index) = Classes.slotName(classes, cls, index)
 
 fun lowered(checked : Checked) -> Core.CProgram {
 	let lowerer = Lower.newLowerer(
@@ -1640,31 +1706,31 @@ fun lowered(checked : Checked) -> Core.CProgram {
 -- every body it copies, so "the copy still typechecks" is the property that a
 -- substitution went wrong would break first. Every copy specialization makes
 -- is given binders of its own, so no id is bound twice here either.
-fun monomorphized(checked : Checked, main : String, program : Core.CProgram) -> Core.CProgram {
+fun monomorphized(front : Front, main : String, program : Core.CProgram) -> Core.CProgram {
 	let specialized = Mono.monomorphize(
 		program,
-		checked.binders,
-		checked.decls,
-		checked.classes,
+		front.binders,
+		front.decls,
+		front.classes,
 		main,
-		roots(checked),
+		roots(front.decls),
 	)
 	Coretc.checkProgram(
-		checked.decls,
-		checked.classes,
+		front.decls,
+		front.classes,
 		specialized,
-		Coretc.globalsOf(checked.env, checked.binders),
+		Coretc.globalsOf(front.env, front.binders),
 	)
 	specialized
 }
 
 fun dumpMono(
 	b : String.Builder,
-	checked : Checked,
+	classes : Classes.ClassTable,
 	entry : Modules.Module,
 	specialized : Core.CProgram,
 ) -> Unit =
-	String.push(b, Core.showProgram(specialized, Some(entry.name), slotNames(checked)))
+	String.push(b, Core.showProgram(specialized, Some(entry.name), slotNames(classes)))
 
 -- And that with the optimizations applied.
 --
@@ -1683,61 +1749,61 @@ fun dumpMono(
 -- What `opt` prints is exactly what the backend is handed: the dump and the
 -- compile both run this one function, so they cannot come to disagree about
 -- the pass order.
-fun optimize(checked : Checked, main : String, specialized : Core.CProgram) -> Core.CProgram {
+fun optimize(front : Front, main : String, specialized : Core.CProgram) -> Core.CProgram {
 	-- Each step's time, for `--timings`, under `opt.`.
 	var at = Stopwatch.start()
-	let first = Opt.reduceProgram(specialized, checked.decls, checked.binders)
+	let first = Opt.reduceProgram(specialized, front.decls, front.binders)
 	at = lap("opt.reduce", at)
 	let discovered = Joins.discover(first)
 	at = lap("opt.joins", at)
-	let second = Opt.reduceProgram(discovered, checked.decls, checked.binders)
+	let second = Opt.reduceProgram(discovered, front.decls, front.binders)
 	at = lap("opt.reduce", at)
 	-- Reachability again, now that the reductions have inlined calls away and
 	-- folded the branches a constant decides: what only they reached is dead.
 	let reduced = Mono.reachable(
 		second,
 		main,
-		roots(checked),
-		checked.decls.definitions,
-		prunable(checked, Giblets.gibletModules(), _),
+		roots(front.decls),
+		front.decls.definitions,
+		prunable(front.library, Giblets.gibletModules(), _),
 	)
 	at = lap("opt.reachable", at)
 	Coretc.checkProgram(
-		checked.decls,
-		checked.classes,
+		front.decls,
+		front.classes,
 		reduced,
-		Coretc.globalsOf(checked.env, checked.binders),
+		Coretc.globalsOf(front.env, front.binders),
 	)
 	at = lap("opt.check", at)
 	-- Family applications reduced before the layouts are decided, since a stuck
 	-- one has no representation and the backend would guess. See
 	-- `Mono.reduceTypes`.
-	let settled = Mono.reduceTypes(reduced, checked.classes)
+	let settled = Mono.reduceTypes(reduced, front.classes)
 	at = lap("opt.types", at)
 	-- What the cap left generic, shared by layout instead of by type. This is
 	-- after the optimizations rather than among them: a copy is the optimized
 	-- body under another name, so there is nothing left to reduce in it.
 	let out = Uncurry.program(
-		Layout.share(settled, checked.binders, checked.decls, checked.classes, main),
-		checked.binders,
+		Layout.share(settled, front.binders, front.decls, front.classes, main),
+		front.binders,
 	)
 	at = lap("opt.share", at)
 	Coretc.checkProgram(
-		checked.decls,
-		checked.classes,
+		front.decls,
+		front.classes,
 		out,
-		Coretc.globalsOf(checked.env, checked.binders),
+		Coretc.globalsOf(front.env, front.binders),
 	)
 	at = lap("opt.check", at)
 	-- After the last check, which is the last pass that reads what the
 	-- coercions grant.
-	let erased = Erase.program(out, checked.binders, checked.classes)
+	let erased = Erase.program(out, front.binders, front.classes)
 	at = lap("opt.erase", at)
 	-- Every layout the backend asks for has to be knowable, and this is the
 	-- program it is handed: erased, so with no coercion in it, and with the
 	-- family applications the coercions decided rewritten.
 	Mono.checkLayouts(erased)
-	let unknown = Layout.unknownLayouts(erased, checked.decls)
+	let unknown = Layout.unknownLayouts(erased, front.decls)
 	if len(unknown) > 0 {
 		Diag.fail(
 			Diag.whole(
@@ -1761,9 +1827,9 @@ fun optimize(checked : Checked, main : String, specialized : Core.CProgram) -> C
 -- whole, for the dumps that show them and for the giblet check, which judges
 -- each function a giblet module defines -- and so does a giblet module a test
 -- names, which comes from the library but is the test's own program.
-fun prunable(checked : Checked, giblets : Set.Set String, b : Core.CBind) -> Bool {
+fun prunable(library : Set.Set String, giblets : Set.Set String, b : Core.CBind) -> Bool {
 	let implementation = String.startsWith(b.module_, "Turkey.")
-	if !implementation && !Set.contains(checked.library, b.module_) { return False }
+	if !implementation && !Set.contains(library, b.module_) { return False }
 	implementation || !Set.contains(giblets, b.module_)
 }
 
@@ -1789,30 +1855,27 @@ fun switchesStacks(m : SsaLower.Module) -> Bool {
 
 -- Besides the `foreign` definitions: a coroutine's start and a worker
 -- thread's, which only the code `Turkey.Emit` writes calls.
-fun roots(checked : Checked) -> Vec String = match target.arch {
+fun roots(decls : Decls.DeclTable) -> Vec String = match target.arch {
 	-- A wasm program has one thread, so no worker thread is ever started and
 	-- nothing enters `workerRun` or ends a worker. Rooting them would keep
 	-- every path a worker takes, and the threads and system calls it makes,
 	-- in a module that cannot import them.
 	"Wasm32" -> {
 		let out = []
-		for name in Mono.runtimeRoots(checked.decls, build.exportRuntime) {
-			let symbol = match Map.get(checked.decls.definitions, name) {
+		for name in Mono.runtimeRoots(decls, build.exportRuntime) {
+			let symbol = match Map.get(decls.definitions, name) {
 				Some(info) -> info.symbol
 				None       -> ""
 			}
 			if symbol != "turkey_worker_ended" { Vec.push(out, name) }
 		}
-		for (name, info) in Map.entries(checked.decls.definitions) {
+		for (name, info) in Map.entries(decls.definitions) {
 			if Array.contains(Rt.wasmReferencedSymbols, info.symbol) { Vec.push(out, name) }
 		}
 		Vec.push(out, Rt.coroutineStart)
 		out
 	}
-	_ -> Vec.append(Mono.runtimeRoots(checked.decls, build.exportRuntime), [
-		Rt.coroutineStart,
-		Rt.workerRun,
-	])
+	_ -> Vec.append(Mono.runtimeRoots(decls, build.exportRuntime), Vec.fromArray(Rt.entryPoints))
 }
 
 -- The Low IR, and the checks on it. Every path that lowers comes through here,
@@ -2039,8 +2102,11 @@ type Made = Made {
 	base      : Asm.Symbol
 	-- Its calls' return addresses and positions, for the trace table.
 	calls : Vec (Asm.Symbol, Int)
-	texts : Array (Option String)
-	cost  : Duration
+	-- Its safepoint maps in the order of their return addresses, for the
+	-- frame table.
+	placed : Vec Frame.SafepointMap
+	texts  : Array (Option String)
+	cost   : Duration
 }
 
 -- Selected function `i`, through the backend. It reads only what selection
@@ -2076,6 +2142,7 @@ fun backendOf(
 			variables  = []
 			base       = Emit.functionEnd(asm.dialect, i)
 			calls      = []
+			placed     = []
 			texts      = []
 			cost       = Stopwatch.elapsed(started)
 		}
@@ -2089,7 +2156,8 @@ fun backendOf(
 			}
 			let emitted = []
 			let calls = []
-			Emit.emitFunc(asm, a.func, a, l, i, debugInfo(), marks, calls, emitted)
+			let placed = []
+			Emit.emitFunc(asm, a.func, a, l, i, debugInfo(), marks, calls, placed, emitted)
 			let (code, inlined, variables) = if debugInfo() {
 				Dwarf.inlinedCalls(
 					asm.dialect,
@@ -2118,6 +2186,7 @@ fun backendOf(
 				variables  = variables
 				base       = base
 				calls      = calls
+				placed     = placed
 				texts      = texts
 				cost       = Stopwatch.elapsed(started)
 			}
@@ -2202,7 +2271,7 @@ type Out = Out {
 -- Answers what the backend refused, which in assembly is only a comment.
 fun emitModule(
 	path : String,
-	entry : Modules.Module,
+	main : String,
 	module_ : SsaLower.Module,
 	files : Position.Files,
 	types : DebugTypes.Types,
@@ -2264,9 +2333,11 @@ fun emitModule(
 	}
 	let lows = Map.new()
 	for low in module_.functions { Map.put(lows, low.name, low) }
-	-- Each function's frame layout is kept: the frame table is one section
-	-- after the code, and its entries are those layouts' safepoint maps.
+	-- Each function's frame layout is kept, and its safepoint maps in the
+	-- order `Emit.emitFunc` placed them: the frame table is one section after
+	-- the code, and its entries are those maps.
 	let layouts = []
+	let placed = []
 	-- With `-g`, each laid-out function's inlined calls and variables, beside
 	-- its layout.
 	let inlinedCalls = []
@@ -2293,7 +2364,7 @@ fun emitModule(
 					for var o = 0; o < len(outs); o = o + 1 {
 						match m.texts[o] {
 							Some(text) -> String.push(outs[o].text, text)
-							None -> outs[o].render(
+							None -> (outs[o].render)(
 								asm.dialect,
 								Vec.slice(m.code, 0, len(m.code)),
 								outs[o].text,
@@ -2302,6 +2373,7 @@ fun emitModule(
 					}
 					flush()
 					Vec.push(layouts, (i, l))
+					Vec.push(placed, (i, m.placed))
 					Vec.push(inlinedCalls, m.inlined)
 					Vec.push(variables, (m.variables, m.base))
 					Vec.push(traced, Trace.Traced {
@@ -2337,7 +2409,7 @@ fun emitModule(
 	-- one row with no line covers them all, rather than the last function's
 	-- last row.
 	if debugInfo() { Vec.push(code, Stream.Loc(0, False)) }
-	Emit.emitEntry(asm, module_, Map.getOr(entry.scope.values, "main", "main"), sites, code)
+	Emit.emitEntry(asm, module_, main, sites, code)
 	-- Each only in a program that needs it: the switch names the runtime's
 	-- record of the running stack, and the start calls a coroutine's start
 	-- and then the switch.
@@ -2350,7 +2422,7 @@ fun emitModule(
 	Emit.emitDefinitions(module_, asm, code)
 	Emit.emitMessages(asm, code)
 	Emit.emitData(module_, asm, sites, code)
-	Emit.emitFrameTable(asm, layouts, code)
+	Emit.emitFrameTable(asm, placed, code)
 	Emit.emitTraceTable(asm, tracedFiles(files, path), traced, tracedName, code)
 	if debugInfo() {
 		-- The end of the code, after everything the text section holds.
@@ -2632,20 +2704,24 @@ fun dumpSelect(b : String.Builder, path : String, module_ : SsaLower.Module) -> 
 	var effFp = 0
 	for f in selected {
 		let p = Regalloc.pressureOf(f)
-		if p.gp > maxGp { maxGp = p.gp }
-		if p.fp > maxFp { maxFp = p.fp }
+		let pGp = Regalloc.inFile(f, p, Arm64.Gp)
+		let pFp = Regalloc.inFile(f, p, Arm64.Fp)
+		if pGp > maxGp { maxGp = pGp }
+		if pFp > maxFp { maxFp = pFp }
 		let e = Regalloc.effectivePressure(f)
-		if e.gp > effGp { effGp = e.gp }
-		if e.fp > effFp { effFp = e.fp }
-		if p.gp > Regalloc.availableGp || p.fp > Regalloc.availableFp {
+		let eGp = Regalloc.inFile(f, e, Arm64.Gp)
+		let eFp = Regalloc.inFile(f, e, Arm64.Fp)
+		if eGp > effGp { effGp = eGp }
+		if eFp > effFp { effFp = eFp }
+		if pGp > Arm64.availableGp || pFp > Arm64.availableFp {
 			String.push(
 				b,
 				"--   over budget  "
 					+ f.name
 					+ "  gp "
-					+ Int.toString(p.gp)
+					+ Int.toString(pGp)
 					+ "  fp "
-					+ Int.toString(p.fp)
+					+ Int.toString(pFp)
 					+ "\n",
 			)
 		}
@@ -2655,11 +2731,11 @@ fun dumpSelect(b : String.Builder, path : String, module_ : SsaLower.Module) -> 
 		"-- pressure  gp "
 			+ Int.toString(maxGp)
 			+ " of "
-			+ Int.toString(Regalloc.availableGp)
+			+ Int.toString(Arm64.availableGp)
 			+ "  fp "
 			+ Int.toString(maxFp)
 			+ " of "
-			+ Int.toString(Regalloc.availableFp)
+			+ Int.toString(Arm64.availableFp)
 			+ "\n",
 	)
 	String.push(
@@ -2667,11 +2743,11 @@ fun dumpSelect(b : String.Builder, path : String, module_ : SsaLower.Module) -> 
 		"-- effective  gp "
 			+ Int.toString(effGp)
 			+ " of "
-			+ Int.toString(Regalloc.availableGp)
+			+ Int.toString(Arm64.availableGp)
 			+ "  fp "
 			+ Int.toString(effFp)
 			+ " of "
-			+ Int.toString(Regalloc.availableFp)
+			+ Int.toString(Arm64.availableFp)
 			+ "\n",
 	)
 	-- Register allocation, and its own verifier. A colouring that puts two
@@ -2780,9 +2856,9 @@ fun dumpSelect(b : String.Builder, path : String, module_ : SsaLower.Module) -> 
 	var untraced = 0
 	var worst = 0
 	for f in selected {
-		let u = Regalloc.untracedPressure(f)
-		if u.gp > untraced { untraced = u.gp }
-		let w = Regalloc.worstCall(f)
+		let u = Regalloc.inFile(f, Regalloc.untracedPressure(f), Arm64.Gp)
+		if u > untraced { untraced = u }
+		let w = Regalloc.inFile(f, Regalloc.worstCall(f), Arm64.Gp)
 		if w > worst { worst = w }
 	}
 	String.push(
@@ -2790,11 +2866,11 @@ fun dumpSelect(b : String.Builder, path : String, module_ : SsaLower.Module) -> 
 		"-- untraced  gp "
 			+ Int.toString(untraced)
 			+ " of "
-			+ Int.toString(Regalloc.availableGp)
+			+ Int.toString(Arm64.availableGp)
 			+ "   worst call site  "
 			+ Int.toString(worst)
 			+ " of "
-			+ Int.toString(Regalloc.calleeSavedGp)
+			+ Int.toString(Arm64.calleeSavedGp)
 			+ "\n",
 	)
 	String.push(
@@ -2881,10 +2957,14 @@ fun dumpSelect(b : String.Builder, path : String, module_ : SsaLower.Module) -> 
 	var acTf = 0
 	for f in selected {
 		let a = Regalloc.acrossCalls(f)
-		if a.untracedGp > acUg { acUg = a.untracedGp }
-		if a.tracedGp > acTg { acTg = a.tracedGp }
-		if a.untracedFp > acUf { acUf = a.untracedFp }
-		if a.tracedFp > acTf { acTf = a.tracedFp }
+		let ug = Regalloc.inFile(f, a.untraced, Arm64.Gp)
+		let tg = Regalloc.inFile(f, a.traced, Arm64.Gp)
+		let uf = Regalloc.inFile(f, a.untraced, Arm64.Fp)
+		let tf = Regalloc.inFile(f, a.traced, Arm64.Fp)
+		if ug > acUg { acUg = ug }
+		if tg > acTg { acTg = tg }
+		if uf > acUf { acUf = uf }
+		if tf > acTf { acTf = tf }
 	}
 	String.push(
 		b,
@@ -2893,13 +2973,13 @@ fun dumpSelect(b : String.Builder, path : String, module_ : SsaLower.Module) -> 
 			+ " untraced + "
 			+ Int.toString(acTg)
 			+ " traced of "
-			+ Int.toString(Regalloc.calleeSavedGp)
+			+ Int.toString(Arm64.calleeSavedGp)
 			+ "  fp "
 			+ Int.toString(acUf)
 			+ " untraced + "
 			+ Int.toString(acTf)
 			+ " traced of "
-			+ Int.toString(Regalloc.calleeSavedFp)
+			+ Int.toString(Arm64.calleeSavedFp)
 			+ "\n",
 	)
 	let counts = Map.new()
@@ -3001,6 +3081,24 @@ type Checked = Checked {
 	files : Vec String
 }
 
+-- The front end's results that the passes after the lint read: `Checked`
+-- without the type table, the typed statements and the files.
+type Front = Front {
+	decls   : Decls.DeclTable
+	classes : Classes.ClassTable
+	env     : Constraints.Env
+	library : Set.Set String
+	binders : Binders.Table
+}
+
+fun frontOf(checked : Checked) -> Front = Front {
+	decls   = checked.decls
+	classes = checked.classes
+	env     = checked.env
+	library = checked.library
+	binders = checked.binders
+}
+
 fun checkProgram(path : String) -> (Checked, Modules.Module) {
 	let (checked, entry, _) = checkSource(readOrDie(path))
 	(checked, entry)
@@ -3025,6 +3123,7 @@ fun checkSource(source : Source) -> (Checked, Modules.Module, Vec (Vec Modules.M
 		files   = []
 	}
 	checked.classes = Classes.newClassTable(checked.decls)
+	let homes = methodHomes(groups, binders, checked.classes)
 	-- A component of modules is checked in one run: their bindings may use
 	-- each other, so they are inferred together.
 	for group in groups {
@@ -3057,6 +3156,7 @@ fun checkSource(source : Source) -> (Checked, Modules.Module, Vec (Vec Modules.M
 				None     -> fallback
 			},
 		)
+		solver.homes = homes
 		let (items, constraint) = Infer.generate(g, programs)
 		-- The generator goes on past an error with a placeholder in its place,
 		-- which a constraint built around it would only report against again.
@@ -3068,13 +3168,294 @@ fun checkSource(source : Source) -> (Checked, Modules.Module, Vec (Vec Modules.M
 		Infer.checkExhaustiveness(g)
 		Diag.stopOnErrors()
 		Evidence.run(checked.classes, solver.uses, g.instanceChecks)
-		for item in items { Vec.push(checked.ordered, item) }
+		for item in Infer.evaluationOrder(g, items) { Vec.push(checked.ordered, item) }
+		Diag.stopOnErrors()
 	}
 	if checkingBinders() { Binders.checkInferred(binders, source.name) }
 	checkMain(entry, checked.env, checked.classes)
 	Diag.stopOnErrors()
 	Diag.stopCollecting()
 	(checked, entry, groups)
+}
+
+-- Where the method calls of a program find their functions
+-- (`Turkey.MethodCalls`). The homes of the library's internal types are
+-- worked out here, once, from what the public library modules export, so
+-- that a type exported by two of them is reported whatever the program
+-- calls.
+fun methodHomes(
+	groups : Vec (Vec Modules.Module),
+	binders : Binders.Table,
+	classes : Classes.ClassTable,
+) -> MethodCalls.Homes {
+	let byName = Map.new()
+	let byFile = Map.new()
+	-- Every type alias, by its internal name, and the head of what it stands
+	-- for.
+	let aliases : Map String String = Map.new()
+	for group in groups {
+		for m in group {
+			Map.put(byName, m.name, m)
+			Map.put(byFile, m.file, m)
+			for d in m.program.decls {
+				if let DType(t) = d {
+					if let Some(body) = t.alias {
+						if let TECon(head, _) = body.kind { Map.put(aliases, t.name, head) }
+					}
+				}
+			}
+		}
+	}
+	let internal = internalHomes(groups, aliases)
+	let caller = fun(where : Option Source.Span) = match where {
+		Some(sp) -> Map.get(byFile, sp.file)
+		None     -> None
+	}
+	MethodCalls.Homes {
+		home = fun(tycon) {
+			if let Some((owner, _)) = String.rsplitOnce(tycon, "#") {
+				if !MethodCalls.isInternal(owner) { return Right(owner) }
+			}
+			match Map.get(internal, tycon) {
+				Some(home) -> Right(home)
+				None       -> Left("no public module exports it")
+			}
+		}
+		lookup = fun(home, label, where) {
+			let m = match Map.get(byName, home) {
+				Some(m) -> m
+				None    -> return None
+			}
+			let own = Prelude.internal(home, label)
+			let target = match caller(where) {
+				Some(c) -> if c.name == home && Map.get(m.scope.values, label) == Some(own) {
+					Some(own)
+				} else {
+					Map.get(m.exports.values, label)
+				}
+				None -> Map.get(m.exports.values, label)
+			}
+			match target {
+				Some(t) -> match Binders.named(binders, t) {
+					Some(id) -> Some((t, id))
+					None     -> None
+				}
+				None -> None
+			}
+		}
+		declares = fun(home, label) = match Map.get(byName, home) {
+			Some(m) -> Map.get(m.scope.values, label) == Some(Prelude.internal(home, label))
+			None    -> False
+		}
+		elsewhere = fun(label, where) {
+			let out = Vec.new(1)
+			if let Some(c) = caller(where) {
+				for (q, modules) in Map.entries(c.scope.qualifiers) {
+					if Iter.any(modules, fun(other) = Map.contains(other.exports.values, label)) {
+						Vec.push(out, q + "." + label)
+					}
+				}
+			}
+			out
+		}
+		refer = fun(node, id) = Binders.record(binders, node, id)
+		classMethod = fun(label, where) {
+			let c = caller(where)?
+			-- Two classes' methods in scope under the name: the call cannot
+			-- choose, as a call by name cannot.
+			if let Some(targets) = Map.get(
+				Modules.conflictsIn(c.scope, Modules.ValueSpace),
+				label,
+			) {
+				let classesOf = Vec.filter(
+					Vec.map(targets, fun(t) = Classes.method(classes, t)),
+					Option.isSome,
+				)
+				if len(classesOf) > 1 {
+					let names = Vec.sort(
+						Vec.map(classesOf, fun(info) = match info {
+							Some(i) -> "'" + Ty.shortName(i.cls) + "'"
+							None    -> ""
+						}),
+					)
+					return Some(
+						Left(
+							"'"
+								+ label
+								+ "' is a method of both "
+								+ String.join(names, " and ")
+								+ "; call it by its class's qualified name",
+						),
+					)
+				}
+			}
+			let target = Map.get(c.scope.values, label)?
+			let info = match Classes.method(classes, target) {
+				Some(info) -> info
+				-- A function of the name hides a class method of it that an
+				-- import brings, as it does from a call by name.
+				None ->
+					if Iter.any(
+						Modules.reachable(c.scope),
+						fun(other) = match Map.get(other.exports.values, label) {
+							Some(t) -> Option.isSome(Classes.method(classes, t))
+							None    -> False
+						},
+					) {
+						let whose = match String.rsplitOnce(target, "#") {
+							Some((owner, _)) -> if owner == c.name {
+								"this module's '" + label + "'"
+							} else {
+								"the imported '" + owner + "." + label + "'"
+							}
+							None -> "'" + label + "'"
+						}
+						return Some(
+							Left(
+								"cannot call the class method '"
+									+ label
+									+ "': "
+									+ whose
+									+ " hides it, as it does from a call by name",
+							),
+						)
+					} else {
+						return None
+					}
+			}
+			if !hasReceiver(info) {
+				let why = if parameterCount(info) == 0 {
+					"it has no parameters"
+				} else {
+					"its first parameter's type is not headed by the class's type variable"
+				}
+				return Some(
+					Left(
+						"the method '"
+							+ label
+							+ "' of class '"
+							+ Ty.shortName(info.cls)
+							+ "' has no receiver: "
+							+ why
+							+ ", so it cannot be called with '.'",
+					),
+				)
+			}
+			let id = Binders.named(binders, target)?
+			Some(Right((target, id)))
+		}
+		spelling = fun(home, label, where) {
+			if let Some(c) = caller(where) {
+				if c.name == home { return label }
+				for (q, modules) in Map.entries(c.scope.qualifiers) {
+					if Iter.any(modules, fun(other) = other.name == home) { return q + "." + label }
+				}
+			}
+			home + "." + label
+		}
+	}
+}
+
+-- Returns how many parameters the class method `info` takes.
+fun parameterCount(info : Classes.MethodInfo) -> Int = match Ty.prune(info.scheme.body) {
+	TFun(params, _) -> len(params)
+	_               -> 0
+}
+
+-- Returns whether the class method `info` has a receiver: a first parameter
+-- whose type is headed by the class's type variable, which a method call's
+-- receiver is then of. `show(a)` and `map(f a, ...)` have one; `pure(a)` and
+-- `zero()` do not.
+fun hasReceiver(info : Classes.MethodInfo) -> Bool {
+	let TFun(params, _) = Ty.prune(info.scheme.body) else { return False }
+	if len(params) == 0 { return False }
+	match Ty.spine(Ty.prune(params[0])).0 {
+		TVar(v) -> v.id == info.classVar.id
+		_       -> False
+	}
+}
+
+-- The home of each type internal to the library that a public library
+-- module exports, by itself or through an alias of it, and has from no other
+-- public module: that module. Reports a type that two of them export so,
+-- since a type has one home.
+fun internalHomes(
+	groups : Vec (Vec Modules.Module),
+	aliases : Map String String,
+) -> Map String String {
+	let byName = Map.new()
+	for group in groups {
+		for m in group { Map.put(byName, m.name, m) }
+	}
+	let isPublic = fun(m : Modules.Module) = m.library && !MethodCalls.isInternal(m.name)
+	-- Each exporter of each internal type, and whether it has the type from
+	-- another public module and so only passes it on, as `Net.HTTP` does its
+	-- parts'.
+	let exporters : Map String (Vec (String, Bool)) = Map.new()
+	for group in groups {
+		for m in group {
+			if !isPublic(m) { continue }
+			for target in Map.values(m.exports.types) {
+				let head = aliasHead(aliases, target)
+				let isInternal = match String.rsplitOnce(head, "#") {
+					Some((owner, _)) -> MethodCalls.isInternal(owner)
+					None             -> True
+				}
+				if !isInternal { continue }
+				let passedOn =
+					Iter.any(Map.values(m.imported), fun(name) = match Map.get(byName, name) {
+						Some(other) -> isPublic(other)
+							&& Iter.any(
+								Map.values(other.exports.types),
+								fun(t) = aliasHead(aliases, t) == head,
+							)
+						None -> False
+					})
+				let entry = (m.name, passedOn)
+				match Map.get(exporters, head) {
+					Some(found) -> if !Iter.any(found, fun((n, _)) = n == m.name) {
+						Vec.push(found, entry)
+					}
+					None -> Map.put(exporters, head, [entry])
+				}
+			}
+		}
+	}
+	let out = Map.new()
+	for (tycon, found) in Map.entries(exporters) {
+		let origins = Vec.filter(found, fun((_, passedOn)) = !passedOn)
+		if len(origins) == 1 {
+			Map.put(out, tycon, origins[0].0)
+		} else {
+			-- None at all is public modules passing the type to each other.
+			let named = if len(origins) == 0 { found } else { origins }
+			Ty.typeError(
+				"the library type '"
+					+ Ty.shortName(tycon)
+					+ "' is exported by "
+					+ String.join(
+						Vec.map(Vec.sort(Vec.map(named, fun((n, _)) = n)), fun(n) = "'" + n + "'"),
+						" and ",
+					)
+					+ (if len(origins) == 0 { ", each from the other" } else { "" })
+					+ "; a type internal to the library can have only one public module",
+				None,
+			)
+		}
+	}
+	out
+}
+
+-- The type constructor the type named `name` is, through any aliases.
+fun aliasHead(aliases : Map String String, name : String) -> String {
+	var at = name
+	for _ in Int.range(0, 16) {
+		match Map.get(aliases, at) {
+			Some(next) -> { at = next }
+			None       -> return at
+		}
+	}
+	at
 }
 
 -- The value constructors a module's scope can name, ambiguous ones included.
@@ -3098,8 +3479,8 @@ fun visibleConstructors(m : Modules.Module) -> Set.Set String {
 -- it -- both of which a reader is entitled to hear about as a type error.
 fun checkMain(entry : Modules.Module, env : Constraints.Env, classes : Classes.ClassTable) -> Unit {
 	for item in entry.program.decls {
-		match item {
-			DStmt(s) -> for name in bindingNames(s) {
+		if let DStmt(s) = item {
+			for name in bindingNames(s) {
 				if name == Prelude.internal(entry.name, "main") {
 					if let Some(binding) = Constraints.lookup_(env, name) {
 						let scheme = reduced(classes, binding.scheme)
@@ -3118,7 +3499,6 @@ fun checkMain(entry : Modules.Module, env : Constraints.Env, classes : Classes.C
 					}
 				}
 			}
-			_ -> {}
 		}
 	}
 }
@@ -3234,9 +3614,11 @@ fun directoryOf(path : String) -> String {
 }
 
 fun readOrDie(path : String) -> Source = match File.readText(path) {
-	Right(text)    -> Source { name = path, text = text }
-	Left(Left(_))  -> die("'" + path + "' is not valid UTF-8")
-	Left(Right(e)) -> die(message(e))
+	Right(text) -> Source { name = path, text = text }
+	Left(e) -> match Error.cast(e) : Option IO.InvalidUTF8 {
+		Some(_) -> die("'" + path + "' is not valid UTF-8")
+		None    -> die(Error.describe(e))
+	}
 }
 
 fun usage() -> a =
@@ -3245,14 +3627,24 @@ fun usage() -> a =
 			+ "       turkey doc [--html DIR] FILE...\n"
 			+ "       turkey format [--check] FILE...\n"
 			+ "       turkey format [--check] [--stdin-name NAME] -\n"
+			+ "       turkey highlight FILE\n"
+			+ "       turkey highlight -\n"
 			+ "       turkey build [OPTIONS] [-o PATH] [-S] [-g] [--debug=lines|full]\n"
 			+ "                    FILE...\n"
 			+ "options: --target TARGET  --dump STAGE,...  --timings  --gc-verify"
 			+ "  --gc-stats  --export-runtime\n"
 			+ "         --allow CHECK,...  --warn CHECK,...  --deny CHECK,...  --deny-warnings\n"
-			+ "         --fix (check only)\n"
+			+ "         --fix (check only)  --diagnostics=text|json\n"
 			+ "stages: "
-			+ String.join(stages, ", "),
+			+ String.join(stages, ", ")
+			+ "\n"
+			+ "--diagnostics=json writes each diagnostic to stderr as one line holding one\n"
+			+ "JSON object: file, line, column, endLine, endColumn, severity ('error' or\n"
+			+ "'warning'), stage, code (the check's name, or null), message and notes, each\n"
+			+ "note with its own file, positions and message. Lines and columns are\n"
+			+ "1-based and count code points, and a span ends before endLine:endColumn.\n"
+			+ "Positions are null for a diagnostic about a whole file. Other stderr lines\n"
+			+ "are not diagnostics.",
 	)
 
 fun die(message : String) -> a {

@@ -1,0 +1,563 @@
+export (unitSpelling, detachedDocComment, needlessEquality)
+
+--- Checks on how code is spelled where two spellings mean one thing, and the
+--- one written says something its author did not mean.
+
+import Data.Set as Set
+import Turkey.Ast (
+	Expr(..),
+	ExprKind(..),
+	Stmt(..),
+	StmtKind(..),
+	Arm(..),
+	Child(..),
+	FunDecl(..),
+	Type(..),
+	TypeKind(..),
+	Pat(..),
+	PatKind(..),
+	Pred(..),
+	PredKind(..),
+	Decl(..),
+	Program(..),
+	ClassDecl(..),
+	InstanceDecl(..),
+	children,
+)
+import Turkey.Lint (File, Finding(..), Fix(..), Edit(..))
+import Turkey.Lint as Lint
+import Turkey.DocComments as DocComments
+import Turkey.DocComments (Run(..))
+import Turkey.Source as Source
+import Turkey.Source (Span(..))
+import Turkey.Token (Comment(..))
+
+-- -- unit-spelling ------------------------------------------------------------------
+--
+-- `{}` and `()` are one value, and the spelling says which the author means:
+-- `{}` is a body that does nothing, `()` is the unit value. So an empty block
+-- whose value is used is spelled `()`. A `match` arm that does nothing is
+-- spelled `{}` when the `match` is a statement and `()` when its value is used.
+--
+-- Whether a value is used is decided by where it is written, never by types or
+-- by the other arms: a rule that read the other arms would flip the spelling
+-- of an arm nobody touched whenever one of them is edited. Where the grammar
+-- asks for a block -- a function body, an `if` branch, a loop body -- `{}` is
+-- always a body, and nothing is reported. The value of a `return` or `break`
+-- is left to `empty-return-value`, so the two never fix the same text.
+
+-- Where an expression is written, as far as its value goes.
+type Place
+	-- A statement, or the last expression of a block: its value is not used.
+	= Statement
+	-- A function's body, written after `=` or as a block.
+	| Body
+	-- A `let`, `var` or assignment's value, an argument, an element of a
+	-- tuple, array or record, or an operand: its value is used.
+	| Used
+	-- The value of a `return` or `break`, which is used, and which
+	-- `empty-return-value` owns when it is `{}` or `()`.
+	| Returned
+
+--- Returns a finding for each empty block whose value is used, and for each
+--- `match` arm whose body is `{}` or `()` and is not spelled as the `match`'s
+--- place asks. Each has a mechanical fix.
+fun unitSpelling(f : File) -> Vec Finding {
+	let out = []
+	Lint.nodes(f, fun(c) {
+		match c {
+			ChStmt(s) -> match s.kind {
+				SLet(_, value)           -> placed(f, value, Used, out)
+				SVar(_, value)           -> placed(f, value, Used, out)
+				SAssign(_, value)        -> placed(f, value, Used, out)
+				SLetElse(_, _, value, _) -> placed(f, value, Used, out)
+				SExpr(e)                 -> placed(f, e, Statement, out)
+				SFun(_)                  -> {}
+			}
+			ChFun(d) -> if let Some(body) = d.body { placed(f, body, Body, out) }
+			ChExpr(e) -> match e.kind {
+				ECall(_, args)     -> for a in args { placed(f, a, Used, out) }
+				EMethod(_, args)   -> for a in args { placed(f, a, Used, out) }
+				ETuple(items)      -> for x in items { placed(f, x, Used, out) }
+				EArray(items)      -> for x in items { placed(f, x, Used, out) }
+				ERecord(_, fields) -> for (_, x) in fields { placed(f, x, Used, out) }
+				EUnary(_, x, _)    -> placed(f, x, Used, out)
+				EBinary(_, a, b, _) -> {
+					placed(f, a, Used, out)
+					placed(f, b, Used, out)
+				}
+				EReturn(Some(x))       -> placed(f, x, Returned, out)
+				EBreak(Some(x))        -> placed(f, x, Returned, out)
+				ELambda(_, _, body, _) -> placed(f, body, Body, out)
+				_                      -> {}
+			}
+			ChArm(_) -> {}
+		}
+		True
+	})
+	out
+}
+
+-- Reports `e`, written at `place`, if it is an empty block whose value is
+-- used, or the arms of `e` if it is a `match`.
+fun placed(f : File, e : Expr, place : Place, out : Vec Finding) -> Unit {
+	match e.kind {
+		EParen(inner) -> placed(f, inner, place, out)
+		EBlock(stmts) -> if len(stmts) == 0 {
+			if let Used = place {
+				respell(
+					f,
+					e,
+					"{}",
+					"()",
+					"this empty block is used as a value, which is the unit value",
+					out,
+				)
+			}
+		}
+		EMatch(_, arms) -> for arm in arms { armPlaced(f, arm, place, out) }
+		_               -> {}
+	}
+}
+
+-- Reports `arm`'s body if it is `{}` or `()` and not as `place`, the place of
+-- its `match`, asks. Any other body is the arm's value, and has the place of
+-- the `match`.
+fun armPlaced(f : File, arm : Arm, place : Place, out : Vec Finding) -> Unit {
+	let body = arm.body
+	let written = match body.kind {
+		EUnit         -> "()"
+		EBlock(stmts) -> if len(stmts) == 0 { "{}" } else { "" }
+		_             -> ""
+	}
+	if written == "" {
+		placed(f, body, if let Body = place { Statement } else { place }, out)
+		return
+	}
+	let (wanted, why) = match place {
+		Statement | Body -> (
+			"{}",
+			"this 'match' is a statement, so an arm that does nothing is an empty body",
+		)
+		Used | Returned -> (
+			"()",
+			"this 'match' is used as a value, so an empty arm is the unit value",
+		)
+	}
+	-- Most arms are spelled as their place asks, and those need no text read.
+	if written != wanted { respell(f, body, written, wanted, why, out) }
+}
+
+-- Reports `e`, if its text is `from` and whitespace, with a fix that writes
+-- `to` in its place. A block holding a comment is empty in the tree but not in
+-- the text, and the comment says why nothing happens, so it is not reported.
+fun respell(
+	f : File,
+	e : Expr,
+	from : String,
+	to : String,
+	why : String,
+	out : Vec Finding,
+) -> Unit {
+	-- A node the parser wrote has an empty span and no text to edit.
+	if Source.isEmpty(e.span) || Source.isGenerated(e.span) { return }
+	if squeezed(Lint.textOf(f, e.span)) != from { return }
+	Vec.push(out, Finding {
+		span    = e.span
+		message = why + "; write '" + to + "'"
+		fix     = Some(Fix { edits = [Edit { span = e.span, text = to }], mechanical = True })
+	})
+}
+
+-- -- detached-doc-comment ---------------------------------------------------------
+--
+-- A `---` comment documents what begins on the line directly after it, and
+-- `turkey doc` drops one that documents nothing without a word, since such a
+-- comment is never an error. Directive lines between a doc comment and its
+-- declaration are passed over (`Turkey.DocComments`), so a doc comment above
+-- `--@expect(...)` above a declaration still documents it.
+
+--- Returns a finding for each run of doc comments that documents nothing:
+--- one not directly above a declaration, constructor, field, class method or
+--- associated type, that is not the module's comment, or that follows code on
+--- its line. Where one blank line is all that parts a run from a declaration,
+--- the fix deletes it, and is mechanical. Elsewhere the fix writes `--` for
+--- `---`, which is not mechanical, since the comment may be meant for the
+--- declaration it missed.
+fun detachedDocComment(f : File) -> Vec Finding {
+	let program = Lint.programOf(f)
+	let all = DocComments.runs(program.comments, Lint.sourceOf(f))
+	if len(all) == 0 { return [] }
+	let targets = DocComments.targets(program)
+	let header = DocComments.moduleRun(all, targets, DocComments.firstDeclLine(program))
+	let blank = Set.fromIterator(program.blankLines)
+	let out = []
+	for r in all {
+		if !r.trailing && Set.contains(targets, r.documents) { continue }
+		if let Some(h) = header {
+			if h.span.line == r.span.line { continue }
+		}
+		let gap = r.span.endLine + 1
+		let joins = !r.trailing
+			&& r.documents == gap
+			&& Set.contains(blank, gap)
+			&& Set.contains(targets, gap + 1)
+		let finding = if joins {
+			Finding {
+				span = r.span
+				message = "this doc comment documents nothing, since a blank line parts it from "
+					+ "the declaration below; remove the blank line"
+				fix = Some(Fix {
+					edits      = [Edit { span = lineSpan(r.span, gap), text = "" }]
+					mechanical = True
+				})
+			}
+		} else {
+			Finding {
+				span = r.span
+				message = "this doc comment documents nothing; move it directly above a "
+					+ "declaration, constructor, field or class method, or write '--' for a "
+					+ "comment"
+				fix = Some(Fix { edits = Vec.map(r.comments, ordinary), mechanical = False })
+			}
+		}
+		Vec.push(out, finding)
+	}
+	out
+}
+
+-- The whole of line `line` of the file `at` is in, with its line break.
+fun lineSpan(at : Span, line : Int) -> Span =
+	Span { line = line, col = 1, endLine = line + 1, endCol = 1, file = at.file, inlined = None }
+
+-- An edit that writes `--` for the `---` that begins `c`.
+fun ordinary(c : Comment) -> Edit {
+	let s = c.span
+	Edit { span = Source.endingAt(s, s.line, s.col + 3), text = "--" }
+}
+
+-- -- needless-equality ------------------------------------------------------------
+--
+-- In `fun freeze[Iterator c, Item c ~ a](xs : c) -> FrozenArray a`, the entry
+-- `Item c ~ a` constrains nothing: `a` is a variable of this signature alone,
+-- in no other entry, so the equality only gives `Item c` a second name, and
+-- `FrozenArray (Item c)` says the same. Where `a` is written more than once,
+-- the name is a real abbreviation, `fun(a) -> a` reads better than `Item c`
+-- twice, and nothing is reported. Nor is it where a type variable of the body
+-- or of an enclosing signature, class or instance is `a`, since those scope
+-- over the signature.
+--
+-- Types are not known at this tier, so `Option x ~ a` is reported as `Item c
+-- ~ a` is: an equality with any type applied to arguments gives that type a
+-- second name.
+
+--- Returns a finding for each equality in a function's context between a
+--- type variable and an applied type, where the variable is in no other
+--- entry, appears at most once in the parameter and result types, and is not
+--- written in the body or bound around the function. The fix deletes the
+--- entry and writes the applied type where the variable was, and is
+--- mechanical.
+fun needlessEquality(f : File) -> Vec Finding {
+	let out = []
+	for d in Lint.programOf(f).decls {
+		match d {
+			DStmt(s) -> nested(f, ChStmt(s), Set.new(), out)
+			DClass(c) -> {
+				let bound = Set.new()
+				Set.add(bound, c.param)
+				for m in c.methods { function(f, m, bound, out) }
+			}
+			DInstance(i) -> {
+				let bound = Set.new()
+				typeVars(i.head, bound)
+				for p in i.context { predVars(p, bound) }
+				for m in i.methods { function(f, m, bound, out) }
+			}
+			_ -> {}
+		}
+	}
+	out
+}
+
+-- Checks every `fun` in `c`, with `bound` the type variables around it.
+fun nested(f : File, c : Child, bound : Set.Set String, out : Vec Finding) -> Unit {
+	if let ChFun(d) = c { return function(f, d, bound, out) }
+	for child in children(c) { nested(f, child, bound, out) }
+}
+
+-- Checks `d`'s context, then the functions in its body, with the variables of
+-- `d`'s signature added to `bound`.
+fun function(f : File, d : FunDecl, bound : Set.Set String, out : Vec Finding) -> Unit {
+	let header = Set.union(bound, Set.new())
+	signatureVars(d, header)
+	-- Most contexts hold no equality, and those need no walk of the body.
+	let equalities = Iter.any(d.context, fun(p) = match p.kind {
+		PEq(_, _)    -> True
+		PClass(_, _) -> False
+	})
+	if equalities {
+		let body = Set.new()
+		if let Some(b) = d.body { bodyVars(ChExpr(b), body) }
+		-- Two entries' removals each take a comma, and removals of neighbours
+		-- would edit the same comma. So one finding of a context carries the
+		-- fix, and `--fix` finds the others again in the text it leaves.
+		var fixing = True
+		for i in Int.range(0, len(d.context)) {
+			let Some(found) = needless(f, d, i, bound, body) else { continue }
+			if fixing {
+				Vec.push(out, found)
+				fixing = Option.isNone(found.fix)
+			} else {
+				Vec.push(out, Finding { span = found.span, message = found.message, fix = None })
+			}
+		}
+	}
+	if let Some(b) = d.body { nested(f, ChExpr(b), header, out) }
+}
+
+-- The finding for `d`'s `i`th context entry, if it is a needless equality.
+fun needless(
+	f : File,
+	d : FunDecl,
+	i : Int,
+	bound : Set.Set String,
+	body : Set.Set String,
+) -> Option Finding {
+	let entry = d.context[i]
+	let (name, named) = match entry.kind {
+		PEq(a, b) -> match (a.kind, b.kind) {
+			(TEVar(_), TEVar(_)) -> return None
+			(TEVar(v), _)        -> (v, b)
+			(_, TEVar(v))        -> (v, a)
+			_                    -> return None
+		}
+		PClass(_, _) -> return None
+	}
+	if !applied(named) || Set.contains(bound, name) || Set.contains(body, name) { return None }
+	let mentioned = Set.new()
+	typeVars(named, mentioned)
+	if Set.contains(mentioned, name) { return None }
+	for j in Int.range(0, len(d.context)) {
+		if j == i { continue }
+		let others = Set.new()
+		predVars(d.context[j], others)
+		if Set.contains(others, name) { return None }
+	}
+	let uses = []
+	for p in d.params { patOccurrences(p, name, uses) }
+	if let Some(r) = d.ret { occurrences(r, name, False, uses) }
+	if len(uses) > 1 { return None }
+	let typeText = Lint.textOf(f, named.span)
+	let entryText = Lint.textOf(f, entry.span)
+	let edits = []
+	if let Some(removal) = entryRemoval(f, d.context, i) { Vec.push(edits, removal) }
+	let message = if len(uses) == 0 {
+		"'"
+			+ entryText
+			+ "' constrains nothing, since '"
+			+ name
+			+ "' is written nowhere else; remove it"
+	} else {
+		let (at, inArgument) = uses[0]
+		let wrapped = inArgument && !String.startsWith(typeText, "(")
+		Vec.push(edits, Edit {
+			span = at
+			text = if wrapped { "(" + typeText + ")" } else { typeText }
+		})
+		"'"
+			+ name
+			+ "' only names '"
+			+ typeText
+			+ "'; write '"
+			+ typeText
+			+ "' for '"
+			+ name
+			+ "' and remove '"
+			+ entryText
+			+ "'"
+	}
+	-- Without the removal, which needs the brackets on the entry's own lines,
+	-- the rewrite would leave the entry beside what replaces `name`, so the
+	-- fix is mechanical only with it.
+	Some(Finding {
+		span    = entry.span
+		message = message
+		fix = if len(edits) == 0 {
+			None
+		} else {
+			Some(Fix { edits = edits, mechanical = len(edits) == len(uses) + 1 })
+		}
+	})
+}
+
+-- Whether `t` is a type applied to arguments.
+fun applied(t : Type) -> Bool = match t.kind {
+	TECon(_, args) -> len(args) > 0
+	TEApp(_, _)    -> True
+	_              -> False
+}
+
+-- The edit that deletes `context[i]` with the comma that parts it from its
+-- neighbour, or with the brackets around it when it is the only entry. `None`
+-- when the brackets are not on the entry's own lines.
+fun entryRemoval(f : File, context : Vec Pred, i : Int) -> Option Edit {
+	let entry = context[i].span
+	if i > 0 {
+		let before = context[i - 1].span
+		return Some(Edit {
+			span = Source.endingAt(endOf(before), entry.endLine, entry.endCol)
+			text = ""
+		})
+	}
+	if len(context) > 1 {
+		let after = context[1].span
+		return Some(Edit { span = Source.endingAt(entry, after.line, after.col), text = "" })
+	}
+	let opening = String.toCodePoints(lineText(f, entry, entry.line))
+	var from = entry.col - 1
+	while from > 0 && Char.isSpace(opening[from - 1]) { from = from - 1 }
+	if from == 0 || opening[from - 1] != '[' { return None }
+	let closing = String.toCodePoints(lineText(f, entry, entry.endLine))
+	var to = entry.endCol - 1
+	while to < len(closing) && (Char.isSpace(closing[to]) || closing[to] == ',') { to = to + 1 }
+	if to == len(closing) || closing[to] != ']' { return None }
+	let span = Span {
+		line    = entry.line
+		col     = from
+		endLine = entry.endLine
+		endCol  = to + 2
+		file    = entry.file
+		inlined = None
+	}
+	Some(Edit { span = span, text = "" })
+}
+
+-- The empty range at the end of `s`.
+fun endOf(s : Span) -> Span = Span {
+	line    = s.endLine
+	col     = s.endCol
+	endLine = s.endLine
+	endCol  = s.endCol
+	file    = s.file
+	inlined = None
+}
+
+-- The text of line `line` of the file `at` is in, without its line break.
+fun lineText(f : File, at : Span, line : Int) -> String =
+	String.trimEnd(Lint.textOf(f, lineSpan(at, line)))
+
+-- Adds where `t` writes the type variable `name` to `out`, each with whether
+-- it is an argument of an applied type there, where an applied type written
+-- in its place needs parentheses.
+fun occurrences(t : Type, name : String, inArgument : Bool, out : Vec (Span, Bool)) -> Unit =
+	match t.kind {
+		TEVar(v)       -> if v == name { Vec.push(out, (t.span, inArgument)) }
+		TECon(_, args) -> for a in args { occurrences(a, name, True, out) }
+		TEApp(head, args) -> {
+			occurrences(head, name, False, out)
+			for a in args { occurrences(a, name, True, out) }
+		}
+		TETuple(items) -> for x in items { occurrences(x, name, False, out) }
+		TEFun(params, ret) -> {
+			for x in params { occurrences(x, name, False, out) }
+			occurrences(ret, name, False, out)
+		}
+		TEParen(inner) -> occurrences(inner, name, inArgument, out)
+	}
+
+fun patOccurrences(p : Pat, name : String, out : Vec (Span, Bool)) -> Unit = match p.kind {
+	PAnnot(inner, t) -> {
+		patOccurrences(inner, name, out)
+		occurrences(t, name, False, out)
+	}
+	PCon(_, args)                -> for a in args { patOccurrences(a, name, out) }
+	PRecord(_, fields, _)        -> for (_, x) in fields { patOccurrences(x, name, out) }
+	PTuple(items)                -> for x in items { patOccurrences(x, name, out) }
+	POr(items)                   -> for x in items { patOccurrences(x, name, out) }
+	PParen(inner)                -> patOccurrences(inner, name, out)
+	PVar(_) | PWild | PLit(_, _) -> {}
+}
+
+-- Adds the type variables `t` writes to `out`.
+fun typeVars(t : Type, out : Set.Set String) -> Unit {
+	let found = []
+	allOccurrences(t, found)
+	for v in found { Set.add(out, v) }
+}
+
+fun allOccurrences(t : Type, out : Vec String) -> Unit = match t.kind {
+	TEVar(v)       -> Vec.push(out, v)
+	TECon(_, args) -> for a in args { allOccurrences(a, out) }
+	TEApp(head, args) -> {
+		allOccurrences(head, out)
+		for a in args { allOccurrences(a, out) }
+	}
+	TETuple(items) -> for x in items { allOccurrences(x, out) }
+	TEFun(params, ret) -> {
+		for x in params { allOccurrences(x, out) }
+		allOccurrences(ret, out)
+	}
+	TEParen(inner) -> allOccurrences(inner, out)
+}
+
+fun predVars(p : Pred, out : Set.Set String) -> Unit = match p.kind {
+	PClass(_, t) -> typeVars(t, out)
+	PEq(a, b) -> {
+		typeVars(a, out)
+		typeVars(b, out)
+	}
+}
+
+fun patVars(p : Pat, out : Set.Set String) -> Unit = match p.kind {
+	PAnnot(inner, t) -> {
+		patVars(inner, out)
+		typeVars(t, out)
+	}
+	PCon(_, args)                -> for a in args { patVars(a, out) }
+	PRecord(_, fields, _)        -> for (_, x) in fields { patVars(x, out) }
+	PTuple(items)                -> for x in items { patVars(x, out) }
+	POr(items)                   -> for x in items { patVars(x, out) }
+	PParen(inner)                -> patVars(inner, out)
+	PVar(_) | PWild | PLit(_, _) -> {}
+}
+
+-- Adds the type variables `d`'s signature writes to `out`.
+fun signatureVars(d : FunDecl, out : Set.Set String) -> Unit {
+	for p in d.params { patVars(p, out) }
+	if let Some(r) = d.ret { typeVars(r, out) }
+	for p in d.context { predVars(p, out) }
+}
+
+-- Adds the type variables written in annotations in `c` to `out`, with those
+-- of the signatures of the functions in it.
+fun bodyVars(c : Child, out : Set.Set String) -> Unit {
+	match c {
+		ChExpr(e) -> match e.kind {
+			EAnnot(_, t) -> typeVars(t, out)
+			ELambda(params, ret, _, _) -> {
+				for p in params { patVars(p, out) }
+				if let Some(r) = ret { typeVars(r, out) }
+			}
+			EForIn(p, _, _, _, _) -> patVars(p, out)
+			_                     -> {}
+		}
+		ChStmt(s) -> match s.kind {
+			SLet(p, _)           -> patVars(p, out)
+			SVar(p, _)           -> patVars(p, out)
+			SLetElse(_, p, _, _) -> patVars(p, out)
+			_                    -> {}
+		}
+		ChFun(d)   -> signatureVars(d, out)
+		ChArm(arm) -> for p in arm.patterns { patVars(p, out) }
+	}
+	for child in children(c) { bodyVars(child, out) }
+}
+
+-- `text` without its whitespace.
+fun squeezed(text : String) -> String {
+	let kept = []
+	for c in String.codePoints(text) {
+		if !Char.isSpace(c) { Vec.push(kept, c) }
+	}
+	String.fromCodePoints(kept)
+}

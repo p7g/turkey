@@ -46,11 +46,8 @@ def _split(text: str, paths: list[Path]) -> list[str]:
 
 @functools.lru_cache(maxsize=None)
 def _all(flags: tuple[str, ...] = ()) -> dict[str, str]:
-    """Every corpus program's assembly, from one `turkey` process.
-
-    Starting `turkey` costs minutes and compiling a program costs a moment, so
-    one process per program turns the corpus into an hour.
-    """
+    """Every corpus program's assembly, from `boot_each`, which compiles the
+    corpus in one process per core rather than one per program."""
     paths = [PROGRAMS / name for name in CORPUS]
     texts = bootc.boot_each("asm", paths, _split, flags)
     return {path.name: texts[path] for path in paths}

@@ -1,7 +1,8 @@
 export (cases, message, diagnostic, panicMessage, traceProblem)
 
---- Cases from the language reference, `docs/ref/`: every Turkey example in
---- every chapter, checked against what the chapter says of it.
+--- Cases from the language reference, `docs/ref/`, and the tour,
+--- `docs/tutorial/`: every Turkey example in every chapter, checked against
+--- what the chapter says of it.
 ---
 --- An example is a `kotlin` fence, and an HTML comment on the line before it
 --- says how to check it:
@@ -18,6 +19,10 @@ export (cases, message, diagnostic, panicMessage, traceProblem)
 ---                            `run` or `panic` example before it: the
 ---                            compile's warnings, then a panic and its trace
 ---   <!-- module: F.gob -->   another file of the next example's program
+---   <!-- skip: T: REASON -->  directly before a `run` or `panic` directive:
+---                            that example is skipped on the target T, as a
+---                            program's `--% skip` is; only in chapters that
+---                            run on other targets than the host
 ---
 --- Every example requires a C compiler, since even one that is only checked
 --- is a promise about a program a reader can build.
@@ -32,12 +37,15 @@ export (cases, message, diagnostic, panicMessage, traceProblem)
 --- unmarked fence is an error rather than a skip because the reference
 --- promises that its examples are real, and an unmarked one is a promise
 --- nobody checks. For the same reason, a directory with no examples at all is
---- a harness error.
+--- a harness error, and so is a `skip` that skips nothing: one not directly
+--- before a `run` or `panic` directive, or one in a chapter that runs only on
+--- the host.
 ---
 --- Each example is written out as `Main.gob` beside its modules, in a
 --- directory of its own under `WORK` (`Files.writeOut`).
 
 import Case (Case(..), Expected(..), Golden(..), Quote(..), Requirement(..), Ending(..), Observed(..))
+import Case as Case
 import Files as Files
 
 -- The stages `turkey` names in a diagnostic, `FILE:LINE:COL: STAGE: MESSAGE`.
@@ -49,13 +57,14 @@ let stages = ["lex error", "parse error", "type error", "internal error", "gible
 type Mode = Run | Check | Fails(String) | Panic(String)
 
 -- What a directive marks the fence after it as: another file, by name, of
--- the next example's program, or an example checked as `Mode` says.
+-- the next example's program, an example checked as `Mode` says, or the
+-- standard error of the example before it.
 type Marker = ModuleFile(String) | Marked(Mode) | Stderr
 
 -- One example as its chapter gives it: the line of its opening fence, how
 -- it is checked, its source, the `text` fence after it, the `text` fence a
--- `stderr` directive marks, and the modules before it, as (file name,
--- source).
+-- `stderr` directive marks, the modules before it, as (file name, source),
+-- and the targets it is skipped on, as (target, reason).
 type Example = Example {
     line : Int,
     mode : Mode,
@@ -63,6 +72,7 @@ type Example = Example {
     stdout : Option String,
     stderr : Option String,
     modules : Array (String, String),
+    skips : Array (String, String),
 }
 
 -- What is wrong with a chapter, and on which line.
@@ -75,7 +85,9 @@ type Fence = Fence { language : String, body : String, line : Int, next : Int }
 --- Returns a case for every example in each `.md` file in `directory` (an
 --- absolute path), named by `prefix`, the path to it from the repository
 --- root, in chapter order. Writes each example's files under `work`.
-fun cases(directory : String, prefix : String, work : String) -> Array Case {
+--- `targets` says whether the chapters' examples also run on targets other
+--- than the host, which is what a `skip` directive is for.
+fun cases(directory : String, prefix : String, work : String, targets : Bool) -> Array Case {
     let out = []
     for name in Files.listed(directory) {
         if !String.endsWith(name, ".md") { continue }
@@ -84,7 +96,7 @@ fun cases(directory : String, prefix : String, work : String) -> Array Case {
             Left(e) -> Vec.push(out, broken(chapter, directory, name, Error.describe(e)))
             Right(text) -> {
                 let found = []
-                let read = extract(String.lines(text), found)
+                let read = extract(String.lines(text), targets, found)
                 for e in found { Vec.push(out, example(work, caseName(chapter, e.line), e)) }
                 if let Left(m) = read { Vec.push(out, broken(caseName(chapter, m.line), directory, name, m.why)) }
             }
@@ -138,7 +150,7 @@ fun example(work : String, name : String, e : Example) -> Case {
         timeout = None,
         requires = [Cc],
         xfail = None,
-        skips = [],
+        skips = e.skips,
         problem = Option.map(Either.left(written), Error.describe),
         checkOnly = match e.mode {
             Check | Fails(_) -> True
@@ -151,14 +163,38 @@ fun example(work : String, name : String, e : Example) -> Case {
 -- -- reading a chapter -----------------------------------------------------------------
 
 -- Pushes each example in `lines` onto `found`, up to the first thing wrong
--- with the chapter, if there is one.
-fun extract(lines : Vec String, found : Vec Example) -> Either Malformed Unit {
+-- with the chapter, if there is one. `targets` says whether a `skip` may
+-- appear.
+fun extract(lines : Vec String, targets : Bool, found : Vec Example) -> Either Malformed Unit {
     var modules = []
     var lastModule = 0
+    var skips = []
     var i = 0
     while i < len(lines) {
         let line = String.trim(lines[i])
         if let Some((name, arg)) = directive(line) {
+            -- A `skip` marks no fence of its own: it stands on the line
+            -- before the directive of the example it skips, or before
+            -- another `skip` of that example.
+            if name == "skip" {
+                if !targets {
+                    return Left(Malformed(i + 1, "'skip' skips nothing here: these chapters run only on the host"))
+                }
+                match Case.skipOn(arg) {
+                    Right(skip) -> Vec.push(skips, skip)
+                    Left(why) -> return Left(Malformed(i + 1, why))
+                }
+                let next = if i + 1 < len(lines) { directive(String.trim(lines[i + 1])) } else { None }
+                let before = match next {
+                    Some(("run", _)) | Some(("panic", _)) | Some(("skip", _)) -> True
+                    _ -> False
+                }
+                if !before {
+                    return Left(Malformed(i + 1, "'skip' must be on the line before a run or panic directive"))
+                }
+                i = i + 1
+                continue
+            }
             match marker(name, arg) {
                 -- Any other comment is prose, unless it stands where a
                 -- directive would, before a `kotlin` fence.
@@ -176,7 +212,7 @@ fun extract(lines : Vec String, found : Vec Example) -> Either Malformed Unit {
                         Some(e) -> match e.mode {
                             Run | Panic(_) -> Example { line = e.line, mode = e.mode, source = e.source,
                                                         stdout = e.stdout, stderr = Some(f.body),
-                                                        modules = e.modules }
+                                                        modules = e.modules, skips = e.skips }
                             _ -> return Left(Malformed(f.line, "'stderr' must follow a run or panic example"))
                         }
                         None -> return Left(Malformed(f.line, "'stderr' must follow a run or panic example"))
@@ -208,8 +244,9 @@ fun extract(lines : Vec String, found : Vec Example) -> Either Malformed Unit {
                                 i = t.next
                             }
                             Vec.push(found, Example { line = f.line, mode, source = f.body, stdout, stderr = None,
-                                                      modules = Vec.toArray(modules) })
+                                                      modules = Vec.toArray(modules), skips = Vec.toArray(skips) })
                             modules = []
+                            skips = []
                         }
                     }
                 }

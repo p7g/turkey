@@ -88,6 +88,7 @@ through its call on line 10.
 | `Int` division or remainder by zero | `division by zero`, `remainder by zero` |
 | An array is indexed outside its bounds | `array index out of bounds: ...` |
 | A map is indexed with a key it does not contain | `map has no entry for this key; ...` |
+| [`e!`](do-notation.md#unwrapping-with-) on a value with nothing inside | `unwrapped None`, or the error's message for a `Left` |
 | A call to `error(message)` | the message |
 
 <!-- panic: integer overflow in + -->

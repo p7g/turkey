@@ -7,9 +7,10 @@ export (
 	parseRadix,
 	toStringRadix,
 	compare,
-	mod,
-	floorDiv,
+	quot,
+	rem,
 	divMod,
+	quotRem,
 	abs,
 	sign,
 	gcd,
@@ -50,7 +51,7 @@ import Data.Num (
 	Sub(..),
 	Mul(..),
 	Div(..),
-	Rem(..),
+	Mod(..),
 	Neg(..),
 	Zero(..),
 	One(..),
@@ -62,10 +63,9 @@ import Data.Num (
 )
 import Text.Show (Show(..))
 import Data.Hashable (Hash(..), Hasher(..))
-import Iter (Iterator(..))
+import Iter (Iterator(..), Step(..))
 import Data.Index (Index(..), SetIndex(..), Length(..))
 import Control.Panic (error)
-import Data.Bool ()
 import Data.Bool (Bool(..))
 import Data.Option (Option(..))
 import Data.Ordering (Ordering(..))
@@ -78,17 +78,18 @@ import Turkey.Array as Storage
 
 type Int = Prim.Int
 
---- Decimal, with a leading `-` for a negative number. The digits are peeled off
---- a non-positive copy, because `minValue` has no positive counterpart to peel
---- them from; `%` takes the dividend's sign, so each remainder is in -9..0.
+--- Decimal, with a leading `-` for a negative number.
 fun toString(n : Int) -> String {
+	-- Peel the digits off a non-positive copy, because `minValue` has no
+	-- positive counterpart to peel them from. `rem` takes the dividend's sign,
+	-- so each remainder is in -9..0.
 	let digits = Storage.uninitialized(19)
 	var count = 0
 	var rest = if n < 0 { n } else { -n }
 	loop {
-		digits[count] = Byte.truncate(48 - rest % 10)
+		digits[count] = Byte.truncate(48 - rem(rest, 10))
 		count = count + 1
-		rest = rest / 10
+		rest = quot(rest, 10)
 		if rest == 0 { break }
 	}
 	let sign = if n < 0 { 1 } else { 0 }
@@ -112,15 +113,6 @@ fun compare(a : Int, b : Int) -> Ordering {
 	if a < b { return LT }
 	if a > b { return GT }
 	EQ
-}
-
---- Floored, so the result takes the sign of the *divisor* and is therefore a
---- valid index for every positive `b`. `%` is remainder and takes the sign of
---- the dividend; the difference bites exactly where people reach for it, which
---- is bucket selection.
-fun mod(a : Int, b : Int) -> Int {
-	let r = a % b
-	if r != 0 && (r < 0) != (b < 0) { r + b } else { r }
 }
 
 --- Panics on `minValue()`, which has no positive counterpart. That is the
@@ -244,10 +236,10 @@ fun toStringRadix(n : Int, radix : Int) -> String {
 	var count = 0
 	var rest = if n < 0 { n } else { -n }
 	loop {
-		let d = -(rest % radix)
+		let d = -rem(rest, radix)
 		digits[count] = Byte.truncate(if d < 10 { 48 + d } else { 87 + d })
 		count = count + 1
-		rest = rest / radix
+		rest = quot(rest, radix)
 		if rest == 0 { break }
 	}
 	let signLength = if n < 0 { 1 } else { 0 }
@@ -264,16 +256,23 @@ fun toStringRadix(n : Int, radix : Int) -> String {
 --- Returns -1, 0 or 1 as `n` is negative, zero or positive.
 fun sign(n : Int) -> Int = if n < 0 { -1 } else if n > 0 { 1 } else { 0 }
 
---- Returns the quotient of `a` and `b` rounded toward negative infinity, which
---- pairs with `mod`: `floorDiv(a, b) * b + mod(a, b) == a`. Panics when `b` is
---- zero, and on `floorDiv(minValue(), -1)`, as `/` does.
-fun floorDiv(a : Int, b : Int) -> Int {
-	let q = a / b
-	if a % b != 0 && (a < 0) != (b < 0) { q - 1 } else { q }
-}
+--- Returns the quotient of `a` and `b` rounded toward zero, as C, Rust and the
+--- hardware divide: `quot(-7, 2) == -3`, where `-7 / 2 == -4`. Panics when `b`
+--- is zero, and on `quot(minValue(), -1)`, as `/` does.
+fun quot(a : Int, b : Int) -> Int = Prim.intDiv(a, b)
 
---- Returns `(floorDiv(a, b), mod(a, b))`.
-fun divMod(a : Int, b : Int) -> (Int, Int) = (floorDiv(a, b), mod(a, b))
+--- Returns the remainder that pairs with `quot`, which takes the sign of `a`:
+--- `quot(a, b) * b + rem(a, b) == a`, and `rem(-7, 2) == -1`, where
+--- `-7 % 2 == 1`. Panics when `b` is zero, as `%` does.
+fun rem(a : Int, b : Int) -> Int = Prim.intRem(a, b)
+
+--- Returns `(a / b, a % b)`, the quotient rounded toward negative infinity and
+--- the remainder with the sign of `b`.
+fun divMod(a : Int, b : Int) -> (Int, Int) = (a / b, a % b)
+
+--- Returns `(quot(a, b), rem(a, b))`, the quotient rounded toward zero and the
+--- remainder with the sign of `a`.
+fun quotRem(a : Int, b : Int) -> (Int, Int) = (quot(a, b), rem(a, b))
 
 --- Returns the greatest common divisor, never negative; `gcd(0, 0)` is 0.
 --- Panics only when the answer is 2^63, that is, when one argument is
@@ -281,12 +280,11 @@ fun divMod(a : Int, b : Int) -> (Int, Int) = (floorDiv(a, b), mod(a, b))
 fun gcd(a : Int, b : Int) -> Int {
 	-- Run Euclid on non-positive values, which can all be represented, so
 	-- that `minValue()` is an ordinary argument. `x % y` takes the sign of
-	-- `x`, so every remainder stays non-positive. `x % -1` is skipped:
-	-- it is 0, and `minValue() % -1` would trap.
+	-- `y`, so every remainder stays non-positive.
 	var x = if a > 0 { -a } else { a }
 	var y = if b > 0 { -b } else { b }
 	while y != 0 {
-		let t = if y == -1 { 0 } else { x % y }
+		let t = x % y
 		x = y
 		y = t
 	}
@@ -345,7 +343,7 @@ fun powMod(base : Int, exp : Int, modulus : Int) -> Int {
 	if exp < 0 { error("Int.powMod: negative exponent") }
 	if modulus <= 0 { error("Int.powMod: modulus must be positive") }
 	var result = 1 % modulus
-	var b = mod(base, modulus)
+	var b = base % modulus
 	var e = exp
 	while e > 0 {
 		if and(e, 1) == 1 { result = mulMod(result, b, modulus) }
@@ -471,20 +469,13 @@ fun badShift(operation : ShiftOp, by : Int) -> a {
 --- all, so a range is only ever made by `range`.
 type Range = Range { from : Int, to : Int }
 
-type RangeCursor = RangeCursor { var at : Int }
-
 fun range(from : Int, to : Int) -> Range = Range { from = from, to = to }
 
 instance Iterator Range {
 	type Item = Int
-	type Cursor = RangeCursor
-	fun iter(r) = RangeCursor { at = r.from }
-	fun next(r, cur) {
-		if cur.at >= r.to { return None }
-		let x = cur.at
-		cur.at = x + 1
-		Some(x)
-	}
+	type Cursor = Int
+	fun iter(r) = r.from
+	fun next(r, at) = if at >= r.to { Done } else { Yield(at, at + 1) }
 }
 
 instance Eq Int { fun eq(x, y) = Prim.intEq(x, y) }
@@ -492,8 +483,8 @@ instance Ord Int { fun lt(x, y) = Prim.intLt(x, y) }
 instance Add Int { fun add(x, y) = Prim.intAdd(x, y) }
 instance Sub Int { fun sub(x, y) = Prim.intSub(x, y) }
 instance Mul Int { fun mul(x, y) = Prim.intMul(x, y) }
-instance Div Int { fun div(x, y) = Prim.intDiv(x, y) }
-instance Rem Int { fun rem(x, y) = Prim.intRem(x, y) }
+instance Div Int { fun div(x, y) = Prim.intFloorDiv(x, y) }
+instance Mod Int { fun mod(x, y) = Prim.intMod(x, y) }
 instance Neg Int { fun neg(x) = Prim.intNeg(x) }
 instance Zero Int { fun zero() = 0 }
 instance One Int { fun one() = 1 }

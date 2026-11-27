@@ -15,7 +15,7 @@ export (
 --- The machine stacks Turkey code runs on: the program's own, and a
 --- coroutine's, which this module maps, lays out and unmaps. Each is a raw
 --- record on one list, which the collector walks for roots (`Turkey.Heap`)
---- and `turkey_swap_stack` switches between (`Turkey.Emit`).
+--- and `Prim.swapStack` switches between (`Turkey.Emit`, `Turkey.Wasm.Select`).
 ---
 --- A giblet module: it runs before anything can allocate and holds nothing
 --- the collector traces. It never switches stacks itself, and edits only a
@@ -24,11 +24,9 @@ export (
 import Prelude ()
 import Data.Int (Int)
 import Data.Tuple (Unit)
-import Data.Eq (Eq(..), (==), (!=))
-import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
-import Bits (BitAnd(..), (&))
-import Iter (Iterator(..))
-import Data.Int ()
+import Data.Eq ((==), (!=))
+import Data.Num (Neg(..))
+import Bits ((&))
 import Data.Bool (Bool(..))
 import Target (OS(..))
 import Target as Target
@@ -104,7 +102,9 @@ fun first() -> Ptr = stacks
 fun next(stack : Ptr) -> Ptr = Ptr.load(stack, stackNext)
 
 --- The outermost frame record any walk of `stack` may reach, and the record it
---- was parked at, null while it runs.
+--- was parked at, null while it runs. On wasm32-wasi they are the top of the
+--- stack's shadow stack and the innermost shadow frame it parked at
+--- (`Turkey.Wasm.Select`), and a stack that has not started has none.
 fun high(stack : Ptr) -> Ptr = Ptr.load(stack, stackHigh)
 fun parked(stack : Ptr) -> Ptr = Ptr.load(stack, stackParked)
 
@@ -145,8 +145,8 @@ fun resumerSet(stack : Ptr, by : Ptr) -> Unit =
 -- `mprotect` needs; it costs address space and no memory.
 let stackGuardBytes = 65536
 
---- A stack of `bytes` for a coroutine, registered and parked, ready for its
---- first switch; null if there was no memory for it.
+--- A stack of `bytes` for a coroutine, registered and ready for its first
+--- switch, which starts the coroutine; null if there was no memory for it.
 fun new(bytes : Int) -> Ptr {
 	let total = Int.addWrapping(guardBytes(), bytes)
 	let base = mapped(total)
@@ -169,16 +169,26 @@ fun new(bytes : Int) -> Ptr {
 	-- record. That code calls the coroutine's start, whose frame record then
 	-- links to the outermost one -- a record whose saved `x29` is zero, where
 	-- every walk of the stack stops.
+	--
+	-- On wasm the stack is a shadow stack, which holds no frame until its
+	-- first switch calls the coroutine's start (`Turkey.Wasm.Program`): a
+	-- stack with no parked frame is one that has not started.
 	let high = Ptr.add(base, total)
-	let outermost = Ptr.add(high, -16)
-	let entry = Ptr.add(high, -32)
-	let parked = Ptr.add(high, -48)
-	Ptr.store(outermost, 0, Ptr.null())
-	Ptr.store(outermost, 8, Ptr.null())
-	Ptr.store(entry, 0, record)
-	Ptr.store(entry, 8, Ptr.null())
-	Ptr.store(parked, 0, outermost)
-	Ptr.store(parked, 8, Prim.codeAddress("turkey_stack_start"))
+	let parked = match Target.os {
+		Wasi -> Ptr.null()
+		_ -> {
+			let outermost = Ptr.add(high, -16)
+			let entry = Ptr.add(high, -32)
+			let parked = Ptr.add(high, -48)
+			Ptr.store(outermost, 0, Ptr.null())
+			Ptr.store(outermost, 8, Ptr.null())
+			Ptr.store(entry, 0, record)
+			Ptr.store(entry, 8, Ptr.null())
+			Ptr.store(parked, 0, outermost)
+			Ptr.store(parked, 8, Prim.codeAddress("turkey_stack_start"))
+			parked
+		}
+	}
 	Ptr.store(record, stackHigh, high)
 	Ptr.store(record, stackParked, parked)
 	Ptr.store(record, stackLow, base)
@@ -190,8 +200,9 @@ fun new(bytes : Int) -> Ptr {
 	record
 }
 
---- Unregister and unmap a stack whose last frame is gone: one that is parked
---- for good, never to be resumed. Never the running one.
+--- Unregister and unmap a stack whose last frame is gone: one that is never to
+--- be resumed again, because its coroutine's body has returned. Never the
+--- running one.
 fun free(stack : Ptr) -> Unit {
 	if stack == running() || Ptr.isNull(Ptr.load(stack, stackLow)) {
 		Process.panic(Prim.cString("freed a stack that is running or not a coroutine's"))
@@ -213,8 +224,10 @@ fun free(stack : Ptr) -> Unit {
 --
 -- Mapped rather than allocated, so a page costs memory only once it is
 -- touched. Wasm has neither: its memory is one block that only grows, so a
--- stack there is pages from the allocator, with no guard. Running off the
--- end of one writes over whatever is below it.
+-- stack there is pages from the allocator, with no guard. Generated code
+-- tests the shadow stack pointer against the running stack's bottom as it
+-- pushes each frame instead (`Turkey.Wasm.Select.prologue`), and running out
+-- panics.
 fun mapped(total : Int) -> Ptr = match Target.os {
 	Wasi -> Wasi.alignedAlloc(65536, total)
 	_ -> {

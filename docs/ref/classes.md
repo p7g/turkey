@@ -2,7 +2,7 @@
 
 A type class names a set of operations. An instance provides those operations
 for one type, and a function constrained by the class works on every type that
-has an instance. Operators, `for` loops, indexing, `?` and `print` are all
+has an instance. Operators, `for` loops, indexing, `?`, `!` and `print` are all
 built on classes ([Built-in types and classes](builtins.md)). This chapter
 covers declaring classes and instances, superclasses and default methods,
 associated types, equality constraints, and the rules that keep instances
@@ -279,8 +279,8 @@ some. It follows a `:`, the same `:` that gives an instance its
 requirements: `type Card : Ord = ...` says that `Card` has `Ord`. The
 compiler writes each instance from the declaration's constructors. It can
 write instances of three classes that a list may ask for, and it writes two
-more without being asked: `Debug` for every type, and `Object` for every type
-whose values are objects ([`Object` and
+more without being asked: `Debug` for every type whose fields have it, and
+`Object` for every type whose values are objects ([`Object` and
 `identical`](builtins.md#object-and-identical)):
 
 * **`Eq`.** Two values are equal when they were built by the same
@@ -298,7 +298,12 @@ whose values are objects ([`Object` and
   printing](builtins.md#show-and-printing).
 
 Only `eq`, `lt`, `hashInto` and `debug` are written; the other methods are the
-class's defaults, so `<=` is `lt(x, y) || eq(x, y)`.
+class's defaults, so `<=` is `lt(x, y) || eq(x, y)`. Those defaults are right
+only when the order agrees with the type's equality: for any two values,
+exactly one of `lt(a, b)`, `lt(b, a)` and `a == b` holds. A derived `Ord`
+always agrees with a derived `Eq`. An `Ord` written by hand beside a derived
+`Eq` is reported by the `ord-inconsistent-with-eq` check
+([Warnings](README.md#warnings)).
 
 A tuple of any length gets the same instances, and `Ord` and `Show` too,
 without asking, wherever its elements have them. It behaves like a type with
@@ -435,11 +440,11 @@ derived `Hash` either, and writes its own if it needs one:
 type Angle = Angle(Int)
 
 instance Eq Angle {
-    fun eq(Angle(a), Angle(b)) = Int.mod(a, 360) == Int.mod(b, 360)
+    fun eq(Angle(a), Angle(b)) = a % 360 == b % 360
 }
 
 instance Hash Angle {
-    fun hashInto(Angle(a), h) = hashInto(Int.mod(a, 360), h)
+    fun hashInto(Angle(a), h) = hashInto(a % 360, h)
 }
 
 fun main() {

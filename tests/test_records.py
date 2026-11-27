@@ -253,8 +253,8 @@ fun main() {
 }
 """)
     assert message == ("cannot assign to field 'owner': it is not 'var' in "
-                       "'Account' (declared at Main.gob:1:26); declare it "
-                       "'var owner' to make it assignable")
+                       "'Account'; declare it 'var owner' to make it assignable\n"
+                       "Main.gob:1:26: note: 'owner' is declared here")
 
 
 def test_a_polymorphic_assignment_is_checked_where_the_type_is_supplied():

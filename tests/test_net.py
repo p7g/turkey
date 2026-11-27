@@ -140,7 +140,7 @@ fun main() {
     }
     -- The message, which names the failure, rather than the error's fields.
     match Net.lookup("bad\\u{0}name", Duration.seconds(30)) {
-        Left(e) -> print("Left(" + message(e) + ")")
+        Left(e) -> print("Left(" + show(e) + ")")
         other -> print(shown(other))
     }
 }

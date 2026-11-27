@@ -2,7 +2,8 @@
 
 Several pieces of syntax are defined in terms of library types and classes:
 `if` needs a `Bool`, `+` calls `Add`, a `for` loop calls `Iterator`, `a[i]`
-calls `Index`, `a[i] = v` calls `SetIndex`, and `?` calls `Monad`. This
+calls `Index`, `a[i] = v` calls `SetIndex`, `?` calls `Monad`, and `e!` calls
+`Unwrap`. This
 chapter describes those types and classes, and the Prelude that makes them
 available. It does not document the rest of the library.
 
@@ -17,7 +18,7 @@ The Prelude provides these names unqualified:
 | Kind | Names |
 |---|---|
 | Types and their constructors | `Int`, `Float`, `Byte`, `Char`, `Unit`, `Bool`, `Option`, `Either`, `Ordering`, `SomeError`, and the types `String`, `Array`, `Vec`, `FrozenArray` and `Map` without their constructors |
-| Classes and their methods | `Eq`, `Ord`, `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Zero`, `One`, `Show`, `Iterator`, `Index`, `SetIndex`, `Length`, `Functor`, `Applicative`, `Monad`, `Semigroup`, `Monoid`, `Foldable`, `Hash`, `Error`, `Typed`, `Object`, `Debug` |
+| Classes and their methods | `Eq`, `Ord`, `Add`, `Sub`, `Mul`, `Div`, `Mod`, `Neg`, `Zero`, `One`, `Show`, `Iterator`, `Index`, `SetIndex`, `Length`, `Functor`, `Applicative`, `Monad`, `Unwrap`, `Semigroup`, `Monoid`, `Foldable`, `Hash`, `Error`, `Typed`, `Object`, `Debug` |
 | Functions | `print`, `write`, `dbg`, `error`, `fail`, `throw`, `const`, `pipe`, `fmap`, `min`, `max`, `hash` |
 | Operators | `+` `-` `*` `/` `%`, `==` `!=` `<` `<=` `>` `>=`, `&` `\|` `^` `<<` `>>`, `<>`, `\|>` `\|>>` `<&>` `<$>` ([Operators](expressions.md#operators)) |
 
@@ -67,7 +68,7 @@ type Bool : Ord = False | True
 ```
 
 An ordinary data type. `if`, `while`, the test of a C-style `for`, `&&`,
-`||` and `!` all require this type. `==` and the other comparisons return it.
+`||` and prefix `!` all require this type. `==` and the other comparisons return it.
 Its `Eq`, `Ord` and `Hash` are derived ([Derived instances](classes.md#derived-instances)),
 so `False < True`.
 
@@ -77,9 +78,9 @@ so `False < True`.
 type Option a = None | Some(a)
 ```
 
-A value that may be absent. The `Iterator` class's `next` returns an
-`Option` to say whether there is another element, and `Option` is a `Monad`
-whose `?` stops at the first `None` ([`?`](do-notation.md)).
+A value that may be absent. `Option` is a `Monad` whose `?` stops at the first
+`None` ([`?`](do-notation.md)), and iterating an `Option` gives its one element,
+or none.
 
 ## `Either`
 
@@ -323,7 +324,7 @@ class Add a { fun add(a, a) -> a }
 class Sub a { fun sub(a, a) -> a }
 class Mul a { fun mul(a, a) -> a }
 class Div a { fun div(a, a) -> a }
-class Rem a { fun rem(a, a) -> a }
+class Mod a { fun mod(a, a) -> a }
 class Neg a { fun neg(a) -> a }
 class Zero a { fun zero() -> a }
 class One a { fun one() -> a }
@@ -349,6 +350,10 @@ class Shift a {
     fun shr(a, Int) -> a
 }
 ```
+
+For `Int`, `div` rounds toward negative infinity and `mod` takes the sign of
+the divisor, so `div(a, b) * b + mod(a, b) == a` as arithmetic on integers
+([Int](types.md#int)).
 
 `Int` and `Byte` have instances of the four bitwise classes
 ([Bitwise operators](expressions.md#bitwise-operators)), and `Set` has
@@ -381,7 +386,7 @@ Ada Bo
 
 The instances the library provides for built-in types:
 
-| Type | `Eq` | `Ord` | `Hash` | `Add` | `Sub` `Mul` `Div` `Neg` | `Rem` | `Zero` `One` | `Show` |
+| Type | `Eq` | `Ord` | `Hash` | `Add` | `Sub` `Mul` `Div` `Neg` | `Mod` | `Zero` `One` | `Show` |
 |---|---|---|---|---|---|---|---|---|
 | `Int` | yes | yes | yes | yes | yes | yes | yes | yes |
 | `Float` | yes | yes | no | yes | yes | no | yes | yes |
@@ -475,6 +480,8 @@ standard output holds, and returns `x`, so it can wrap any expression.
   field whose type mentions a type an [existential
   constructor](types.md#existential-types) hides as `<hidden>`, unless its
   `Debug` follows from the classes the constructor carries.
+* A `SomeError` prints as `SomeError("...")` around its message chain,
+  outermost first, as `Error.describe` gives it.
 
 A container's `Show` shows its elements' `Debug`. The `Show` of `Array`,
 `Vec`, `FrozenArray`, `Map`, `Set`, `Deque`, `PriorityQueue`, `Option`, `Either` and the
@@ -622,11 +629,8 @@ fun main() {
     write("working... ")
     -- Without this, a program whose output goes to a pipe would show nothing
     -- until the buffer filled or the program ended.
-    match IO.flush(IO.stdout()) {
-        Left(e) -> {
-            let _ = IO.writeText(IO.stderr(), message(e) + "\n")
-        }
-        Right(_) -> {}
+    if let Left(e) = IO.flush(IO.stdout()) {
+        let _ = IO.writeText(IO.stderr(), message(e) + "\n")
     }
     print("done")
 }
@@ -652,38 +656,34 @@ class Iterator c {
     type Cursor c
 
     fun iter(c) -> Cursor c
-    fun next(c, Cursor c) -> Option (Item c)
+    fun next(c, Cursor c) -> Iter.Step (Item c) (Cursor c)
 }
+
+type Iter.Step a s = Done | Yield(a, s)
 ```
 
 `for x in c` runs over any type with an `Iterator` instance
 ([`for` over a collection](statements.md#for-over-a-collection)). `Item c` is
-the element type, and `Cursor c` is the type of the state that records how far
-the loop has got. `iter` makes a new cursor, and `next` returns the next
-element and advances the cursor, or returns `None` when there are no more. The
-cursor is usually a mutable record, and nothing asks the collection for its
-length, so a type can be iterated even when it cannot be indexed, such as a
-linked list or a generated sequence:
+the element type, and `Cursor c` is the type of a *position* in `c`. `iter`
+returns the position of the first element, and `next` returns the element at
+a position together with the position after it, as `Iter.Yield(x, after)`, or
+`Iter.Done` when there are no more. `next` changes nothing, so a position can
+be kept and stepped from again, and a second loop over `c` starts again from
+the beginning. Nothing asks the collection for its length, so a type can be
+iterated even when it cannot be indexed, such as a linked list or a generated
+sequence:
 
 <!-- run -->
 ```kotlin
 type Countdown = Countdown { from : Int }
-type CountdownCursor = CountdownCursor { var current : Int }
 
 instance Iterator Countdown {
     type Item = Int
-    type Cursor = CountdownCursor
+    type Cursor = Int
 
-    fun iter(c) = CountdownCursor { current = c.from }
+    fun iter(c) = c.from
 
-    fun next(c, cursor) {
-        if cursor.current == 0 {
-            return None
-        }
-        let value = cursor.current
-        cursor.current = value - 1
-        Some(value)
-    }
+    fun next(_, n) = if n == 0 { Iter.Done } else { Iter.Yield(n, n - 1) }
 }
 
 fun main() {
@@ -697,6 +697,32 @@ fun main() {
 3
 2
 1
+```
+
+A source that keeps its position itself has `()` as its cursor, and every loop
+over it continues from where the last one stopped instead of starting again.
+`Iter.resumable(xs)` makes one from any iterator:
+
+<!-- run -->
+```kotlin
+fun main() {
+    let rest = Iter.resumable(["title", "", "a", "b"])
+    for line in rest {
+        if line == "" {
+            break
+        }
+        print("header: " + line)
+    }
+    for line in rest {
+        print("body: " + line)
+    }
+}
+```
+
+```text
+header: title
+body: a
+body: b
 ```
 
 `Iter.any`, `Iter.all`, `Iter.count` and `Iter.find` ask a
@@ -1018,6 +1044,47 @@ fun main() {
 Some("10")
 [Some(2), None]
 Some(Some(4))
+```
+
+## `Unwrap`
+
+```text
+class Unwrap f {
+    fun tryUnwrap(f a) -> Either String a
+}
+```
+
+The class behind [`e!`](do-notation.md#unwrapping-with-). `tryUnwrap(e)` is
+`Right(x)` when `e` holds a value `x`, and otherwise `Left` with the text the
+panic at a `!` reports. It never panics itself: the `!` does, where it is
+written.
+
+| Instance | `Right` when | `Left` |
+|---|---|---|
+| `Unwrap Option` | `Some(x)` | `"unwrapped None"` |
+| `Unwrap (Either e)`, for `Error e` | `Right(x)` | the `message` of the `Left`'s error |
+
+`SomeError` is an `Error` too, whose `message` is the whole chain as
+`Error.describe` writes it, so `!` works on `Either SomeError a`:
+
+<!-- run -->
+```kotlin
+type NotFound = NotFound { key : String }
+
+instance Error NotFound { fun message(e) = "no entry for '" + e.key + "'" }
+
+fun find(key : String) -> Either SomeError Int =
+    if key == "width" { Right(80) } else { Left(fail(NotFound { key })) }
+
+fun main() {
+    print(find("width")!)
+    print(tryUnwrap(find("height")))
+}
+```
+
+```text
+80
+Left("no entry for 'height'")
 ```
 
 ## `Semigroup` and `Monoid`

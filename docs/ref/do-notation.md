@@ -1,4 +1,4 @@
-# The `?` operator and `do`
+# The `?` and `!` operators and `do`
 
 `e?` sequences a computation through a [monad](#monads). It takes the value
 out of `e` and runs the rest of the block with it, and the monad's own `bind`
@@ -6,6 +6,9 @@ method decides what "the rest of the block" means. For `Option` and `Either`,
 that means stopping at the first failure. For other monads it means other
 things: `Array` runs the rest of the block once for each element. `?` is not
 an early return, and nothing about it is specific to error handling.
+
+`e!` is the partial counterpart: it takes the value out of `e` or panics, and
+leaves the rest of the block alone ([Unwrapping with `!`](#unwrapping-with-)).
 
 ## Syntax
 
@@ -138,7 +141,8 @@ which holds a value of any type with an `Error` instance. `throw(e)`, which is
 `Left(fail(e))`, returns a `Left` holding `e` packed as a `SomeError`; after
 that, `?` passes it along like any other `Left`, and no function in between
 needs to know what kind of error it holds. `fail(e)` alone packs `e` without
-making a result of it.
+making a result of it. `SomeError` is an `Error` too, and `fail` of one
+returns it unchanged, so packing twice does no harm.
 
 `Error.context(err, e)` wraps an error in a new one without discarding it, and
 `Error.describe` reads the whole chain, outermost first. `Error.cast` recovers
@@ -374,6 +378,40 @@ fun main() {
 Variables captured by the rest of the block are shared, not copied, across
 those calls ([Closures](declarations.md#anonymous-functions)).
 
+A `for` loop's position is not one of them. The loop hands each round the
+position after that round's element ([`Iterator`](builtins.md#iterator)), so
+when `bind` runs the rest of the loop several times, each run goes on from its
+own element's position, as nested loops would. Here every `y` goes on to both
+rounds of `x = 2`, and the loop ends four times:
+
+<!-- run -->
+```kotlin
+fun pairs() {
+    for x in [1, 2] {
+        let y = ["a", "b"]?
+        print(show(x) + y)
+    }
+    [()]
+}
+
+fun main() {
+    print(len(pairs()))
+}
+```
+
+```text
+1a
+1b
+2a
+2b
+2a
+2b
+4
+```
+
+A source that keeps its own position, such as `Iter.resumable(xs)`, is shared
+like any other captured state: every run steps the one position.
+
 A loop holding a `?` goes round again inside the function it hands to `bind`.
 When `bind` calls that function last, as `Option`'s does, or returns a
 function that does, as a reader's or a state monad's does, the call is a
@@ -406,3 +444,101 @@ fun label(maybe) {
 > `let x = e?` is `x <- e`. `?` can also appear inside an expression, as in
 > `f(g(x)?)`, which Haskell would write with a separate bind. `return` is not
 > `pure`: it is the control-flow keyword, and `pure` is the method.
+
+## Unwrapping with `!`
+
+**Syntax**
+
+```ebnf
+unwrap ::= postfix "!"
+```
+
+`e!` is the value inside `e`, or a [panic](runtime-errors.md) when there is
+none. It is for a value the program's own logic guarantees is present: a line of
+input known to be a number, a key known to be in a map. A failure the caller
+should handle is a `?` instead.
+
+`!` is a postfix operator like `?`, so it binds tighter than any binary
+operator and chains with calls, fields and `?`: `Int.parse(text)! + 1`,
+`load(path)!.name`, `o?!`. A prefix `!` applies to what the postfix one
+gives, so `!x!` is `!(x!)`.
+
+The value of `e` must have a type `f a` for some type constructor `f` with an
+[`Unwrap`](builtins.md#unwrap) instance, and `e!` is an `a`. The Prelude has
+instances for `Option` and for `Either e` where `e` is an `Error`. `e!` is
+approximately
+
+```text
+match tryUnwrap(e) {
+    Right($x) -> $x
+    Left($why) -> error($why)
+}
+```
+
+where `tryUnwrap` is the method of `Unwrap`, which returns what is inside `e`
+or why nothing is:
+
+```text
+class Unwrap f {
+    fun tryUnwrap(f a) -> Either String a
+}
+```
+
+The panic is raised by the `!` itself, not inside the instance, so the trace
+names the line and column of the `!`. On `None` its message is
+`unwrapped None`, and on a `Left` it is the error's `message`:
+
+<!-- panic: unwrapped None -->
+```kotlin
+fun main() {
+    let year = Int.parse("2026")!
+    print(year + 1)
+    let ports = Map.new()
+    Map.put(ports, "http", 80)
+    print(Map.get(ports, "http")!)
+    print(Map.get(ports, "gopher")!)
+}
+```
+
+```text
+2027
+80
+```
+
+prints, on standard error:
+
+<!-- stderr -->
+```text
+panic: unwrapped None
+  at error (Control/Panic.gob:8:36)
+  at main (Main.gob:7:35)
+```
+
+A `!` directly followed by another operator character is part of a longer
+operator, because the lexer takes the longest run of operator characters it
+can ([Operators and punctuation](lexical.md#operators-and-punctuation)). So
+`opt!=x` compares `opt` with `x`, and `x!!` is the operator `!!`, not two
+`!`s. Separate them, as in `x! != y` and `(x!)!`.
+
+A type of the program's own gets `!` from an instance:
+
+<!-- run -->
+```kotlin
+type Validated a = Validated(Bool, a)
+
+instance Unwrap Validated {
+    fun tryUnwrap(v) = match v {
+        Validated(True, x) -> Right(x)
+        Validated(False, _) -> Left("used a value that was not validated")
+    }
+}
+
+fun main() {
+    let reading = Validated(True, 21)
+    print(reading! + 1)
+}
+```
+
+```text
+22
+```

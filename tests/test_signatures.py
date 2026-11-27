@@ -25,20 +25,17 @@ ESCAPES = (
 
 ITER = """
 type Two a = Two { fst : a, snd : a }
-type TwoCur = TwoCur { var taken : Int }
 
 instance Iterator (Two a) {
     type Item = a
-    type Cursor = TwoCur
+    type Cursor = Int
 
-    fun iter(t) = TwoCur { taken = 0 }
+    fun iter(t) = 0
 
-    fun next(t, cur) {
-        let k = cur.taken
-        cur.taken = k + 1
-        if k == 0 { return Some(t.fst) }
-        if k == 1 { return Some(t.snd) }
-        None
+    fun next(t, k) = match k {
+        0 -> Iter.Yield(t.fst, 1)
+        1 -> Iter.Yield(t.snd, 2)
+        _ -> Iter.Done
     }
 }
 """

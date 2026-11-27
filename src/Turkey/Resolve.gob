@@ -55,6 +55,7 @@ import Turkey.Diag as Diag
 import Turkey.Fixity as Fixity
 import Turkey.Fixity (Group)
 import Turkey.Modules (Module(..), Namespace(..), Scope(..), lookupName, conflictsIn)
+import Turkey.Modules as Modules
 import Turkey.Prelude as Prelude
 import Turkey.Prims as Prims
 import Turkey.Source as Source
@@ -115,9 +116,8 @@ fun arities(modules : Vec Module) -> Map String Int {
 	for m in modules {
 		for decl in m.program.decls {
 			match decl {
-				DStmt(s) -> match s.kind {
-					SFun(d) -> Map.put(out, Prelude.internal(m.name, d.name), len(d.params))
-					_       -> {}
+				DStmt(s) -> if let SFun(d) = s.kind {
+					Map.put(out, Prelude.internal(m.name, d.name), len(d.params))
 				}
 				DClass(c) -> {
 					let cls = Prelude.internal(m.name, c.name)
@@ -288,16 +288,13 @@ fun operators(modules : Vec Module, arities : Map String Int) -> Map String (Gro
 	for m in modules {
 		let seen = Set.new()
 		for decl in m.program.decls {
-			match decl {
-				DInfix(d) -> {
-					if Set.contains(seen, d.op) {
-						report("the operator '" + d.op + "' is declared twice", d.span)
-					}
-					Set.add(seen, d.op)
-					let target = infixTarget(m.scope, d, arities)
-					Map.put(out, Prelude.internal(m.name, d.op), (d.group, target))
+			if let DInfix(d) = decl {
+				if Set.contains(seen, d.op) {
+					report("the operator '" + d.op + "' is declared twice", d.span)
 				}
-				_ -> {}
+				Set.add(seen, d.op)
+				let target = infixTarget(m.scope, d, arities)
+				Map.put(out, Prelude.internal(m.name, d.op), (d.group, target))
 			}
 		}
 	}
@@ -358,19 +355,16 @@ fun foreignDecl(r : R, f : ForeignDecl) -> Unit {
 fun typeDecl(r : R, d : TypeDecl) -> Unit {
 	d.name = tycon(r, d.name, d.span)
 	for entry in d.derives { entry.cls = cls(r, entry.cls, entry.span) }
-	match d.alias {
-		Some(a) -> typeExpr(r, a)
-		None    -> {}
+	if let Some(a) = d.alias {
+		typeExpr(r, a)
 	}
-	match d.variants {
-		None -> {}
-		Some(vs) -> for v in vs {
+	if let Some(vs) = d.variants {
+		for v in vs {
 			v.name = con(r, v.name, v.span)
 			context(r, v.context)
 			for a in v.args { typeExpr(r, a) }
-			match v.fields {
-				Some(fs) -> for (_, te) in fs { typeExpr(r, te) }
-				None     -> {}
+			if let Some(fs) = v.fields {
+				for (_, te) in fs { typeExpr(r, te) }
 			}
 		}
 	}
@@ -450,15 +444,13 @@ fun enter(r : R, nodeId : Int, where : Span) -> Unit {
 fun funDecl(r : R, d : FunDecl) -> Unit {
 	context(r, d.context)
 	for param in d.params { pattern(r, param) }
-	match d.ret {
-		Some(t) -> typeExpr(r, t)
-		None    -> {}
+	if let Some(t) = d.ret {
+		typeExpr(r, t)
 	}
 	push(r)
 	for param in d.params { bindPattern(r, param, False) }
-	match d.body {
-		Some(b) -> expr(r, b)
-		None    -> {}
+	if let Some(b) = d.body {
+		expr(r, b)
 	}
 	pop(r)
 }
@@ -618,9 +610,16 @@ fun expr(r : R, e : Expr) -> Unit = match e.kind {
 		expr(r, fn)
 		for a in args { expr(r, a) }
 	}
+	EMethod(label, args) -> {
+		if let Some(id) = local(r, label) { Map.put(r.binders.localMethods, e.id, id) }
+		for a in args { expr(r, a) }
+	}
 	EIndex(arr, index, _, _) -> bracket(r, e, arr, index, False)
-	EField(obj, _)           -> expr(r, obj)
-	EProject(obj, _)         -> expr(r, obj)
+	EField(obj, label) -> {
+		Modules.noteField(r.scope, label)
+		expr(r, obj)
+	}
+	EProject(obj, _) -> expr(r, obj)
 	EUnary(_, operand, fn) -> {
 		resolveMethod(r, fn)
 		expr(r, operand)
@@ -650,9 +649,8 @@ fun expr(r : R, e : Expr) -> Unit = match e.kind {
 	EIf(cond, then, otherwise) -> {
 		expr(r, cond)
 		expr(r, then)
-		match otherwise {
-			Some(o) -> expr(r, o)
-			None    -> {}
+		if let Some(o) = otherwise {
+			expr(r, o)
 		}
 	}
 	EWhile(cond, body) -> {
@@ -660,19 +658,16 @@ fun expr(r : R, e : Expr) -> Unit = match e.kind {
 		expr(r, body)
 	}
 	ELoop(body) -> expr(r, body)
-	EReturn(value) -> match value {
-		Some(v) -> expr(r, v)
-		None    -> {}
+	EReturn(value) -> if let Some(v) = value {
+		expr(r, v)
 	}
-	EBreak(value) -> match value {
-		Some(v) -> expr(r, v)
-		None    -> {}
+	EBreak(value) -> if let Some(v) = value {
+		expr(r, v)
 	}
 	ELambda(params, ret, body, _) -> {
 		for p in params { pattern(r, p) }
-		match ret {
-			Some(t) -> typeExpr(r, t)
-			None    -> {}
+		if let Some(t) = ret {
+			typeExpr(r, t)
 		}
 		push(r)
 		for p in params { bindPattern(r, p, False) }
@@ -706,9 +701,8 @@ fun expr(r : R, e : Expr) -> Unit = match e.kind {
 	}
 	EIfLet(conditions, then, otherwise) -> {
 		conditionList(r, conditions, then)
-		match otherwise {
-			Some(o) -> expr(r, o)
-			None    -> {}
+		if let Some(o) = otherwise {
+			expr(r, o)
 		}
 	}
 	EWhileLet(conditions, body) -> conditionList(r, conditions, body)
@@ -725,14 +719,12 @@ fun expr(r : R, e : Expr) -> Unit = match e.kind {
 	EForC(init, cond, step, body) -> {
 		-- init, cond, step and body share one scope.
 		push(r)
-		match init {
-			Some(s) -> stmt(r, s)
-			None    -> {}
+		if let Some(s) = init {
+			stmt(r, s)
 		}
 		expr(r, cond)
-		match step {
-			Some(s) -> stmt(r, s)
-			None    -> {}
+		if let Some(s) = step {
+			stmt(r, s)
 		}
 		expr(r, body)
 		pop(r)
@@ -742,8 +734,8 @@ fun expr(r : R, e : Expr) -> Unit = match e.kind {
 		for s in stmts { stmt(r, s) }
 		pop(r)
 	}
-	EQuestion(inner, bindFn) -> {
-		resolveMethod(r, bindFn)
+	EQuestion(inner, fn) | EUnwrap(inner, fn) -> {
+		resolveMethod(r, fn)
 		expr(r, inner)
 	}
 	-- Only a marker; the block underneath scopes as any block does.
@@ -893,11 +885,9 @@ fun lookupOr(space : Map String String, name : String) -> String =
 
 -- A method reference the compiler wrote: `EBinary`'s `fn`, `EForIn`'s `iter`.
 -- Absent when the operator has no class, which `!` and `&&` do not.
-fun resolveMethod(r : R, ref : Option Expr) -> Unit = match ref {
-	None -> {}
-	Some(e) -> match e.kind {
-		EVar(name, _) -> method(r, e, name)
-		_             -> {}
+fun resolveMethod(r : R, ref : Option Expr) -> Unit = if let Some(e) = ref {
+	if let EVar(name, _) = e.kind {
+		method(r, e, name)
 	}
 }
 
@@ -931,7 +921,12 @@ fun protocolMethod(
 -- can see it. Whatever else the scope calls `name` is not a candidate.
 fun visibleMethod(scope : Scope, name : String, where : Span) -> Option String =
 	match Prelude.protocolMethod(name) {
-		Some(target) -> if Set.contains(scope.methods, target) { Some(target) } else { None }
+		Some(target) -> if Set.contains(scope.methods, target) {
+			Modules.noteMethod(scope, target)
+			Some(target)
+		} else {
+			None
+		}
 		None -> Diag.fail(
 			Diag.at("internal error", "'" + name + "' marks no class method", where),
 			where.file,
@@ -1002,7 +997,7 @@ fun missing(r : R, op : String) -> String {
 }
 
 fun splitHint(r : R, op : String) -> String =
-	Fixity.splitAdvice(
+	Fixity.splitAdviceAfterOperand(
 		op,
 		fun(piece) = Fixity.isBuiltin(piece) || Map.contains(r.scope.operators, piece),
 	)
@@ -1013,8 +1008,8 @@ fun splitHint(r : R, op : String) -> String =
 -- of it an error. Choosing between them by operand types would also choose a
 -- group, and so how the chain around the use is grouped.
 fun declared(r : R, op : String, where : Span) -> Option (Group, String) {
-	match Map.get(conflictsIn(r.scope, OperatorSpace), op) {
-		Some(ids) -> report(
+	if let Some(ids) = Map.get(conflictsIn(r.scope, OperatorSpace), op) {
+		report(
 			"the operator '"
 				+ op
 				+ "' is ambiguous: it is declared in "
@@ -1025,8 +1020,8 @@ fun declared(r : R, op : String, where : Span) -> Option (Group, String) {
 				+ "their imports",
 			where,
 		)
-		None -> {}
 	}
+	Modules.noteOperator(r.scope, op)
 	match Map.get(r.scope.operators, op) {
 		Some(id) -> Map.get(r.operators, id)
 		None     -> None
@@ -1083,9 +1078,8 @@ fun pop(r : R) -> Unit = discard(Vec.pop(r.locals))
 fun bindLocal(r : R, nodeId : Int, name : String, where : Span, mutable : Bool) -> Unit {
 	let id = Binders.fresh(r.binders, r.owner, name, Local, Written(where, mutable))
 	Binders.record(r.binders, nodeId, id)
-	match Vec.last(r.locals) {
-		Some(frame) -> Map.put(frame, name, id)
-		None        -> {}
+	if let Some(frame) = Vec.last(r.locals) {
+		Map.put(frame, name, id)
 	}
 }
 

@@ -37,6 +37,45 @@ int main(int argc, char **argv) {
     return binary
 
 
+@pytest.fixture(scope="module")
+def collect_probe(tmp_path_factory, stats_object):
+    """Fifty collections asked for by name, one after another."""
+    if toolchain.missing():
+        pytest.skip("C compiler unavailable")
+    directory = tmp_path_factory.mktemp("collect-probe")
+    source = directory / "probe.c"
+    source.write_text('''
+#include "turkey_exports.h"
+int main(void) {
+    turkey_giblets_initialize();
+    for (int i = 0; i < 50; i++) {
+        turkey_string_new((const unsigned char *)"a", 1);
+        turkey_collect();
+    }
+    return 0;
+}
+''')
+    binary = directory / "probe"
+    subprocess.run([*toolchain.cc(), "-std=c11",
+                    "-I", str(bootc.PROBE_INCLUDE),
+                    str(source), str(stats_object),
+                    "-lm", "-pthread", "-o", str(binary)], check=True,
+                   capture_output=True, text=True)
+    return binary
+
+
+def test_collections_asked_for_by_name_do_not_fill_the_guard(collect_probe):
+    """Each collection here pauses for longer than the program runs between
+    them, which under a one-nanosecond bucket would turn the guard on at
+    once if they counted."""
+    env = dict(os.environ, TURKEY_GC_GUARD_NANOSECONDS="1")
+    env.pop("TURKEY_GC_STRESS", None)
+    result = subprocess.run(toolchain.command(collect_probe), env=env,
+                            capture_output=True, text=True, check=True)
+    assert "[gc 50 full]" in result.stderr
+    assert ", guard" not in result.stderr
+
+
 def probe(binary, scale="2", *args):
     env = dict(os.environ, TURKEY_GC_THRESHOLD_SCALE=scale)
     env.pop("TURKEY_GC_STRESS", None)

@@ -216,6 +216,16 @@ fun cert(name : String) -> TLS.Certificate =
 
 fun text(b : IO.Buffer) -> String = String.fromBytesLossy(IO.bytes(b))
 
+-- A connect or TLS result with its error unpacked from `SomeError`, so that
+-- what a test prints is the `TLSError` itself.
+fun typed(r : Either SomeError a) -> Either TLSError a = match r {
+    Right(x) -> Right(x)
+    Left(e) -> match Error.find(e) : Option TLSError {
+        Some(t) -> Left(t)
+        None -> Left(Stream(Option.expect(Error.find(e), "an IOError or a TLSError")))
+    }
+}
+
 fun listening() -> (TCP.Listener, Int) = match TCP.listen(loopback, 0) {
     Right(l) -> (l, TCP.listenerAddress(l).1)
     Left(e) -> error(show(e))
@@ -237,8 +247,8 @@ fun clientOf(roots : String, protocols : Array String) -> TLS.ClientConfig =
 -- handshake fails.
 fun dial(host : String, port : Int, config : TLS.ClientConfig) -> Either TLSError TLS.TLS {
     let d = Destination { host, port, addresses = [loopback] }
-    let s = Either.mapLeft(TCP.connect(d, Duration.seconds(10)), Stream)?
-    match TLS.client(s, d, config, Duration.seconds(10)) {
+    let s = typed(TCP.connect(d, Duration.seconds(10)))?
+    match typed(TLS.client(s, d, config, Duration.seconds(10))) {
         Right(t) -> Right(t)
         Left(e) -> {
             let _ = TCP.close(s)
@@ -396,7 +406,7 @@ fun silent(within : Duration.Duration, closeAfter : Option Duration.Duration) ->
     let s = match TCP.connect(d, Duration.seconds(10)) { Right(s) -> s; Left(e) -> error(show(e)) }
     let peer = match TCP.accept(l) { Right(p) -> p; Left(e) -> error(show(e)) }
     let r = Task.runScope(do {
-        let shaking = Task.spawn(fun() = TLS.client(s, d, client, within))?
+        let shaking = Task.spawn(fun() = typed(TLS.client(s, d, client, within)))?
         if let Some(after) = closeAfter {
             let _ = Task.spawn(fun() {
                 Sleep.sleep(after)
@@ -421,7 +431,7 @@ fun abandoned() -> String {
     let t = match TLS.accept(a) { Right(t) -> t; Left(e) -> error(show(e)) }
     let _ = IO.writeText(s, "not a hello")
     let _ = TCP.close(s)
-    let r = TLS.handshake(t, Duration.seconds(10))
+    let r = typed(TLS.handshake(t, Duration.seconds(10)))
     let _ = TLS.close(t)
     let _ = TCP.closeListener(l)
     brief(r)
@@ -547,11 +557,11 @@ fun said(r : Either TLSError a) -> String = match r {
 }
 
 fun main() {
-    print(said(TLS.clientConfig(TLS.RootsFile(dir() + "/missing.pem"), [])))
-    print(said(TLS.serverConfig([TLS.Certificate { chain = dir() + "/alpha.pem",
-                                                   key = dir() + "/beta.key" }], [])))
-    print(said(TLS.serverConfig([], [])))
-    print(said(TLS.clientConfig(TLS.SystemRoots, [""])))
+    print(said(typed(TLS.clientConfig(TLS.RootsFile(dir() + "/missing.pem"), []))))
+    print(said(typed(TLS.serverConfig([TLS.Certificate { chain = dir() + "/alpha.pem",
+                                                         key = dir() + "/beta.key" }], []))))
+    print(said(typed(TLS.serverConfig([], []))))
+    print(said(typed(TLS.clientConfig(TLS.SystemRoots, [""]))))
     match TLS.clientConfig(TLS.SystemRoots, ["http/1.1"]) {
         Right(c) -> {
             print("system roots")

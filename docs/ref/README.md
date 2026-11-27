@@ -12,8 +12,8 @@ Some things are deliberately left out:
   it is compiled, and nothing here depends on how a value is laid out in
   memory.
 * **The standard library**, except the parts the language itself relies on:
-  the types and classes behind literals, operators, `for` loops, indexing and
-  `?`. Those are described in [Built-in types and classes](builtins.md).
+  the types and classes behind literals, operators, `for` loops, indexing,
+  `?` and `!`. Those are described in [Built-in types and classes](builtins.md).
   Examples also use a few library functions, such as `print`, without further
   comment.
 
@@ -25,13 +25,14 @@ Some things are deliberately left out:
    aliases, mutability, and existential types.
 3. [Declarations](declarations.md): functions, lambdas, placeholder
    functions, `let` and `var`, annotations, and signatures.
-4. [Expressions](expressions.md): operators, calls, field access, indexing,
-   records, tuples, array literals, and string interpolation.
+4. [Expressions](expressions.md): operators, calls, field access, method
+   calls, indexing, records, tuples, array literals, and string interpolation.
 5. [Patterns](patterns.md): the pattern forms, exhaustiveness, and which
    patterns may appear in bindings.
 6. [Statements and control flow](statements.md): blocks, assignment, `if`,
    `match`, the loops, `break`, `continue`, and `return`.
-7. [The `?` operator and `do`](do-notation.md): monadic sequencing.
+7. [The `?` and `!` operators and `do`](do-notation.md): monadic sequencing,
+   and unwrapping or panicking.
 8. [Type classes](classes.md): classes, instances, superclasses, associated
    types, and equality constraints.
 9. [Type inference](inference.md): what the compiler infers, when it
@@ -162,6 +163,12 @@ left.
 |---|---|---|
 | `empty-return-value` | warn | `return {}`, `return ()`, `break {}` and `break ()`, each of which means the bare `return` or `break`. `--fix` removes the value. |
 | `ambiguous-underscore` | warn | a `fun` whose parameter is `_` and whose body uses `_` to make a function of its own ([Placeholder functions](declarations.md#placeholder-functions)), as in `fun(_) = lookup(_, table)`, where the second `_` is not the parameter |
+| `unused-variable` | warn | a local binding nothing reads: a `let`, `var` or `let ... else`, a pattern of `for`, `match`, `if let`, `if var`, `while let` or `while var`, or a local `fun`. Reads in the binding's own assignments, as in `x = x + 1`, do not count. Parameters, and names that start with `_`, are not reported. `--fix` renames the binding `_name`, or writes `_` for a variable inside a pattern. |
+| `unused-import` | warn | an import, or an entry of an import's list, that brings nothing the module reads or its export list passes on, such as a name a declaration of the module hides. `x as _` is not reported, and `import M ()` only when loading `M` changes nothing a program does. `--fix` removes the entry, writes an unused `x as y` beside `..` as `x as _`, and removes an import none of which is used, unless it is the last import of a module whose loading may run code, provide an instance or define a `foreign` symbol, which it writes as `import M ()`. |
+| `unused-private-function` | warn | a top-level `fun`, `let` or `var` of a module with an export list that the list does not name and that nothing reaches from an export, `main` or a method, a function's own recursion aside. A `let` or `var` whose initializer may run code, such as a call, an operator, an index or a hole in a string, is taken to be there for that code, and a name that starts with `_` is not reported. |
+| `var-never-reassigned` | warn | a local `var`, `if var`, `while var` or `var ... else` that no assignment targets, a lambda's included. Its fix writes `let` in place of `var`, except in a `for` initializer, and where another variable of the same pattern is assigned. `--fix` makes it only where the initializer is not a value a `let` could give another type, as it gives `1` a type that may be `Int` at one use and `Float` at another. |
+| `loop-variable-captured` | warn | a function made in the body of a C-style `for` that captures a variable of the loop's initializer and is stored past the iteration: pushed with `Vec.push`, put with `Map.put`, spawned, assigned to an element or field, put in an array or record, or returned ([`for` with a counter](statements.md#for-with-a-counter)). The finding suggests beginning the body with `let i = i`, unless the body assigns `i`; `--fix` does not make that change, since the function then sees a different value. |
+| `unread-assignment` | warn | an assignment to a local `var` whose value no path reads before the next assignment or the end of the variable's scope. A `var` that a nested function refers to, and a `var`'s initializer, are not reported. |
 | `unreachable-code` | warn | a statement after one that cannot complete ([Blocks](statements.md#blocks)) |
 | `repeated-condition` | warn | a test in an `if`/`else if` chain that repeats an earlier test of the chain, so its branch can never run. A test with a call in it is not compared, and neither is one after a test with a call. |
 | `identical-operands` | warn | a comparison, `-`, `/`, `%`, `^`, `&&` or `\|\|` whose two operands are the same expression, with no call or indexing in it, as in `a.x == a.x`. `Float` operands are not reported. |
@@ -169,6 +176,16 @@ left.
 | `impossible-comparison` | warn | two comparisons of one `Int` or `Char` with constants, joined by `&&`, that no value satisfies both of, as in `c >= 'a' && c <= 'Z'`, or joined by `\|\|`, that every value satisfies one of |
 | `discarded-value` | warn | a statement that computes a value other than `()` and drops it ([Discarded values](statements.md#discarded-values)), except those `discarded-monadic-value` reports |
 | `discarded-monadic-value` | warn | a statement that drops an `Option`, an `Either`, or a value of the monad of the `?` block it is in, which is most often a missing `?` ([Discarded values](statements.md#discarded-values)) |
+| `unit-spelling` | warn | `{}` written where its value is used, as in `let done = {}`, and a `match` arm that does nothing spelled `()` in a statement or `{}` in a `match` whose value is used. `{}` is a body that does nothing and `()` the unit value. `--fix` writes the other spelling. |
+| `detached-doc-comment` | warn | a `---` doc comment that documents nothing ([Doc comments](lexical.md#doc-comments)), such as one parted from its declaration by a blank line, one inside a body, or one after code on its line. `--fix` deletes a single blank line between a doc comment and a declaration. |
+| `needless-equality` | warn | an equality in a function's context, such as `Item c ~ a`, whose variable is in no other entry and is written at most once in the signature and nowhere in the body, so that it only names `Item c`. `--fix` removes the entry and writes `Item c` in its place. |
+| `ord-inconsistent-with-eq` | warn | an `instance Ord` written by hand for a type whose `Eq` is derived, which can make `<=` hold in neither direction ([Derived instances](classes.md#derived-instances)) |
+| `infinite-recursion` | warn | a function, local function or method that cannot return without first calling itself, so it never returns. For an instance's method, itself is the class's method at the same instance. A call inside a `fun` value is not counted. |
+| `shared-fill` | warn | `Array.filled(n, v)`, `Vec.filled(n, v)` or `FrozenArray.filled(n, v)` with a `v` whose type is an object ([`Object` and `identical`](builtins.md#object-and-identical)), so every slot holds the one object. `Array.init(n, fun(_) = v)` makes one for each. |
+| `single-match` | warn | a `match` in which one arm does something and every other arm is `()` or `{}`, which is an [`if let`](statements.md#if-let-and-if-var). `--fix` rewrites it to one when no earlier arm takes a value the live arm's pattern matches. |
+| `irrefutable-match` | warn | a `match` of one arm, whose pattern matches every value, which is a `let` or, for a function's parameter, a [parameter pattern](declarations.md#functions) |
+| `irrefutable-if-let` | warn | an `if let` or `while let` whose conditions always hold ([Irrefutable patterns](patterns.md#irrefutable-patterns)), so the `else` is never taken, or only a `break` ends the loop |
+| `unreachable-arm` | warn | a `match` arm, or an alternative of `\|`, that the arms and alternatives before it already take every value of ([Exhaustiveness](patterns.md#exhaustiveness)) |
 | `unfulfilled-expect` | warn | a check that an `--@expect` names and that finds nothing in what the directive covers ([Expecting a finding](#expecting-a-finding)) |
 
 ### Expecting a finding
@@ -192,8 +209,8 @@ spaces allowed around each. It says that each check reports a finding in the
 code the directive covers, and those findings are neither printed nor fixed
 by `--fix`:
 
-* On a line of its own, a directive covers the whole of the statement,
-  declaration or `match` arm that begins next, every line of it included,
+* On a line of its own, a directive covers the whole of the import,
+  statement, declaration or `match` arm that begins next, every line of it included,
   provided it begins inside the block, type, call or other construct the
   directive is in. If nothing begins there, as at the end of a block, the
   directive covers nothing, and warns. A doc comment can be directly above the
@@ -337,10 +354,16 @@ must be preceded by an HTML comment that says how to check it:
 | `<!-- panic: TEXT -->` | Must compile and then panic with a message containing `TEXT`. An optional `text` fence gives the output printed before the panic. |
 | `<!-- stderr -->` | The next `text` fence is the exact standard error of the `run` or `panic` example before it: the compile's warnings, then the panic and its trace. |
 | `<!-- module: Name.gob -->` | Another source file for the next example, written beside it. The example itself is `Main.gob`. |
+| `<!-- skip: wasm32-wasi: REASON -->` | On the line before the directive of a `run` or `panic` example, in the tour only: the example is not run for that target, and `REASON` says what it needs that the target lacks. |
 
 Every example is compiled and run by `turkey`, the way a reader who copies one
 would. A `kotlin` fence with no directive fails the test. Grammar goes in `ebnf`
 fences and shell commands in `sh` fences; the test ignores both.
+
+The tour in `docs/tutorial/` is checked by the same directives. Its `run` and
+`panic` examples also run under `sh scripts/test.sh --target wasm32-wasi`,
+against the same output, since the tour runs them in a browser; the
+reference's run only on the host, so a `skip` in the reference is an error.
 
 **What goes in.** Only what the compiler accepts today. The reference does not
 mention planned features, reserved syntax, or open proposals; those belong in
@@ -358,8 +381,8 @@ from, and the one that chose differently.
   chapter.
 * The **Haskell 2010 Report** gives the meaning of each piece of syntactic
   sugar by translating it into a smaller core language. This reference
-  explains `for`, `if let`, `while let`, `let ... else`, array literals and
-  `?` the same way, except that it translates into ordinary Turkey rather than
+  explains `for`, `if let`, `while let`, `let ... else`, array literals, `?`
+  and `!` the same way, except that it translates into ordinary Turkey rather than
   a separate core language.
 * The **Rust Reference** puts a small syntax block in each section, and it
   tests its examples, including examples that are meant to be rejected. This

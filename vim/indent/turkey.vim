@@ -40,7 +40,12 @@ setlocal indentexpr=GetTurkeyIndent()
 " or `=`, which move it to a continuation or alternative's indent.
 setlocal indentkeys=0{,0},0),0],!^F,o,O,0=\|,0=\|\|,0=\|>,0=&&,0==
 
-let b:undo_indent = "setlocal indentexpr< indentkeys<"
+" The buffer's own 'preserveindent', which GetTurkeyIndent switches on for a
+" multi-line string's lines only.
+let b:turkey_preserveindent = &l:preserveindent
+
+let b:undo_indent = "setlocal indentexpr< indentkeys< preserveindent<"
+      \ . " | unlet! b:turkey_preserveindent"
 
 if exists("*GetTurkeyIndent")
   finish
@@ -85,8 +90,10 @@ endfunction
 
 function! s:PadLiterals(line) abort
   " Returns a:line with its characters, strings and one-line block comments
-  " padded over with `x`.
-  let line = substitute(a:line, '''\([^''\\]\|\\.\|\\u{\x\+}\)''', function('s:Pad'), 'g')
+  " padded over with `x`. Pad a multi-line string's `"""` first, so that its
+  " quotes do not pair up with those of a one-line string after it.
+  let line = substitute(a:line, '"""', 'xxx', 'g')
+  let line = substitute(line, '''\([^''\\]\|\\.\|\\u{\x\+}\)''', function('s:Pad'), 'g')
   let line = substitute(line, '"\([^"\\]\|\\.\)*"', function('s:Pad'), 'g')
   " Block comments nest, so pad the innermost pairs first.
   while 1
@@ -153,6 +160,35 @@ function! s:InBlockComment(lnum) abort
   return s:CommentEnd(line) >= 0
 endfunction
 
+function! s:InMultiString(lnum) abort
+  " Returns whether the line starts inside a multi-line string: whether it is
+  " one of the string's lines of text or its closing line. Without syntax
+  " highlighting, reads back to the nearest line that settles it, at most
+  " s:maxback lines. A line that ends in `"""` after other code opens a
+  " string, and one that starts with `"""` and goes on closes one. A line of
+  " only `"""` could do either, so each one in between flips the answer.
+  if s:HasSyntax()
+    " A line of text can start with a hole, which is innermost there.
+    return index(map(synstack(a:lnum, 1), 'synIDattr(v:val, "name")'),
+          \ 'turkeyMultiString') >= 0
+  endif
+  let flips = 0
+  let l = a:lnum - 1
+  let stop = a:lnum > s:maxback ? a:lnum - s:maxback : 1
+  while l >= stop
+    let line = getline(l)
+    if line =~# '^\s*"""\s*$'
+      let flips += 1
+    elseif line =~# '^\s*"""'
+      return flips % 2
+    elseif line =~# '"""\s*$' && line !~# '\\"""\s*$'
+      return 1 - flips % 2
+    endif
+    let l -= 1
+  endwhile
+  return flips % 2
+endfunction
+
 function! s:IsComment(lnum) abort
   " Returns whether the line's first non-blank character is in a comment.
   let line = getline(a:lnum)
@@ -169,6 +205,11 @@ function! s:ScanCode(lnum) abort
   " Returns the line as the bracket scan reads it: masked, and empty when
   " it lies wholly inside a block comment.
   if getline(a:lnum) !~# '-}' && s:InBlockComment(a:lnum)
+    return ''
+  endif
+  " A multi-line string's lines of text hold no code. Its closing line can,
+  " after the `"""`.
+  if s:InMultiString(a:lnum) && getline(a:lnum) !~# '^\s*"""'
     return ''
   endif
   return s:CodePart(a:lnum)
@@ -264,10 +305,17 @@ endfunction
 function! s:LogicalStart(lnum) abort
   " Returns the line that the expression ending on a:lnum starts on: the
   " line itself, unless it closes brackets opened above, in which case the
-  " line of the outermost of those openers, and so on up.
+  " line of the outermost of those openers, and so on up. A multi-line
+  " string's closing line continues the line the string opens on, whose
+  " indent is the code's rather than the string's.
   let l = a:lnum
   let n = 0
   while n < s:maxback
+    if getline(l) =~# '^\s*"""' && s:InMultiString(l)
+      while l > 1 && s:InMultiString(l)
+        let l -= 1
+      endwhile
+    endif
     let c = s:LastUnmatchedCloser(l)
     if c == 0
       return l
@@ -452,9 +500,10 @@ function! s:CodeIndent(lnum) abort
   " The innermost open bracket sets the base: one level in from its line.
   " A line above at column 0 that leaves nothing open is a complete
   " top-level line, so skip the scan, which would otherwise walk the whole
-  " file above every declaration.
+  " file above every declaration. A multi-line string's closing line is the
+  " exception: its indent is the string's, not the code's.
   let open = [0, 0, '']
-  if indent(prev) > 0 || s:LeavesOpen(pcode)
+  if indent(prev) > 0 || s:LeavesOpen(pcode) || getline(prev) =~# '^\s*"""'
     let open = s:ScanBack(a:lnum, 1)
   endif
   if open[0] == 0
@@ -509,8 +558,21 @@ endfunction
 function! GetTurkeyIndent() abort
   let lnum = v:lnum
 
+  let &l:preserveindent = get(b:, "turkey_preserveindent", 0)
+
   " Keep a block comment's interior as written.
   if s:InBlockComment(lnum)
+    return -1
+  endif
+
+  " Keep a multi-line string's lines as written: their indentation is part of
+  " the string. So is its closing line's, which sets the string's. Vim
+  " rewrites a kept indent as tabs, which would turn four spaces of the string
+  " into a tab, unless 'preserveindent' is on. So switch it on for these lines
+  " only. It stays on until the next line is indented, since nothing runs
+  " after Vim sets this line's indent to switch it back.
+  if s:InMultiString(lnum)
+    let &l:preserveindent = 1
     return -1
   endif
 

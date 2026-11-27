@@ -127,7 +127,7 @@ fun markStart(b : Code, block : Int) -> Unit {
 	if let Some(label) = Map.get(b.marks, markKey(block, 0)) { emit(b, Label(label)) }
 }
 
--- `x16` and `x17` are the allocator's reserved scratch (`Turkey.Regalloc`'s
+-- `x16` and `x17` are the allocator's reserved scratch (`Turkey.Arm64`'s
 -- `gpPool`), which is what makes them safe here: a large offset, a frame too
 -- big for an immediate, and the cycle in a parallel copy each need a register
 -- no value holds. `d31` is the vector file's, for a cycle of doubles.
@@ -176,17 +176,21 @@ fun functionEnd(d : Asm.Dialect, tag : Int) -> Asm.Symbol =
 --- Function `tag`, with a line table row at each change of position if `rows`,
 --- and the labels `marks` asks for (`markKey`). Each call that has a position
 --- gets a label at its return address, appended to `calls` with the position.
+--- Appends every safepoint map of `l` to `placed`, in ascending order of the
+--- return address its label is placed at.
 fun emitFunc(
 	asm : Asm.Asm,
 	f : Func Inst,
-	a : Regalloc.Allocation,
+	a : Regalloc.Allocation A.Inst A.Mem,
 	l : Frame.Layout,
 	tag : Int,
 	rows : Bool,
 	marks : Map.Map Int Asm.Symbol,
 	calls : Vec (Asm.Symbol, Int),
+	placed : Vec Frame.SafepointMap,
 	out : Vec (Item Inst),
 ) -> Unit {
+	let start = len(out)
 	let b = Code {
 		items        = out
 		at           = 0
@@ -260,6 +264,42 @@ fun emitFunc(
 	}
 	cfi(b, EndProc)
 	if rows { emit(b, Label(functionEnd(d, tag))) }
+	placeMaps(d, tag, l, out, start, placed)
+}
+
+-- Appends each map of `l` to `placed` in the order its label is placed in
+-- `items` from `start` on, which is the order of the return addresses: the
+-- assembler places items in the order they come, and nothing it does moves
+-- code within a section (`Turkey.Assembler.finish`).
+--
+-- `l.maps` is in another order, for two reasons. The blocks are placed in
+-- `blockOrder`, not in the order `Frame.layout` visits them. And the call of
+-- every poll and allocation stub is in the cold code after all the blocks.
+-- The frame table is written in this order so that the runtime finds it
+-- ascending and need not sort it (`Turkey.Heap.frameTableSet`).
+fun placeMaps(
+	d : Asm.Dialect,
+	tag : Int,
+	l : Frame.Layout,
+	items : Vec (Item Inst),
+	start : Int,
+	placed : Vec Frame.SafepointMap,
+) -> Unit {
+	let byLabel = Map.new()
+	for m in l.maps {
+		Map.put(byLabel, Asm.spell(safepointLabel(d, tag, m.block, m.index)), m)
+	}
+	let before = len(placed)
+	for var k = start; k < len(items); k = k + 1 {
+		if let Label(sym) = items[k] {
+			if let Some(m) = Map.get(byLabel, Asm.spell(sym)) { Vec.push(placed, m) }
+		}
+	}
+	-- A map whose label is never placed names a return address no code has,
+	-- and the assembler refuses it; one placed twice is two labels of one name.
+	if len(placed) - before != len(l.maps) {
+		error("internal error: a safepoint label is not placed exactly once")
+	}
 }
 
 --- The blocks of `f` in the order `emitFunc` places them: reverse postorder,
@@ -341,7 +381,7 @@ fun emitInsts(
 	cold : Cold,
 	d : Asm.Dialect,
 	f : Func Inst,
-	a : Regalloc.Allocation,
+	a : Regalloc.Allocation A.Inst A.Mem,
 	l : Frame.Layout,
 	tag : Int,
 	edges : Array (Option A.Arm),
@@ -358,12 +398,9 @@ fun emitInsts(
 		b.at = insts[n].at
 		cold.text.at = insts[n].at
 		let op = insts[n].op
-		match A.pollOf(op) {
-			Some((pb, pn)) -> {
-				poll(b, cold, d, l, tag, pb, pn)
-				continue
-			}
-			None -> {}
+		if let Some((pb, pn)) = A.pollOf(op) {
+			poll(b, cold, d, l, tag, pb, pn)
+			continue
 		}
 		if Option.isNone(A.allocationOf(op)) && Option.isNone(A.arrayAllocationOf(op)) {
 			emitInst(b, d, f, a, l, tag, insts[n])
@@ -372,36 +409,29 @@ fun emitInsts(
 		let save = Frame.stubAt(l, at, n)
 		var label = None
 		if n + 1 < upTo {
-			match A.safepointOf(insts[n + 1].op) {
-				Some((sb, sn)) -> {
-					label = Some(safepointLabel(d, tag, sb, sn))
-					n = n + 1
-				}
-				None -> {}
+			if let Some((sb, sn)) = A.safepointOf(insts[n + 1].op) {
+				label = Some(safepointLabel(d, tag, sb, sn))
+				n = n + 1
 			}
 		}
-		match A.allocationOf(op) {
-			Some((dest, allocation)) ->
-				allocate(b, cold, d, f, l, tag, coloured(f, a, dest), allocation, save, label)
-			None -> {}
+		if let Some((dest, allocation)) = A.allocationOf(op) {
+			allocate(b, cold, d, f, l, tag, coloured(f, a, dest), allocation, save, label)
 		}
-		match A.arrayAllocationOf(op) {
-			Some((dest, length, fill, allocation)) ->
-				allocateArray(
-					b,
-					cold,
-					d,
-					f,
-					l,
-					tag,
-					coloured(f, a, dest),
-					coloured(f, a, length),
-					coloured(f, a, fill),
-					allocation,
-					save,
-					label,
-				)
-			None -> {}
+		if let Some((dest, length, fill, allocation)) = A.arrayAllocationOf(op) {
+			allocateArray(
+				b,
+				cold,
+				d,
+				f,
+				l,
+				tag,
+				coloured(f, a, dest),
+				coloured(f, a, length),
+				coloured(f, a, fill),
+				allocation,
+				save,
+				label,
+			)
 		}
 	}
 }
@@ -439,11 +469,10 @@ fun atEdges(f : Func Inst, reads : Array Int) -> Array (Option A.Arm) {
 	let out : Array (Option A.Arm) = Array.filled(len(f.reps), None)
 	let passed = Array.filled(len(f.reps), False)
 	for block in f.blocks {
-		match block.term {
-			Jump(_, args) -> for v in args {
+		if let Jump(_, args) = block.term {
+			for v in args {
 				if reads[Ssa.valueId(v)] == 1 { passed[Ssa.valueId(v)] = True }
 			}
-			_ -> {}
 		}
 	}
 	for block in f.blocks {
@@ -572,7 +601,7 @@ fun unwind(b : Code, l : Frame.Layout) -> Unit {
 fun tailCall(
 	b : Code,
 	f : Func Inst,
-	a : Regalloc.Allocation,
+	a : Regalloc.Allocation A.Inst A.Mem,
 	l : Frame.Layout,
 	target : Either Asm.Symbol Reg,
 ) -> Unit = match target {
@@ -660,26 +689,22 @@ fun saves(b : Code, l : Frame.Layout, saving : Bool) -> Unit {
 fun cfi(b : Code, rule : Cfi) -> Unit = emit(b, Cfi(rule))
 
 -- The rules, on ELF.
-fun exactly(b : Code, rules : Array Cfi) -> Unit = match b.dialect {
-	Asm.Elf   -> for rule in rules { cfi(b, rule) }
-	Asm.MachO -> {}
+fun exactly(b : Code, rules : Array Cfi) -> Unit = if let Asm.Elf = b.dialect {
+	for rule in rules { cfi(b, rule) }
 }
 
 -- On Mach-O, the block frame mode encodes: the frame record at `x29`, and
 -- the pairs below it in the order `saves` stores them. Each pair is a bank
 -- and its lower register, as `Frame.savedPairs` gives it.
-fun frameMode(b : Code, pairs : Vec (Bank, Int)) -> Unit = match b.dialect {
-	Asm.MachO -> {
-		cfi(b, DefCfa(fpColumn, 16))
-		cfi(b, SavedAt(lrColumn, -8))
-		cfi(b, SavedAt(fpColumn, -16))
-		for var k = 0; k < len(pairs); k = k + 1 {
-			let (bank, first) = pairs[k]
-			cfi(b, SavedAt(column(Physical(bank, first)), -16 * k - 24))
-			cfi(b, SavedAt(column(Physical(bank, first + 1)), -16 * k - 32))
-		}
+fun frameMode(b : Code, pairs : Vec (Bank, Int)) -> Unit = if let Asm.MachO = b.dialect {
+	cfi(b, DefCfa(fpColumn, 16))
+	cfi(b, SavedAt(lrColumn, -8))
+	cfi(b, SavedAt(fpColumn, -16))
+	for var k = 0; k < len(pairs); k = k + 1 {
+		let (bank, first) = pairs[k]
+		cfi(b, SavedAt(column(Physical(bank, first)), -16 * k - 24))
+		cfi(b, SavedAt(column(Physical(bank, first + 1)), -16 * k - 32))
 	}
-	Asm.Elf -> {}
 }
 
 -- DWARF's number for a register.
@@ -718,7 +743,7 @@ fun emitInst(
 	b : Code,
 	d : Asm.Dialect,
 	f : Func Inst,
-	a : Regalloc.Allocation,
+	a : Regalloc.Allocation A.Inst A.Mem,
 	l : Frame.Layout,
 	tag : Int,
 	i : Inst,
@@ -726,26 +751,19 @@ fun emitInst(
 	-- A safepoint is not an instruction: it is the *position* after the call,
 	-- which is the return address the collector will look up. So it becomes a
 	-- label, and `Turkey.Frame`'s entry for the same (block, index) names it.
-	match A.safepointOf(i.op) {
-		Some((sb, sn)) -> {
-			emit(b, Label(safepointLabel(d, tag, sb, sn)))
-			return
-		}
-		None -> {}
+	if let Some((sb, sn)) = A.safepointOf(i.op) {
+		emit(b, Label(safepointLabel(d, tag, sb, sn)))
+		return
 	}
-	match A.tailCallOf(i.op) {
-		Some(target) -> {
-			tailCall(b, f, a, l, target)
-			return
-		}
-		None -> {}
+	if let Some(target) = A.tailCallOf(i.op) {
+		tailCall(b, f, a, l, target)
+		return
 	}
 	-- A slot whose offset is too wide is the one case that needs an extra
 	-- instruction, so it is settled before the rewrite rather than inside it.
 	let wide = wideSlot(l, i.op)
-	match wide {
-		Some(offset) -> instruction(b, A.MovConst(scratch, offset))
-		None         -> {}
+	if let Some(offset) = wide {
+		instruction(b, A.MovConst(scratch, offset))
 	}
 	let op = A.rewrite(i.op, coloured(f, a, _), placed(l, _, wide))
 	-- A move into the register the value already holds is what a taken hint
@@ -1104,9 +1122,8 @@ fun returnFromStub(
 	let pushed = keptBytes(save) > 0
 	let failed = if pushed { allocationLabel(d, tag, n, "p") } else { exitLabel(d, tag) }
 	instruction(b, A.Bl(slow, A.Standard))
-	match safepoint {
-		Some(label) -> emit(b, Label(label))
-		None        -> {}
+	if let Some(label) = safepoint {
+		emit(b, Label(label))
 	}
 	instruction(b, A.Ldr(scratch, Offset(A.worker, 0), A.W32))
 	instruction(b, A.Cbnz(scratch, failed, A.W32))
@@ -1123,7 +1140,7 @@ fun returnFromStub(
 -- Where the allocator put a value. A physical register is already itself --
 -- selection pins the argument registers, and the emitter's own additions are
 -- physical from the start.
-fun coloured(f : Func Inst, a : Regalloc.Allocation, r : Reg) -> Reg = match r {
+fun coloured(f : Func Inst, a : Regalloc.Allocation A.Inst A.Mem, r : Reg) -> Reg = match r {
 	Virtual(n)        -> Physical(A.bankOf(f.reps[n]), a.colouring.of_[n])
 	Physical(bank, n) -> Physical(bank, n)
 }
@@ -1160,7 +1177,7 @@ fun emitTerm(
 	b : Code,
 	d : Asm.Dialect,
 	f : Func Inst,
-	a : Regalloc.Allocation,
+	a : Regalloc.Allocation A.Inst A.Mem,
 	l : Frame.Layout,
 	tag : Int,
 	edges : Array (Option A.Arm),
@@ -1196,12 +1213,11 @@ fun emitTerm(
 			-- write, and which have finished with the scratch register a
 			-- wide frame address takes.
 			for var i = 0; i < len(params) && i < len(args); i = i + 1 {
-				match edges[Ssa.valueId(args[i])] {
-					Some(op) -> emitInst(b, d, f, a, l, tag, Inst {
+				if let Some(op) = edges[Ssa.valueId(args[i])] {
+					emitInst(b, d, f, a, l, tag, Inst {
 						op = A.rewrite(op, fun(r) = renamed(r, args[i], params[i]), fun(m) = m)
 						at = b.at
 					})
-					None -> {}
 				}
 			}
 			b.at = at
@@ -1264,7 +1280,7 @@ fun zero(b : Code, f : Func Inst) -> Unit {
 fun copies(
 	b : Code,
 	f : Func Inst,
-	a : Regalloc.Allocation,
+	a : Regalloc.Allocation A.Inst A.Mem,
 	edges : Array (Option A.Arm),
 	params : Vec Value,
 	args : Vec Value,
@@ -1405,14 +1421,11 @@ fun emitData(m : Module, asm : Asm.Asm, sites : Int, out : Vec (Item Inst)) -> U
 	-- An untraced global is a word of ordinary storage. A traced one is a slot
 	-- of the root array instead -- storing to it and rooting it are the same
 	-- store -- so this defines nothing for it.
-	for (name, r) in m.globals {
-		match Asm.globalSlot(asm, name) {
-			Some(_) -> {}
-			None -> {
-				emit(b, Align(3))
-				emit(b, Label(Asm.globalSymbol(asm.dialect, name)))
-				emit(b, Word(0))
-			}
+	for (name, _) in m.globals {
+		if let None = Asm.globalSlot(asm, name) {
+			emit(b, Align(3))
+			emit(b, Label(Asm.globalSymbol(asm.dialect, name)))
+			emit(b, Word(0))
 		}
 	}
 	emit(b, Align(3))
@@ -1837,18 +1850,6 @@ fun symbolInto(b : Code, r : Reg, sym : Asm.Symbol) -> Unit {
 fun call(b : Code, d : Asm.Dialect, name : String) -> Unit =
 	instruction(b, A.Bl(Asm.runtimeFor(d, name), A.Standard))
 
--- A store through a register base, with the offset in `scratch` when the
--- immediate does not reach. `turkey` interns thousands of literals, so the root
--- array is past 32,760 bytes long before the corpus is.
-fun storeAt(b : Code, r : Reg, base : Reg, offset : Int) -> Unit {
-	if A.offsetFits(offset, 3) {
-		instruction(b, A.Str(r, Offset(base, offset), A.W64))
-		return
-	}
-	instruction(b, A.MovConst(scratch, offset))
-	instruction(b, A.Str(r, Indexed(base, scratch), A.W64))
-}
-
 -- A string's length in bytes, which is what `turkey_string_new` is given.
 -- Counted rather than measured: `String.bytes` answers a `Bytes`, which has no
 -- `len`.
@@ -1866,18 +1867,22 @@ fun byteLength(text : String) -> Int {
 --- address's distance from the entry, its number of roots, and each root's
 --- offset from `x29`, signed (`Turkey.Frame.layout`).
 ---
+--- `functions` holds each function's number and its maps as `emitFunc`
+--- placed them, in the order the functions' code is placed. The entries are
+--- then in ascending order of return address.
+---
 --- A distance must fit in a signed 32-bit field, so the code must be under
 --- 2 GB. `Turkey.Assembler` refuses a distance that does not fit; on the
 --- assembly path nothing here checks it.
 fun emitFrameTable(
 	asm : Asm.Asm,
-	layouts : Vec (Int, Frame.Layout),
+	functions : Vec (Int, Vec Frame.SafepointMap),
 	out : Vec (Item Inst),
 ) -> Unit {
-	-- The emitter cannot sort this: it writes labels, whose addresses are not
-	-- known until the assembler has placed them. So the emitted format only
-	-- carries the facts across, and the runtime builds the structure it
-	-- queries.
+	-- The emitter knows no addresses: it writes labels, which the assembler
+	-- places. It knows their order, though, and the order is all a sorted
+	-- table needs, so the runtime builds its lookup from this without
+	-- sorting it.
 	let b = code(out, False, asm.dialect)
 	let d = asm.dialect
 	emit(b, Section(Asm.Constants))
@@ -1885,10 +1890,10 @@ fun emitFrameTable(
 	emit(b, Global(Asm.frameTableSymbol(d)))
 	emit(b, Label(Asm.frameTableSymbol(d)))
 	var n = 0
-	for (_, l) in layouts { n = n + len(l.maps) }
+	for (_, maps) in functions { n = n + len(maps) }
 	tableField(b, n, "safepoint count")
-	for (tag, l) in layouts {
-		for m in l.maps {
+	for (tag, maps) in functions {
+		for m in maps {
 			-- The return address is a distance and not an address because both
 			-- labels are in the code, so the distance is fixed once the program
 			-- is linked, and the table needs no relocation at load: it is

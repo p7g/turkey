@@ -120,9 +120,9 @@ def test_min_int_divided_by_minus_one_traps_and_its_remainder_does_not():
     assert out("fun main() { print(Int.minValue() % -1) }") == "0\n"
 
 
-def test_division_truncates_and_remainder_takes_the_dividends_sign():
-    assert out("fun main() { print(-7 / 2) }") == "-3\n"
-    assert out("fun main() { print(-7 % 3) }") == "-1\n"
+def test_division_floors_and_remainder_takes_the_divisors_sign():
+    assert out("fun main() { print(-7 / 2) }") == "-4\n"
+    assert out("fun main() { print(-7 % 3) }") == "2\n"
     # a == (a / b) * b + a % b, for every sign combination.
     src = """
     fun main() {
@@ -138,8 +138,14 @@ def test_division_truncates_and_remainder_takes_the_dividends_sign():
 
 
 def test_mod_is_floored_and_therefore_a_usable_index():
-    assert out("fun main() { print(Int.mod(-7, 3)) }") == "2\n"
-    assert out("fun main() { print(Int.mod(7, -3)) }") == "-2\n"
+    assert out("fun main() { print(-7 % 3) }") == "2\n"
+    assert out("fun main() { print(7 % -3) }") == "-2\n"
+
+
+def test_quot_and_rem_truncate():
+    assert out("fun main() { print(Int.quot(-7, 2)) }") == "-3\n"
+    assert out("fun main() { print(Int.rem(-7, 3)) }") == "-1\n"
+    assert out("fun main() { print(Int.quotRem(7, -2)) }") == "(-3, 1)\n"
 
 
 def test_wrapping_and_checked_forms():

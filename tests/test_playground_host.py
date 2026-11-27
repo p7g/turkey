@@ -2,9 +2,10 @@
 
 The host is the layer the playground's page calls. It runs `turkey.wasm` over
 browser_wasi_shim with `lib/` unpacked from `lib.tar.gz`, and runs the module
-the compiler writes, and highlights and formats source for the editor.
-The page's pure modules, the share links and the editor's overlay patch,
-are checked by `tests/playground_share.test.mjs`.
+the compiler writes, and checks, highlights and formats source for the
+editor. The page's pure modules, the share links and the editor's overlay
+patch, are checked by `tests/playground_share.test.mjs`, and the marks made
+from `check`'s diagnostics by `tests/playground_diagnostics.test.mjs`.
 `tests/playground_host.mjs` drives the host under node; the
 same module runs in a browser's Worker. These tests need node
 (`toolchain.needs_node`), and skip without it unless `$TURKEY_REQUIRE_NODE`
@@ -74,7 +75,8 @@ def _host(inputs: tuple[Path, Path], tmp_path: Path, source: str | dict[str, str
 
 
 def test_diagnostics_filter():
-    """The page keeps a refused-functions warning unless it is the baseline's."""
+    """The page keeps a refused-functions warning only after a trap, and marks
+    the spans `check` reports at the right UTF-16 offsets."""
     node = toolchain.needs_node()
     result = subprocess.run([node, str(REPO_ROOT / "tests" / "playground_diagnostics.test.mjs")],
                             capture_output=True, text=True, timeout=60)
@@ -194,6 +196,64 @@ def test_a_type_error_comes_back_as_diagnostics(inputs, tmp_path):
         "main.gob:2:8: type error: a numeric literal cannot have type 'String';"
         " it must be one of 'Int', 'Float'\n")
     assert result["ran"] is None
+
+
+def _driver(inputs: tuple[Path, Path], tmp_path: Path, mode: str,
+            source: str | dict[str, str]) -> dict:
+    node = toolchain.needs_node()
+    if isinstance(source, str):
+        entry = tmp_path / "main.gob"
+        entry.write_text(source)
+    else:
+        entry = tmp_path / "program"
+        for name, text in source.items():
+            (entry / name).parent.mkdir(parents=True, exist_ok=True)
+            (entry / name).write_text(text)
+    argv = [node, f"--stack-size={STACK_KIB}", str(DRIVER), mode, str(inputs[0]), str(inputs[1]),
+            str(entry)]
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=300)
+    assert result.returncode == 0, result.stderr[-4000:]
+    return json.loads(result.stdout)
+
+
+# A program with an error that has a note, for `check`.
+NOT_VAR = "type R = R { a : Int }\n\nfun main() {\n\tlet r = R { a = 1 }\n\tr.a = 2\n}\n"
+
+
+def test_check_returns_the_diagnostics_as_objects(inputs, tmp_path):
+    checked = _driver(inputs, tmp_path, "--check", NOT_VAR)["checked"]
+    assert checked == {
+        "diagnostics": [{
+            "file": "main.gob", "line": 5, "column": 2, "endLine": 5, "endColumn": 5,
+            "severity": "error", "stage": "type error", "code": None,
+            "message": "cannot assign to field 'a': it is not 'var' in 'R';"
+                       " declare it 'var a' to make it assignable",
+            "notes": [{"file": "main.gob", "line": 1, "column": 14, "endLine": 1,
+                       "endColumn": 15, "message": "'a' is declared here"}],
+        }],
+        "status": 1,
+        "text": "",
+    }
+
+
+def test_the_tools_worker_checks_every_file_with_the_library(inputs, tmp_path):
+    """The page's tools Worker fetches `lib.tar.gz` and answers a `check`
+    message with the files it checked and each file's diagnostics."""
+    files = {
+        "main.gob": "import Shapes\n\nfun main() {\n\tlet unused = 4\n\tprint(Shapes.area(2))\n}\n",
+        "Shapes.gob": "export (area)\n\nfun area(side : Int) -> Int {\n\tmatch side {\n"
+                      "\t\ts -> s * s\n\t}\n}\n",
+    }
+    answer = _driver(inputs, tmp_path, "--worker", files)
+    assert answer["replies"] == ["status", "ready", "checked"]
+    checked = answer["checked"]
+    assert (checked["type"], checked["id"]) == ("checked", 7)
+    assert checked["files"] == [["main.gob", files["main.gob"]], ["Shapes.gob", files["Shapes.gob"]]]
+    found = [(d["file"], d["code"], d["line"], d["endLine"]) for d in checked["diagnostics"]]
+    assert sorted(found) == [
+        ("Shapes.gob", "irrefutable-match", 4, 6),
+        ("main.gob", "unused-variable", 4, 4),
+    ]
 
 
 def test_a_panic_comes_back_with_its_report_and_status(inputs, tmp_path):

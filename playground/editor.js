@@ -10,7 +10,12 @@
 // the two aligned. The HTML is shown only if the text has not changed since
 // it was asked for.
 //
+// The checker's diagnostics are underlined by a layer of their own
+// (`marks.js`), which this keeps in step with the text and the scroll.
+//
 // `changedRange` needs no DOM, so node loads this module.
+
+import { attachMarks } from "./marks.js";
 
 /**
  * Starts highlighting `textarea` into `code`, a `display: block` element in a
@@ -19,21 +24,31 @@
  * caller hands the compiler's answer to `highlighted(source, html)` on the
  * object this returns. The caller coalesces requests while a highlight runs.
  * Call `changed()` on it after setting `textarea.value` from code, which
- * fires no event.
+ * fires no event. `mark(marks)` on it underlines `marks`, as `marksFor` in
+ * `diagnostics.js` makes them for the text as it is now, until the next
+ * `mark`; an edit drops the ones it touches and moves the rest.
  *
  * Tab inserts a tab. Escape and then Tab moves the focus on, as in other
- * editors that take the Tab key.
+ * editors that take the Tab key. F8 and Shift+F8 move the caret to the next
+ * and the previous mark.
  */
 export function attachEditor(textarea, code, requestHighlight) {
+  const marks = attachMarks(textarea, code.parentElement);
   // The textarea scrolls, and the code element is moved to match. Moving it
   // with a transform, not by scrolling the `<pre>`, keeps the two aligned at
   // the very end too, where a textarea's scrollbars would let it scroll
   // further than a `<pre>` without them.
   const follow = () => {
     code.style.transform = `translate(${-textarea.scrollLeft}px, ${-textarea.scrollTop}px)`;
+    marks.follow();
   };
+  let marked = textarea.value; // the text the marks were last carried to
   const changed = () => {
     patch(code, textarea.value);
+    if (textarea.value !== marked) {
+      marks.changed(changedRange(marked, textarea.value));
+      marked = textarea.value;
+    }
     follow();
     requestHighlight(textarea.value);
   };
@@ -51,6 +66,10 @@ export function attachEditor(textarea, code, requestHighlight) {
   changed();
   return {
     changed,
+    mark(next) {
+      marked = textarea.value;
+      marks.set(next);
+    },
     highlighted(source, html) {
       if (html !== null && source === textarea.value) {
         // Only the compiler's output is set as HTML: `turkey highlight`

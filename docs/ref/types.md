@@ -927,8 +927,8 @@ be read whole, make the reads and the assignments exclude each other, with
 > one part at a time, and a reader that runs between those writes sees the
 > parts it reaches before and after them.
 
-Assigning a field that is not `var` is an error, and the message says where
-the field is declared, since that is where the fix goes:
+Assigning a field that is not `var` is an error, and a note under it points
+at the field's declaration, since that is where the fix goes:
 
 <!-- error: cannot assign to field 'owner': it is not 'var' in 'Account' -->
 ```kotlin

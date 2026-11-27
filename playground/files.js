@@ -94,13 +94,14 @@ export function filesProblem(pairs) {
  * `attachEditor` calls its own, with the file it is for.
  *
  * Returns the file set: `all()` returns the files as `[name, text]` pairs,
- * the entry first; `active()` returns the file shown; `byId(id)` returns a
+ * the entry first; `list()` returns the files themselves, in that order;
+ * `active()` returns the file shown; `byId(id)` returns a
  * file by its `id`, or null once it is removed; `replace(pairs, { undoable,
  * quiet })` makes the files `pairs`, which `filesProblem` accepts, and shows
  * the entry; `onChange(callback)` calls `callback()` after every edit, after
  * a file is added, renamed or removed, and after a `replace` that is not
- * `quiet`. A file is `{ id, name, textarea, editor }`, `editor` being what
- * `attachEditor` returned for it.
+ * `quiet`. A file is `{ id, name, textarea, editor, tab }`, `editor` being
+ * what `attachEditor` returned for it, and `tab` its tab, a button.
  */
 export function attachFiles(container, { editable = false, say = () => {}, requestHighlight = () => {} } = {}) {
   const panels = [...container.querySelectorAll(":scope > .editor")];
@@ -399,6 +400,7 @@ export function attachFiles(container, { editable = false, say = () => {}, reque
 
   return {
     all: () => files.map((f) => [f.name, f.textarea.value]),
+    list: () => [...files],
     active: () => active,
     byId: (id) => files.find((f) => f.id === id) ?? null,
     replace,

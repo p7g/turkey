@@ -11,6 +11,7 @@
 //     if (built.bytes) { const ran = await run(built.bytes); }
 //     const { html } = await highlight(compiler, source);
 //     const { text } = await format(compiler, source);
+//     const { diagnostics } = await check(compiler, [["main.gob", source]]);
 
 import {
   WASI,
@@ -22,13 +23,13 @@ import {
 } from "./vendor/browser_wasi_shim/index.js";
 
 /**
- * Returns a compiler for `compile`, `highlight` and `format`: `wasm` compiled,
- * and `libArchive` unpacked. `wasm` is `turkey.wasm` as bytes or an already
- * compiled `WebAssembly.Module`. `libArchive` is `lib.tar.gz`'s bytes, or null
- * for a compiler that only highlights and formats, since neither reads the
- * library. Neither argument is read again, so one compiler serves any number
- * of calls. Throws if the archive is not a well-formed ustar archive holding
- * files under `lib/`.
+ * Returns a compiler for `compile`, `check`, `highlight` and `format`: `wasm`
+ * compiled, and `libArchive` unpacked. `wasm` is `turkey.wasm` as bytes or an
+ * already compiled `WebAssembly.Module`. `libArchive` is `lib.tar.gz`'s bytes,
+ * or null for a compiler that only highlights and formats, since neither
+ * reads the library. Neither argument is read again, so one compiler serves
+ * any number of calls. Throws if the archive is not a well-formed ustar
+ * archive holding files under `lib/`.
  */
 export async function loadCompiler(wasm, libArchive = null) {
   const module = wasm instanceof WebAssembly.Module ? wasm : await WebAssembly.compile(wasm);
@@ -116,6 +117,55 @@ export async function highlight(compiler, source) {
 export async function format(compiler, source, name = "main.gob") {
   const result = await tool(compiler, ["format", "--stdin-name", name, "-"], source);
   return { text: result.output, status: result.status, diagnostics: result.diagnostics };
+}
+
+/**
+ * Checks a program as `turkey check --diagnostics=json` does, which writes
+ * no program. `files` is as `compile` takes it. Returns `{ diagnostics,
+ * status, text }`: `diagnostics` is an array of the objects the compiler
+ * wrote, one per diagnostic, whose members `turkey`'s usage text lists and
+ * whose `file` is a name in `files`, or a library file's under `lib/`;
+ * `status` is its exit status, or null if it trapped; and `text` is the rest
+ * of what it wrote, such as a panic's report, with a trap's message last.
+ * Positions are the compiler's: 1-based lines and columns counted in code
+ * points. Throws as `compile` does.
+ */
+export async function check(compiler, files) {
+  if (compiler.lib === null) {
+    throw new Error("this compiler was loaded without lib.tar.gz, so it cannot check");
+  }
+  const pairs = typeof files === "string" ? [["main.gob", files]] : files;
+  checkNames(pairs.map(([name]) => name));
+  const encoder = new TextEncoder();
+  const work = new PreopenDirectory(
+    ".",
+    entriesOf(pairs.map(([name, source]) => [name, encoder.encode(source)])),
+  );
+  // A copy of the library for each check, as `compile` makes, and for the
+  // same reason.
+  const fds = [
+    new OpenFile(new File([])),
+    null,
+    null,
+    new PreopenDirectory("lib", entriesOf(compiler.lib, { readonly: true })),
+    work,
+  ];
+  const argv = ["turkey", "check", "--diagnostics=json", pairs[0][0]];
+  const result = await start(compiler.module, argv, ["TURKEY_LIB=lib"], fds, { merged: false });
+  const diagnostics = [];
+  let text = "";
+  for (const line of result.stderr.split("\n")) {
+    if (line.startsWith("{")) {
+      diagnostics.push(JSON.parse(line));
+    } else if (line !== "") {
+      text += line + "\n";
+    }
+  }
+  return {
+    diagnostics,
+    status: result.status,
+    text: text + (result.trap === null ? "" : result.trap + "\n"),
+  };
 }
 
 // Runs the compiler with `args` and `source` on its standard input. Returns

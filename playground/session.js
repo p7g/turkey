@@ -1,13 +1,13 @@
-// A compile-and-run session for one program on a page: its files' editors
-// and their highlighting, Run and Stop, Format, and the output pane. Compiling happens
-// in one Worker, highlighting and formatting in a second, and running in a
-// third, so the page itself never waits. The playground and each lesson of
-// the tour start one.
+// A compile-and-run session for one program on a page: its files' editors,
+// their highlighting and diagnostic marks, Run and Stop, Format, and the
+// output pane. Compiling happens in one Worker, checking, highlighting and
+// formatting in a second, and running in a third, so the page itself never
+// waits. The playground and each lesson of the tour start one.
 //
 // The Workers are found beside this module, and each fetches `turkey.wasm`
 // relative to itself, so a page in another directory starts the same ones.
 
-import { diagnosticsFor } from "./diagnostics.js";
+import { diagnosticsFor, marksFor } from "./diagnostics.js";
 import { replaceText } from "./editor.js";
 import { attachFiles } from "./files.js";
 
@@ -69,12 +69,84 @@ export function startSession(elements, { lazy = false, editable = false, timeLim
       highlighting = true;
     }
   }
+
+  // The editors' marks come from `turkey check` on all the files, run in the
+  // tools Worker once typing has paused for `IDLE_MS`, and at once when a
+  // Run fails to compile. A check takes a large part of a second whatever
+  // the program's size, since most of it goes on the Prelude, and the Worker
+  // highlights nothing while one runs. Waiting for a pause keeps checks from
+  // running mid-word and holding up the highlighting of the next
+  // keystrokes. One check is in flight at a time, files already checked are
+  // not checked again, and a reply for files since edited, added, renamed
+  // or removed is dropped. A check that failed leaves the marks as they
+  // were. Marking changes no file's text, so it saves nothing.
+  const IDLE_MS = 500;
+  let checking = false;
+  let checkAgain = false; // a check was asked for while one was in flight
+  let checked = null; // the files the marks were made for, as `keyOf` gives them
+  let idle = null;
+  const keyOf = (pairs) => JSON.stringify(pairs);
+  function checkWhenIdle() {
+    clearTimeout(idle);
+    idle = setTimeout(checkNow, IDLE_MS);
+  }
+  function checkNow() {
+    clearTimeout(idle);
+    if (!toolsReady) {
+      return;
+    }
+    const pairs = files.all();
+    if (keyOf(pairs) === checked) {
+      return;
+    }
+    if (checking) {
+      checkAgain = true;
+      return;
+    }
+    checking = true;
+    tools.postMessage({ type: "check", id: 0, files: pairs });
+  }
+  function checkedFiles(data) {
+    checking = false;
+    const key = keyOf(data.files);
+    if (data.diagnostics !== null && key === keyOf(files.all())) {
+      checked = key;
+      for (const file of files.list()) {
+        const marks = marksFor(file.textarea.value, data.diagnostics, file.name);
+        file.editor.mark(marks);
+        markTab(file, marks);
+      }
+    }
+    if (checkAgain) {
+      checkAgain = false;
+      checkNow();
+    }
+  }
+  // Marks a file's tab with the worst of its marks, so that a file not shown
+  // still says it has a problem.
+  function markTab(file, marks) {
+    const errors = marks.filter((m) => m.severity === "error").length;
+    const warnings = marks.length - errors;
+    if (marks.length === 0) {
+      delete file.tab.dataset.problems;
+      file.tab.removeAttribute("title");
+      return;
+    }
+    file.tab.dataset.problems = errors > 0 ? "error" : "warning";
+    const counted = (n, noun) => `${n} ${noun}${n === 1 ? "" : "s"}`;
+    file.tab.title = [
+      ...(errors > 0 ? [counted(errors, "error")] : []),
+      ...(warnings > 0 ? [counted(warnings, "warning")] : []),
+    ].join(", ");
+  }
+
   const files = attachFiles(elements.files, {
     editable,
     say: (...parts) => note.replaceChildren(...parts),
     requestHighlight(file, text) {
       pendingHighlights.set(file.id, text);
       flushHighlight();
+      checkWhenIdle();
     },
   });
 
@@ -231,7 +303,7 @@ export function startSession(elements, { lazy = false, editable = false, timeLim
       } else if (data.type === "ready") {
         if (turkeyModule === null) {
           turkeyModule = data.module;
-          tools?.postMessage({ type: "load", module: turkeyModule, lib: false });
+          tools?.postMessage({ type: "load", module: turkeyModule, lib: true });
         }
         if (phase === "loading") {
           setPhase("idle", "Ready.");
@@ -349,6 +421,8 @@ export function startSession(elements, { lazy = false, editable = false, timeLim
         ["status", status],
       ]);
       setPhase("idle", "Compile failed.");
+      // The marks show where, if the idle check has not already.
+      checkNow();
       return;
     }
     const asked = timeLimit();
@@ -408,23 +482,24 @@ export function startSession(elements, { lazy = false, editable = false, timeLim
   });
   stopButton.addEventListener("click", stop);
 
-  // -- Highlighting and Format -------------------------------------------------
+  // -- Highlighting, checking and Format ---------------------------------------
 
-  // A tools Worker that fails leaves the editor working, unhighlighted, and
-  // Format disabled with the reason beside it. It is not restarted: it runs
+  // A tools Worker that fails leaves the editor working, unhighlighted and
+  // unmarked, and Format disabled with the reason beside it. It is not restarted: it runs
   // nothing of the user's that could crash it, so it would fail again.
   function startTools() {
     const worker = new Worker(new URL("compile-worker.js", import.meta.url), { type: "module", name: "tools" });
     tools = worker;
     // It loads once the compile Worker has compiled `turkey.wasm`.
     if (turkeyModule !== null) {
-      worker.postMessage({ type: "load", module: turkeyModule, lib: false });
+      worker.postMessage({ type: "load", module: turkeyModule, lib: true });
     }
     const failed = (text) => {
       worker.terminate();
       tools = null;
       toolsReady = false;
       highlighting = false;
+      checking = false;
       formatting = null;
       formatButton.disabled = true;
       note.textContent = `Highlighting and Format are unavailable: ${text}`;
@@ -434,6 +509,9 @@ export function startSession(elements, { lazy = false, editable = false, timeLim
         toolsReady = true;
         formatButton.disabled = false;
         flushHighlight();
+        checkNow();
+      } else if (data.type === "checked") {
+        checkedFiles(data);
       } else if (data.type === "failed") {
         failed(data.text);
       } else if (data.type === "highlighted") {
@@ -490,6 +568,8 @@ export function startSession(elements, { lazy = false, editable = false, timeLim
   files.onChange(() => {
     formatError.hidden = true;
     load();
+    // A file added, renamed or removed changes the program without an edit.
+    checkWhenIdle();
   });
 
   // Starts the three Workers, once.
